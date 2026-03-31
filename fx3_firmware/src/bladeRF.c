@@ -451,6 +451,9 @@ CyBool_t NuandHandleVendorRequest(
         CyU3PGpioSetValue(GPIO_RX_EN, CyFalse);
         CyU3PGpioSetValue(GPIO_TX_EN, CyFalse);
 
+        /* Enable loopback */
+        // NuandRFLinkLoopBack(1);
+
         if (use_feature) {
             apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_DEVICE_DESCR, 0, (uint8_t *)CyFxUSB30DeviceDscr_EEM);
             if (apiRetStatus != CY_U3P_SUCCESS) {
