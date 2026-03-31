@@ -298,6 +298,17 @@ API_EXPORT
 int CALL_CONV bladerf_set_pll_enable(struct bladerf *dev, bool enable);
 
 /**
+ * Enable the EEM interface on the bladeRF2
+ *
+ * @param       dev         Device handle
+ * @param[in]   enable      True to enable, False otherwise
+ *
+ * @return 0 on success, value from \ref RETCODES list on failure
+ */
+API_EXPORT
+int CALL_CONV bladerf_set_eem_enable(struct bladerf *dev, bool enable);
+
+/**
  * Get the valid range of frequencies for the reference clock input
  *
  * @param       dev         Device handle

@@ -436,6 +436,83 @@ CyBool_t NuandHandleVendorRequest(
         CyU3PUsbSendRetCode(apiRetStatus);
     break;
 
+    case BLADE_USB_CMD_EEM:
+        StopApplication();
+        apiRetStatus = CY_U3P_SUCCESS;
+        use_feature = wValue;
+        CyU3PGpioGetValue(GPIO_TX_EN, &txen) ;
+        CyU3PGpioGetValue(GPIO_RX_EN, &rxen) ;
+        if (txen == CyFalse && rxen == CyFalse) {
+            CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue) ;
+            CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
+        }
+
+        /* Disable TX and RX for now */
+        CyU3PGpioSetValue(GPIO_RX_EN, CyFalse);
+        CyU3PGpioSetValue(GPIO_TX_EN, CyFalse);
+
+        if (use_feature) {
+            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_DEVICE_DESCR, 0, (uint8_t *)CyFxUSB30DeviceDscr_EEM);
+            if (apiRetStatus != CY_U3P_SUCCESS) {
+                LOG_ERROR(apiRetStatus);
+                CyFxAppErrorHandler(apiRetStatus);
+            }
+            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_DEVICE_DESCR, 0, (uint8_t *)CyFxUSB20DeviceDscr_EEM);
+            if (apiRetStatus != CY_U3P_SUCCESS) {
+                LOG_ERROR(apiRetStatus);
+                CyFxAppErrorHandler(apiRetStatus);
+            }
+            /* Super speed configuration descriptor */
+            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBSSConfigDscr_EEM);
+            if (apiRetStatus != CY_U3P_SUCCESS) {
+                LOG_ERROR(apiRetStatus);
+                CyFxAppErrorHandler(apiRetStatus);
+            }
+            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBHSConfigDscr_EEM);
+            if (apiRetStatus != CY_U3P_SUCCESS) {
+                LOG_ERROR(apiRetStatus);
+                CyFxAppErrorHandler(apiRetStatus);
+            }
+        } else {
+            const uint8_t *usb3_device_descr;
+            const uint8_t *usb2_device_descr;
+            if (NuandGetProductID() == USB_NUAND_BLADERF_PRODUCT_ID) {
+                usb3_device_descr = CyFxUSB30DeviceDscr_bladeRF1;
+                usb2_device_descr = CyFxUSB20DeviceDscr_bladeRF1;
+            } else {
+                usb3_device_descr = CyFxUSB30DeviceDscr_bladeRF2;
+                usb2_device_descr = CyFxUSB20DeviceDscr_bladeRF2;
+            }
+            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_DEVICE_DESCR, 0, (uint8_t *)usb3_device_descr);
+            if (apiRetStatus != CY_U3P_SUCCESS) {
+                LOG_ERROR(apiRetStatus);
+                CyFxAppErrorHandler(apiRetStatus);
+            }
+            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_DEVICE_DESCR, 0, (uint8_t *)usb2_device_descr);
+            if (apiRetStatus != CY_U3P_SUCCESS) {
+                LOG_ERROR(apiRetStatus);
+                CyFxAppErrorHandler(apiRetStatus);
+            }
+            /* Super speed configuration descriptor */
+            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBSSConfigDscr);
+            if (apiRetStatus != CY_U3P_SUCCESS) {
+                LOG_ERROR(apiRetStatus);
+                CyFxAppErrorHandler(apiRetStatus);
+            }
+            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBHSConfigDscr);
+            if (apiRetStatus != CY_U3P_SUCCESS) {
+                LOG_ERROR(apiRetStatus);
+                CyFxAppErrorHandler(apiRetStatus);
+            }
+        }
+
+
+        CyU3PUsbSendRetCode(apiRetStatus);
+        CyU3PConnectState(CyFalse, CyTrue);
+        CyU3PThreadSleep(500);
+        CyU3PConnectState(CyTrue, CyTrue);
+    break;
+
     case BLADE_USB_CMD_BEGIN_PROG:
         retStatus = FpgaBeginProgram();
         if(0 == retStatus) {

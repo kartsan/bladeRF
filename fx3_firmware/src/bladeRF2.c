@@ -33,6 +33,10 @@
 #define BLADERF_PID_LOW     (USB_NUAND_BLADERF2_PRODUCT_ID & 0xff)
 #define BLADERF_PID_HIGH    (USB_NUAND_BLADERF2_PRODUCT_ID >> 8)
 
+/* EEM PID */
+#define EEM_PID_LOW     (0xad)
+#define EEM_PID_HIGH    (0xde)
+
 /* Standard device descriptor for USB 3.0 */
 const uint8_t CyFxUSB30DeviceDscr_bladeRF2[] __attribute__ ((aligned (32))) __attribute__ ((section(".usbdscr"))) =
 {
@@ -52,6 +56,25 @@ const uint8_t CyFxUSB30DeviceDscr_bladeRF2[] __attribute__ ((aligned (32))) __at
     0x01                                    /* Number of configurations */
 };
 
+/* Standard device descriptor for USB 3.0 for EEM */
+const uint8_t CyFxUSB30DeviceDscr_EEM[] __attribute__ ((aligned (32))) __attribute__ ((section(".usbdscr"))) =
+{
+    0x12,                                   /* Descriptor size */
+    CY_U3P_USB_DEVICE_DESCR,                /* Device descriptor type */
+    0x00,0x03,                              /* USB 3.0 */
+    0x02,                                   /* Device class: CDC */
+    0x0C,                                   /* Device sub-class: EEM */
+    0x00,                                   /* Device protocol: EEM */
+    0x00,                                   /* Maxpacket size for EP0 : 2^9 */
+    VID_LOW, VID_HIGH,                      /* Vendor ID */
+    EEM_PID_LOW, EEM_PID_HIGH,              /* Product ID */
+    0x00,0x00,                              /* Device release number */
+    0x01,                                   /* Manufacture string index */
+    0x02,                                   /* Product string index */
+    0x03,                                   /* Serial number string index */
+    0x01                                    /* Number of configurations */
+};
+
 /* Standard device descriptor for USB 2.0 */
 const uint8_t CyFxUSB20DeviceDscr_bladeRF2[] __attribute__ ((aligned (32))) __attribute__ ((section(".usbdscr"))) =
 {
@@ -64,6 +87,25 @@ const uint8_t CyFxUSB20DeviceDscr_bladeRF2[] __attribute__ ((aligned (32))) __at
     0x40,                                   /* Maxpacket size for EP0 : 64 bytes */
     VID_LOW, VID_HIGH,                      /* Vendor ID */
     BLADERF_PID_LOW, BLADERF_PID_HIGH,      /* Product ID */
+    0x00,0x00,                              /* Device release number */
+    0x01,                                   /* Manufacture string index */
+    0x02,                                   /* Product string index */
+    0x03,                                   /* Serial number string index */
+    0x01                                    /* Number of configurations */
+};
+
+/* Standard device descriptor for USB 2.0 for EEM */
+const uint8_t CyFxUSB20DeviceDscr_EEM[] __attribute__ ((aligned (32))) __attribute__ ((section(".usbdscr"))) =
+{
+    0x12,                                   /* Descriptor size */
+    CY_U3P_USB_DEVICE_DESCR,                /* Device descriptor type */
+    0x10,0x02,                              /* USB 2.10 */
+    0x02,                                   /* Device class: CDC */
+    0x00,                                   /* Device sub-class: EEM */
+    0x00,                                   /* Device protocol: EEM */
+    0x40,                                   /* Maxpacket size for EP0 : 64 bytes */
+    VID_LOW, VID_HIGH,                      /* Vendor ID */
+    EEM_PID_LOW, EEM_PID_HIGH,      /* Product ID */
     0x00,0x00,                              /* Device release number */
     0x01,                                   /* Manufacture string index */
     0x02,                                   /* Product string index */

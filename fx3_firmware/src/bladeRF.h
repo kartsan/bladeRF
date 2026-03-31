@@ -61,15 +61,19 @@
 extern const uint8_t CyFxUSBDeviceQualDscr[];
 extern const uint8_t CyFxUSBFSConfigDscr[];
 extern const uint8_t CyFxUSBHSConfigDscr[];
+extern const uint8_t CyFxUSBHSConfigDscr_EEM[];
 extern const uint8_t CyFxUSBBOSDscr[];
 extern const uint8_t CyFxUSBSSConfigDscr[];
+extern const uint8_t CyFxUSBSSConfigDscr_EEM[];
 extern const uint8_t CyFxUSBStringLangIDDscr[];
 extern const uint8_t CyFxUSBManufactureDscr[];
 extern const uint8_t CyFxUSB20DeviceDscr_bladeRF1[];
 extern const uint8_t CyFxUSB30DeviceDscr_bladeRF1[];
 extern const uint8_t CyFxUSBProductDscr_bladeRF1[];
 extern const uint8_t CyFxUSB20DeviceDscr_bladeRF2[];
+extern const uint8_t CyFxUSB20DeviceDscr_EEM[];
 extern const uint8_t CyFxUSB30DeviceDscr_bladeRF2[];
+extern const uint8_t CyFxUSB30DeviceDscr_EEM[];
 extern const uint8_t CyFxUSBProductDscr_bladeRF2[];
 
 #include "cyu3externcend.h"

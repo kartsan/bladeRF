@@ -218,6 +218,158 @@ const uint8_t CyFxUSBSSConfigDscr[] __attribute__ ((aligned (32))) __attribute__
     0x00,0x00,                      /* Service interval for the EP : 0 for bulk */
 };
 
+/* Standard super speed configuration descriptor for EEM */
+const uint8_t CyFxUSBSSConfigDscr_EEM[] __attribute__ ((aligned (32))) __attribute__ ((section(".usbdscr"))) =
+{
+    /* Configuration descriptor */
+    0x09,                           /* Descriptor size */
+    CY_U3P_USB_CONFIG_DESCR,        /* Configuration descriptor type */
+    0x7B,0x00,                      /* Length of this descriptor and all sub descriptors */
+    0x01,                           /* Number of interfaces */
+    0x01,                           /* Configuration number */
+    0x00,                           /* COnfiguration string index */
+    0x80,                           /* Config characteristics - Bus powered */
+    0x64,                           /* Max power consumption of device (in 8mA unit) : 200mA */
+
+
+    /* Interface descriptor #0, alt interface #0, Nothing */
+    0x09,                           /* Descriptor size */
+    CY_U3P_USB_INTRFC_DESCR,        /* Interface Descriptor type */
+    0x00,                           /* Interface number */
+    0x00,                           /* Alternate setting number */
+    0x00,                           /* Number of end points */
+    0x02,                           /* Interface class */
+    0x0C,                           /* Interface sub class */
+    0x07,                           /* Interface protocol code */
+    0x00,                           /* Interface descriptor string index */
+
+
+    /* Interface descriptor #0, alt interface #1, RF */
+    0x09,                           /* Descriptor size */
+    CY_U3P_USB_INTRFC_DESCR,        /* Interface Descriptor type */
+    0x00,                           /* Interface number */
+    0x01,                           /* Alternate setting number */
+    0x04,                           /* Number of end points */
+    0x02,                           /* Interface class: CDC */
+    0x0C,                           /* Interface sub class: EEM */
+    0x07,                           /* Interface protocol code: EEM */
+    0x00,                           /* Interface descriptor string index */
+
+    /* Endpoint descriptor for consumer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    CY_FX_EP_CONSUMER,              /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x04,                      /* Max packet size = 1024 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for Bulk */
+
+    /* Super speed endpoint companion descriptor for consumer EP */
+    0x06,                           /* Descriptor size */
+    CY_U3P_SS_EP_COMPN_DESCR,       /* SS endpoint companion descriptor type */
+    0x0f,                           /* Max no. of packets in a burst : 0: burst 1 packet at a time */
+    0x00,                           /* Max streams for bulk EP = 0 (No streams) */
+    0x00,0x00,                      /* Service interval for the EP : 0 for bulk */
+
+    /* Endpoint descriptor for producer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    CY_FX_EP_PRODUCER,              /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x04,                      /* Max packet size = 1024 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for bulk */
+
+    /* Super speed endpoint companion descriptor for producer EP */
+    0x06,                           /* Descriptor size */
+    CY_U3P_SS_EP_COMPN_DESCR,       /* SS endpoint companion descriptor type */
+    0x0f,                           /* Max no. of packets in a burst : 0: burst 1 packet at a time */
+    0x00,                           /* Max streams for bulk EP = 0 (No streams) */
+    0x00,0x00,                      /* Service interval for the EP : 0 for bulk */
+
+    /* Endpoint descriptor for consumer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    0x82,                           /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x04,                      /* Max packet size = 1024 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for Bulk */
+
+    /* Super speed endpoint companion descriptor for consumer EP */
+    0x06,                           /* Descriptor size */
+    CY_U3P_SS_EP_COMPN_DESCR,       /* SS endpoint companion descriptor type */
+    0x01,                           /* Max no. of packets in a burst : 0: burst 1 packet at a time */
+    0x00,                           /* Max streams for bulk EP = 0 (No streams) */
+    0x00,0x00,                      /* Service interval for the EP : 0 for bulk */
+
+    /* Endpoint descriptor for producer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    BLADE_FPGA_EP_PRODUCER,         /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x04,                      /* Max packet size = 1024 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for bulk */
+
+    /* Super speed endpoint companion descriptor for producer EP */
+    0x06,                           /* Descriptor size */
+    CY_U3P_SS_EP_COMPN_DESCR,       /* SS endpoint companion descriptor type */
+    0x0f,                           /* Max no. of packets in a burst : 0: burst 1 packet at a time */
+    0x00,                           /* Max streams for bulk EP = 0 (No streams) */
+    0x00,0x00,                      /* Service interval for the EP : 0 for bulk */
+
+
+    /* Interface descriptor #0, alt interface #2, FX3 firmware */
+    0x09,                           /* Descriptor size */
+    CY_U3P_USB_INTRFC_DESCR,        /* Interface Descriptor type */
+    0x00,                           /* Interface number */
+    0x02,                           /* Alternate setting number */
+    0x01,                           /* Number of end points */
+    0xFF,                           /* Interface class */
+    0x00,                           /* Interface sub class */
+    0x00,                           /* Interface protocol code */
+    0x00,                           /* Interface descriptor string index */
+
+    /* Endpoint descriptor for producer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    BLADE_FPGA_EP_PRODUCER,         /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x04,                      /* Max packet size = 1024 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for bulk */
+
+    /* Super speed endpoint companion descriptor for producer EP */
+    0x06,                           /* Descriptor size */
+    CY_U3P_SS_EP_COMPN_DESCR,       /* SS endpoint companion descriptor type */
+    0x01,                           /* Max no. of packets in a burst : 0: burst 1 packet at a time */
+    0x00,                           /* Max streams for bulk EP = 0 (No streams) */
+    0x00,0x00,                      /* Service interval for the EP : 0 for bulk */
+
+
+    /* Interface descriptor #0, alt interface #3, FPGA load */
+    0x09,                           /* Descriptor size */
+    CY_U3P_USB_INTRFC_DESCR,        /* Interface Descriptor type */
+    0x00,                           /* Interface number */
+    0x03,                           /* Alternate setting number */
+    0x01,                           /* Number of end points */
+    0xFF,                           /* Interface class */
+    0x00,                           /* Interface sub class */
+    0x00,                           /* Interface protocol code */
+    0x00,                           /* Interface descriptor string index */
+
+    /* Endpoint descriptor for producer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    BLADE_FPGA_EP_PRODUCER,         /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x04,                      /* Max packet size = 1024 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for bulk */
+
+    /* Super speed endpoint companion descriptor for producer EP */
+    0x06,                           /* Descriptor size */
+    CY_U3P_SS_EP_COMPN_DESCR,       /* SS endpoint companion descriptor type */
+    0x01,                           /* Max no. of packets in a burst : 0: burst 1 packet at a time */
+    0x00,                           /* Max streams for bulk EP = 0 (No streams) */
+    0x00,0x00,                      /* Service interval for the EP : 0 for bulk */
+};
+
 /* Standard high speed configuration descriptor */
 const uint8_t CyFxUSBHSConfigDscr[] __attribute__ ((aligned (32))) __attribute__ ((section(".usbdscr"))) =
 {
@@ -251,6 +403,112 @@ const uint8_t CyFxUSBHSConfigDscr[] __attribute__ ((aligned (32))) __attribute__
     0xFF,                           /* Interface class */
     0x00,                           /* Interface sub class */
     0x00,                           /* Interface protocol code */
+    0x00,                           /* Interface descriptor string index */
+
+    /* Endpoint descriptor for producer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    0x01,                           /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x02,                      /* Max packet size = 512 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for bulk */
+
+    /* Endpoint descriptor for producer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    0x81,                           /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x02,                      /* Max packet size = 512 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for bulk */
+
+    /* Endpoint descriptor for producer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    0x02,                           /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x02,                      /* Max packet size = 512 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for bulk */
+
+    /* Endpoint descriptor for producer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    0x82,                           /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x02,                      /* Max packet size = 512 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for bulk */
+
+    /* Interface descriptor #0, alt interface #2, FX3 firmware */
+    0x09,                           /* Descriptor size */
+    CY_U3P_USB_INTRFC_DESCR,        /* Interface Descriptor type */
+    0x00,                           /* Interface number */
+    0x02,                           /* Alternate setting number */
+    0x01,                           /* Number of endpoints */
+    0xFF,                           /* Interface class */
+    0x00,                           /* Interface sub class */
+    0x00,                           /* Interface protocol code */
+    0x00,                           /* Interface descriptor string index */
+
+    /* Endpoint descriptor for producer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    0x01,                           /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x02,                      /* Max packet size = 512 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for bulk */
+
+    /* Interface descriptor #0, alt interface #3, FPGA load */
+    0x09,                           /* Descriptor size */
+    CY_U3P_USB_INTRFC_DESCR,        /* Interface Descriptor type */
+    0x00,                           /* Interface number */
+    0x03,                           /* Alternate setting number */
+    0x01,                           /* Number of endpoints */
+    0xFF,                           /* Interface class */
+    0x00,                           /* Interface sub class */
+    0x00,                           /* Interface protocol code */
+    0x00,                           /* Interface descriptor string index */
+
+    /* Endpoint descriptor for producer EP */
+    0x07,                           /* Descriptor size */
+    CY_U3P_USB_ENDPNT_DESCR,        /* Endpoint descriptor type */
+    BLADE_FPGA_EP_PRODUCER,         /* Endpoint address and description */
+    CY_U3P_USB_EP_BULK,             /* Bulk endpoint type */
+    0x00,0x02,                      /* Max packet size = 512 bytes */
+    0x00,                           /* Servicing interval for data transfers : 0 for bulk */
+};
+
+/* Standard high speed configuration descriptor */
+const uint8_t CyFxUSBHSConfigDscr_EEM[] __attribute__ ((aligned (32))) __attribute__ ((section(".usbdscr"))) =
+{
+    /* Configuration descriptor */
+    0x09,                           /* Descriptor size */
+    CY_U3P_USB_CONFIG_DESCR,        /* Configuration descriptor type */
+    0x57,0x00,                      /* Length of this descriptor and all sub descriptors */
+    0x01,                           /* Number of interfaces */
+    0x01,                           /* Configuration number */
+    0x00,                           /* COnfiguration string index */
+    0x80,                           /* Config characteristics - bus powered */
+    0x64,                           /* Max power consumption of device (in 2mA unit) : 200mA */
+
+    /* Interface descriptor #0, alt interface #0, Nothing */
+    0x09,                           /* Descriptor size */
+    CY_U3P_USB_INTRFC_DESCR,        /* Interface Descriptor type */
+    0x00,                           /* Interface number */
+    0x00,                           /* Alternate setting number */
+    0x00,                           /* Number of endpoints */
+    0x02,                           /* Interface class */
+    0x0C,                           /* Interface sub class */
+    0x07,                           /* Interface protocol code */
+    0x00,                           /* Interface descriptor string index */
+
+    /* Interface descriptor #0, alt interface #1, RF */
+    0x09,                           /* Descriptor size */
+    CY_U3P_USB_INTRFC_DESCR,        /* Interface Descriptor type */
+    0x00,                           /* Interface number */
+    0x01,                           /* Alternate setting number */
+    0x04,                           /* Number of endpoints */
+    0x02,                           /* Interface class: CDC */
+    0x0C,                           /* Interface sub class: EEM */
+    0x07,                           /* Interface protocol code: EEM */
     0x00,                           /* Interface descriptor string index */
 
     /* Endpoint descriptor for producer EP */

@@ -48,6 +48,8 @@
 #define BLADE_USB_CMD_GET_LOOPBACK            114
 #define BLADE_USB_CMD_READ_LOG_ENTRY          115
 
+#define BLADE_USB_CMD_EEM                     200
+
 /* String descriptor indices */
 #define BLADE_USB_STR_INDEX_MFR     1   /* Manufacturer */
 #define BLADE_USB_STR_INDEX_PRODUCT 2   /* Product */
