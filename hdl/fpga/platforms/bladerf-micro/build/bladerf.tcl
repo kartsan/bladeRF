@@ -124,6 +124,8 @@ make_revision foxhunt
 # Create the wlan
 make_revision wlan
 
+# Create the net
+make_revision net
 
 # Projects created!
 puts "${PROJECT_NAME} projects created!"
