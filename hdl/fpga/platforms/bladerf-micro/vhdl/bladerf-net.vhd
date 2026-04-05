@@ -65,7 +65,6 @@ architecture hosted_bladerf of bladerf is
     signal i2c_sda_out            : std_logic;
     signal i2c_sda_oen            : std_logic;
 
-    signal net_sample_fifo        : net_fifo_t       := NET_FIFO_T_DEFAULT;
     signal tx_sample_fifo         : tx_fifo_t       := TX_FIFO_T_DEFAULT;
     signal rx_sample_fifo         : rx_fifo_t       := RX_FIFO_T_DEFAULT;
     signal tx_loopback_fifo       : loopback_fifo_t := LOOPBACK_FIFO_T_DEFAULT;
@@ -183,10 +182,6 @@ architecture hosted_bladerf of bladerf is
     signal wbm_wb_ack_i           : std_logic;
     signal wbm_wb_cyc_o           : std_logic;
 
-    -- Loopback FIFO signals
-    signal loopback_fifo_full     : std_logic;
-    signal loopback_fifo_empty    : std_logic;
-    signal loopback_fifo_q        : std_logic_vector(31 downto 0);
 begin
 
     U_rx_pkt_gen : entity work.rx_packet_generator
@@ -295,8 +290,8 @@ begin
 
             usb_speed           =>  usb_speed_pclk,
 
-            meta_enable         =>  '0',  -- Disable for bulk mode
-            packet_enable       =>  '0',  -- Disable for bulk mode
+            meta_enable         =>  meta_en_pclk,
+            packet_enable       =>  packet_en_pclk,
             rx_enable           =>  rx_enable_pclk,
             tx_enable           =>  tx_enable_pclk,
 
@@ -307,11 +302,11 @@ begin
             ctl_out             =>  fx3_ctl_out,
             ctl_oe              =>  fx3_ctl_oe,
 
-            tx_fifo_write       =>  net_sample_fifo.wreq,
-            tx_fifo_full        =>  net_sample_fifo.wfull,
-            tx_fifo_empty       =>  net_sample_fifo.wempty,
-            tx_fifo_usedw       =>  net_sample_fifo.wused,
-            tx_fifo_data        =>  net_sample_fifo.wdata,
+            tx_fifo_write       =>  tx_sample_fifo.wreq,
+            tx_fifo_full        =>  tx_sample_fifo.wfull,
+            tx_fifo_empty       =>  tx_sample_fifo.wempty,
+            tx_fifo_usedw       =>  tx_sample_fifo.wused,
+            tx_fifo_data        =>  tx_sample_fifo.wdata,
 
             tx_timestamp        =>  fx3_timestamp,
             tx_meta_fifo_write  =>  tx_meta_fifo.wreq,
@@ -320,11 +315,11 @@ begin
             tx_meta_fifo_usedw  =>  tx_meta_fifo.wused,
             tx_meta_fifo_data   =>  tx_meta_fifo.wdata,
 
-            rx_fifo_read        =>  net_sample_fifo.rreq,
-            rx_fifo_full        =>  net_sample_fifo.rfull,
-            rx_fifo_empty       =>  net_sample_fifo.rempty,
-            rx_fifo_usedw       =>  net_sample_fifo.rused,
-            rx_fifo_data        =>  net_sample_fifo.rdata,
+            rx_fifo_read        =>  rx_sample_fifo.rreq,
+            rx_fifo_full        =>  rx_sample_fifo.rfull,
+            rx_fifo_empty       =>  rx_sample_fifo.rempty,
+            rx_fifo_usedw       =>  rx_sample_fifo.rused,
+            rx_fifo_data        =>  rx_sample_fifo.rdata,
 
             rx_meta_fifo_read   =>  rx_meta_fifo.rreq,
             rx_meta_fifo_full   =>  rx_meta_fifo.rfull,
@@ -367,35 +362,6 @@ begin
             end if;
         end if;
     end process;
-
-    -- Loopback FIFO for GPIF data
-    U_loopback_fifo : entity work.sync_fifo
-        generic map (
-            DEPTH       => 2048,
-            WIDTH       => 32,
-            READ_AHEAD  => true
-        )
-        port map (
-            areset      => sys_reset_pclk,
-            clock       => fx3_pclk_pll,
-            data_in     => net_sample_fifo.wdata,
-            write_en    => net_sample_fifo.wreq,
-            data_out    => loopback_fifo_q,
-            read_en     => net_sample_fifo.rreq and not loopback_fifo_empty,
-            full        => loopback_fifo_full,
-            empty       => loopback_fifo_empty,
-            used_words  => open
-        );
-
-    -- Connect loopback FIFO to net_sample_fifo for loopback
-    net_sample_fifo.wfull <= loopback_fifo_full;
-    net_sample_fifo.wempty <= loopback_fifo_empty;
-    net_sample_fifo.rdata <= loopback_fifo_q;
-    net_sample_fifo.rfull <= '0';  -- Not used in this setup
-    net_sample_fifo.rempty <= loopback_fifo_empty;
-    net_sample_fifo.rused <= (others => '0');  -- Not used
-    net_sample_fifo.wused <= (others => '0');  -- Not used
-
 
     -- ========================================================================
     -- NIOS SYSTEM
