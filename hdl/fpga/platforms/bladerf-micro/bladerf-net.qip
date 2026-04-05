@@ -39,6 +39,9 @@ set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhd
 set_global_assignment -name VHDL_FILE [file normalize [file join $common_dir vhdl/fx3_gpif.vhd]]
 # set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/tx.vhd]]
 # set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/rx.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/net.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/fx3_net_gpif_p.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/fx3_net_gpif.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/bladerf-net.vhd]]
 set_global_assignment -name QIP_FILE  [file normalize                  nios_system/synthesis/nios_system.qip]
 
