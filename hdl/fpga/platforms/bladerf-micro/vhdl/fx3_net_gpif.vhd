@@ -172,7 +172,12 @@ begin
             gpif_oe             <= '0';
             gpif_out            <= (others => '1');
             tx_packet_data      <= gpif_in;
-            packet_tx_valid     <= '1' when current.gpif_mode = TX else '0';
+            
+            if current.gpif_mode = TX then
+                packet_tx_valid <= '1';
+            else
+                packet_tx_valid <= '0';
+            end if;
 
             case (current.gpif_mode) is
                 when IDLE =>
