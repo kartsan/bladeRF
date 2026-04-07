@@ -43,7 +43,7 @@
 #define BLADE_FPGA_EP_PRODUCER          0x02
 #define BLADE_FPGA_CONFIG_SOCKET        CY_U3P_UIB_SOCKET_PROD_2
 
-// interface #1
+// interface #1 - RF sample path (GPIF threads RX0/TX3)
 #define BLADE_RF_SAMPLE_EP_PRODUCER     0x01
 #define BLADE_RF_SAMPLE_EP_PRODUCER_USB_SOCKET CY_U3P_UIB_SOCKET_PROD_1
 #define BLADE_UART_EP_PRODUCER          0x02
@@ -54,26 +54,27 @@
 #define BLADE_UART_EP_CONSUMER          0x82
 #define BLADE_UART_EP_CONSUMER_USB_SOCKET CY_U3P_UIB_SOCKET_CONS_2
 
-// interface #2
-// doesn't actually use BULK, EP exists for debugging purposes
+// interface #2 - CDC EEM bulk path (GPIF threads RX1/TX2)
+#define BLADE_RF_EEM_EP_PRODUCER        0x03
+#define BLADE_RF_EEM_EP_PRODUCER_USB_SOCKET CY_U3P_UIB_SOCKET_PROD_3
+#define BLADE_RF_EEM_EP_CONSUMER        0x83
+#define BLADE_RF_EEM_EP_CONSUMER_USB_SOCKET CY_U3P_UIB_SOCKET_CONS_3
 
 /* Extern definitions for the USB Descriptors */
 extern const uint8_t CyFxUSBDeviceQualDscr[];
 extern const uint8_t CyFxUSBFSConfigDscr[];
 extern const uint8_t CyFxUSBHSConfigDscr[];
-extern const uint8_t CyFxUSBHSConfigDscr_EEM[];
 extern const uint8_t CyFxUSBBOSDscr[];
 extern const uint8_t CyFxUSBSSConfigDscr[];
-extern const uint8_t CyFxUSBSSConfigDscr_EEM[];
+extern const uint8_t CyFxUSBSSConfigDscr_DUAL[];
+extern const uint8_t CyFxUSBHSConfigDscr_DUAL[];
 extern const uint8_t CyFxUSBStringLangIDDscr[];
 extern const uint8_t CyFxUSBManufactureDscr[];
 extern const uint8_t CyFxUSB20DeviceDscr_bladeRF1[];
 extern const uint8_t CyFxUSB30DeviceDscr_bladeRF1[];
 extern const uint8_t CyFxUSBProductDscr_bladeRF1[];
 extern const uint8_t CyFxUSB20DeviceDscr_bladeRF2[];
-extern const uint8_t CyFxUSB20DeviceDscr_EEM[];
 extern const uint8_t CyFxUSB30DeviceDscr_bladeRF2[];
-extern const uint8_t CyFxUSB30DeviceDscr_EEM[];
 extern const uint8_t CyFxUSBProductDscr_bladeRF2[];
 
 #include "cyu3externcend.h"
@@ -84,6 +85,8 @@ CyU3PReturnStatus_t ClearDMAChannel(uint8_t ep, CyU3PDmaChannel * handle,
                                     uint32_t count);
 void CyFxAppErrorHandler(CyU3PReturnStatus_t apiRetStatus);
 void NuandAllowSuspend(CyBool_t set_allow_suspend);
+void NuandEEMStart(void);
+void NuandEEMStop(void);
 
 /* defined in bladerf{1,2}.c */
 void NuandFpgaConfigSwFlipLut(uint16_t flipLut[256]);

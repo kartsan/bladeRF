@@ -45,7 +45,8 @@ uint32_t glAppMode = MODE_NO_CONFIG;
 CyU3PThread bladeRFAppThread;
 
 uint8_t glUsbConfiguration = 0;             /* Active USB configuration. */
-uint8_t glUsbAltInterface = 0;                 /* Active USB interface. */
+uint8_t glUsbAltInterface = 0;              /* Interface 0 active alternate setting. */
+uint8_t glUsbAltInterface1 = 0;             /* Interface 1 active alternate setting. */
 
 
 uint8_t glSelBuffer[32];
@@ -232,6 +233,8 @@ static void StopApplication()
             NuandFpgaConfig.stop();
         }
     }
+    /* Always stop EEM on reset/disconnect */
+    NuandEEMStop();
 }
 
 CyBool_t GetStatus(uint16_t endpoint) {
@@ -434,86 +437,6 @@ CyBool_t NuandHandleVendorRequest(
         }
 
         CyU3PUsbSendRetCode(apiRetStatus);
-    break;
-
-    case BLADE_USB_CMD_EEM:
-        StopApplication();
-        apiRetStatus = CY_U3P_SUCCESS;
-        use_feature = wValue;
-        CyU3PGpioGetValue(GPIO_TX_EN, &txen) ;
-        CyU3PGpioGetValue(GPIO_RX_EN, &rxen) ;
-        if (txen == CyFalse && rxen == CyFalse) {
-            CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue) ;
-            CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
-        }
-
-        /* Disable TX and RX for now */
-        CyU3PGpioSetValue(GPIO_RX_EN, CyFalse);
-        CyU3PGpioSetValue(GPIO_TX_EN, CyFalse);
-
-        /* Enable loopback */
-        // NuandRFLinkLoopBack(1);
-
-        if (use_feature) {
-            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_DEVICE_DESCR, 0, (uint8_t *)CyFxUSB30DeviceDscr_EEM);
-            if (apiRetStatus != CY_U3P_SUCCESS) {
-                LOG_ERROR(apiRetStatus);
-                CyFxAppErrorHandler(apiRetStatus);
-            }
-            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_DEVICE_DESCR, 0, (uint8_t *)CyFxUSB20DeviceDscr_EEM);
-            if (apiRetStatus != CY_U3P_SUCCESS) {
-                LOG_ERROR(apiRetStatus);
-                CyFxAppErrorHandler(apiRetStatus);
-            }
-            /* Super speed configuration descriptor */
-            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBSSConfigDscr_EEM);
-            if (apiRetStatus != CY_U3P_SUCCESS) {
-                LOG_ERROR(apiRetStatus);
-                CyFxAppErrorHandler(apiRetStatus);
-            }
-            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBHSConfigDscr_EEM);
-            if (apiRetStatus != CY_U3P_SUCCESS) {
-                LOG_ERROR(apiRetStatus);
-                CyFxAppErrorHandler(apiRetStatus);
-            }
-        } else {
-            const uint8_t *usb3_device_descr;
-            const uint8_t *usb2_device_descr;
-            if (NuandGetProductID() == USB_NUAND_BLADERF_PRODUCT_ID) {
-                usb3_device_descr = CyFxUSB30DeviceDscr_bladeRF1;
-                usb2_device_descr = CyFxUSB20DeviceDscr_bladeRF1;
-            } else {
-                usb3_device_descr = CyFxUSB30DeviceDscr_bladeRF2;
-                usb2_device_descr = CyFxUSB20DeviceDscr_bladeRF2;
-            }
-            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_DEVICE_DESCR, 0, (uint8_t *)usb3_device_descr);
-            if (apiRetStatus != CY_U3P_SUCCESS) {
-                LOG_ERROR(apiRetStatus);
-                CyFxAppErrorHandler(apiRetStatus);
-            }
-            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_DEVICE_DESCR, 0, (uint8_t *)usb2_device_descr);
-            if (apiRetStatus != CY_U3P_SUCCESS) {
-                LOG_ERROR(apiRetStatus);
-                CyFxAppErrorHandler(apiRetStatus);
-            }
-            /* Super speed configuration descriptor */
-            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBSSConfigDscr);
-            if (apiRetStatus != CY_U3P_SUCCESS) {
-                LOG_ERROR(apiRetStatus);
-                CyFxAppErrorHandler(apiRetStatus);
-            }
-            apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBHSConfigDscr);
-            if (apiRetStatus != CY_U3P_SUCCESS) {
-                LOG_ERROR(apiRetStatus);
-                CyFxAppErrorHandler(apiRetStatus);
-            }
-        }
-
-
-        CyU3PUsbSendRetCode(apiRetStatus);
-        CyU3PConnectState(CyFalse, CyTrue);
-        CyU3PThreadSleep(500);
-        CyU3PConnectState(CyTrue, CyTrue);
     break;
 
     case BLADE_USB_CMD_BEGIN_PROG:
@@ -765,9 +688,15 @@ CyBool_t CyFxbladeRFApplnUSBSetupCB(uint32_t setupdat0, uint32_t setupdat1)
 
 
         if (bRequest == CY_U3P_USB_SC_GET_INTERFACE && wLength == 1) {
+            if (wIndex == 0) {
                 bTemp = glUsbAltInterface;
                 CyU3PUsbSendEP0Data(wLength, &bTemp);
                 isHandled = CyTrue;
+            } else if (wIndex == 1) {
+                bTemp = glUsbAltInterface1;
+                CyU3PUsbSendEP0Data(wLength, &bTemp);
+                isHandled = CyTrue;
+            }
         }
 
         if (bRequest == CY_U3P_USB_SC_GET_CONFIGURATION && wLength == 1) {
@@ -825,19 +754,31 @@ CyBool_t CyFxbladeRFApplnUSBSetupCB(uint32_t setupdat0, uint32_t setupdat1)
 /* This is the callback function to handle the USB events. */
 void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
 {
-    int interface;
-    int alt_interface;
+    uint8_t interface;
+    uint8_t alt_interface;
     switch (evtype)
     {
         case CY_U3P_USB_EVENT_SETINTF:
             interface = (evdata & 0xf0) >> 4;
             alt_interface = evdata & 0xf;
 
-            /* Only support sets to interface 0 for now */
+            /* Interface 1 (CDC EEM) has only alt 0; track it and ignore here. */
+            if (interface == 1) {
+                glUsbAltInterface1 = alt_interface;
+                break;
+            }
+
+            /* Only interface 0 controls application modes. */
             if(interface != 0) break;
 
             /* Don't do anything if we're setting the same interface over */
             if( alt_interface == glUsbAltInterface ) break ;
+
+            /* Alt 0 (disabled) is a quick exit; don't call blocking .stop() functions. */
+            if (alt_interface == 0) {
+                glUsbAltInterface = alt_interface;
+                break;
+            }
 
             /* Stop whatever we were doing */
             switch(glUsbAltInterface) {
@@ -866,6 +807,8 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
         case CY_U3P_USB_EVENT_DISCONNECT:
             /* Stop the loop back function. */
             StopApplication();
+            glUsbAltInterface = 0;
+            glUsbAltInterface1 = 0;
             break;
 
         default:
@@ -994,14 +937,14 @@ void bladeRFInit(void)
     }
 
     /* Super speed configuration descriptor */
-    apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBSSConfigDscr);
+    apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBSSConfigDscr_DUAL);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
         CyFxAppErrorHandler(apiRetStatus);
     }
 
     /* High speed configuration descriptor */
-    apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBHSConfigDscr);
+    apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBHSConfigDscr_DUAL);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
         CyFxAppErrorHandler(apiRetStatus);
@@ -1082,6 +1025,10 @@ void bladeRFAppThread_Entry( uint32_t input)
     NuandFpgaConfigSwInit();
 
     bladeRFInit();
+
+    /* Initialise EEM interface */
+    NuandEEMStart();
+
     /* XXX Why do we need an 800ms delay here? It appears required for the FPGA
      * load...
      *
