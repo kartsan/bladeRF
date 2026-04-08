@@ -38,6 +38,8 @@ static CyU3PDmaChannel glChHandlePtoU;
 static CyU3PDmaChannel glChHandleEEMUtoP;  /* USB→FPGA: EP 0x03 OUT → PIB_SOCKET_2 (TX2) */
 static CyU3PDmaChannel glChHandleEEMPtoU;  /* FPGA→USB: PIB_SOCKET_1 (RX1) → EP 0x83 IN  */
 
+/* EEM is managed independently from Interface 0 RF_LINK.
+ * It is started/stopped explicitly by the USB control path. */
 static CyBool_t glEEMActive = CyFalse;
 static int loopback = 0;
 static int loopback_when_created;
@@ -228,8 +230,20 @@ static void UartBridgeStop(void)
 }
 
 
+/* Disable EEM endpoints without affecting RF sample/UART endpoints. */
+static void EEMDisableEndpoints(void)
+{
+    CyU3PEpConfig_t epCfg;
+
+    CyU3PMemSet((uint8_t *)&epCfg, 0, sizeof(epCfg));
+    epCfg.enable = CyFalse;
+
+    (void)CyU3PSetEpConfig(BLADE_RF_EEM_EP_PRODUCER, &epCfg);
+    (void)CyU3PSetEpConfig(BLADE_RF_EEM_EP_CONSUMER, &epCfg);
+}
+
 /* Initialize EEM (CDC Ethernet Emulation) DMA channels and endpoints.
- * These are persistent and always available, independent of Interface 0 mode changes. */
+ * This path is on-demand and independent of Interface 0 mode changes. */
 void NuandEEMStart(void)
 {
     CyU3PEpConfig_t epCfg;
@@ -275,6 +289,7 @@ void NuandEEMStart(void)
     apiRetStatus = CyU3PSetEpConfig(BLADE_RF_EEM_EP_CONSUMER, &epCfg);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
+        EEMDisableEndpoints();
         return;
     }
 
@@ -295,6 +310,7 @@ void NuandEEMStart(void)
     apiRetStatus = CyU3PDmaChannelCreate(&glChHandleEEMUtoP, CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
+        EEMDisableEndpoints();
         return;
     }
 
@@ -306,6 +322,7 @@ void NuandEEMStart(void)
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
         CyU3PDmaChannelDestroy(&glChHandleEEMUtoP);
+        EEMDisableEndpoints();
         return;
     }
 
@@ -317,6 +334,7 @@ void NuandEEMStart(void)
         LOG_ERROR(apiRetStatus);
         CyU3PDmaChannelDestroy(&glChHandleEEMPtoU);
         CyU3PDmaChannelDestroy(&glChHandleEEMUtoP);
+        EEMDisableEndpoints();
         return;
     }
 
@@ -325,6 +343,7 @@ void NuandEEMStart(void)
         LOG_ERROR(apiRetStatus);
         CyU3PDmaChannelDestroy(&glChHandleEEMPtoU);
         CyU3PDmaChannelDestroy(&glChHandleEEMUtoP);
+        EEMDisableEndpoints();
         return;
     }
 
@@ -332,7 +351,7 @@ void NuandEEMStart(void)
 }
 
 /* Cleanup and shutdown EEM DMA channels and endpoints.
- * Called on USB RESET or DISCONNECT. */
+ * Called on USB RESET/DISCONNECT or explicit EEM teardown. */
 void NuandEEMStop(void)
 {
     CyU3PEpConfig_t epCfg;
@@ -587,7 +606,7 @@ CyU3PReturnStatus_t NuandRFLinkResetEndpoint(uint8_t endpoint)
                 status = ClearDMAChannel(endpoint, &glChHandleEEMUtoP,
                                          BLADE_DMA_TX_SIZE);
             } else {
-                status = CY_U3P_SUCCESS;
+                status = CY_U3P_ERROR_BAD_ARGUMENT;
             }
             break;
 
@@ -596,7 +615,7 @@ CyU3PReturnStatus_t NuandRFLinkResetEndpoint(uint8_t endpoint)
                 status = ClearDMAChannel(endpoint, &glChHandleEEMPtoU,
                                          BLADE_DMA_TX_SIZE);
             } else {
-                status = CY_U3P_SUCCESS;
+                status = CY_U3P_ERROR_BAD_ARGUMENT;
             }
             break;
     }
@@ -614,11 +633,18 @@ CyBool_t NuandRFLinkHaltEndpoint(CyBool_t set, uint16_t endpoint)
     case BLADE_RF_SAMPLE_EP_CONSUMER:
     case BLADE_UART_EP_PRODUCER:
     case BLADE_UART_EP_CONSUMER:
-    case BLADE_RF_EEM_EP_PRODUCER:
-    case BLADE_RF_EEM_EP_CONSUMER:
         isHandled = !set;
         RF_status_bits[endpoint] = set;
         status = NuandRFLinkResetEndpoint(endpoint);
+        break;
+
+    case BLADE_RF_EEM_EP_PRODUCER:
+    case BLADE_RF_EEM_EP_CONSUMER:
+        if (glEEMActive) {
+            isHandled = !set;
+            RF_status_bits[endpoint] = set;
+            status = NuandRFLinkResetEndpoint(endpoint);
+        }
         break;
     }
 
@@ -641,10 +667,16 @@ CyBool_t NuandRFLinkHalted(uint16_t endpoint, uint8_t * data)
     case BLADE_RF_SAMPLE_EP_CONSUMER:
     case BLADE_UART_EP_PRODUCER:
     case BLADE_UART_EP_CONSUMER:
-    case BLADE_RF_EEM_EP_PRODUCER:
-    case BLADE_RF_EEM_EP_CONSUMER:
         *data = RF_status_bits[endpoint];
         isHandled = CyTrue;
+        break;
+
+    case BLADE_RF_EEM_EP_PRODUCER:
+    case BLADE_RF_EEM_EP_CONSUMER:
+        if (glEEMActive) {
+            *data = RF_status_bits[endpoint];
+            isHandled = CyTrue;
+        }
         break;
     }
 
