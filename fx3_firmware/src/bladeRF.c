@@ -756,37 +756,16 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
 {
     uint8_t interface;
     uint8_t alt_interface;
-    uint8_t byte_hi_interface;
-    uint8_t byte_lo_alt;
-    uint8_t byte_lo_interface;
-    uint8_t byte_hi_alt;
     switch (evtype)
     {
         case CY_U3P_USB_EVENT_SETINTF:
-            /* FX3 SDK event payload has appeared in multiple formats.
-             * Support both byte orders plus the older nibble-packed form.
-             *
-             * Prefer the interface-0 interpretation when the byte-packed
-             * forms are ambiguous, because host mode switches always target
-             * interface 0 while interface 1 has no application mode changes.
-             */
-            byte_hi_interface = (uint8_t)((evdata >> 8) & 0xFF);
-            byte_lo_alt = (uint8_t)(evdata & 0xFF);
-            byte_lo_interface = byte_lo_alt;
-            byte_hi_alt = byte_hi_interface;
+            /* FX3 SDK payload has appeared in both byte-packed and
+             * nibble-packed forms across versions. Decode byte-packed first
+             * and fall back to nibble-packed if it looks invalid. */
+            interface = (uint8_t)((evdata >> 8) & 0xFF);
+            alt_interface = (uint8_t)(evdata & 0xFF);
 
-            if ((byte_hi_interface == 1) && (byte_lo_alt == 0) &&
-                (byte_lo_interface == 0) && (byte_hi_alt <= USB_IF_SPI_FLASH) &&
-                (byte_hi_alt != glUsbAltInterface)) {
-                interface = byte_lo_interface;
-                alt_interface = byte_hi_alt;
-            } else if ((byte_hi_interface <= 1) && (byte_lo_alt <= USB_IF_SPI_FLASH)) {
-                interface = byte_hi_interface;
-                alt_interface = byte_lo_alt;
-            } else if ((byte_lo_interface <= 1) && (byte_hi_alt <= USB_IF_SPI_FLASH)) {
-                interface = byte_lo_interface;
-                alt_interface = byte_hi_alt;
-            } else {
+            if (interface > 1 || alt_interface > USB_IF_SPI_FLASH) {
                 interface = (uint8_t)((evdata & 0xF0) >> 4);
                 alt_interface = (uint8_t)(evdata & 0x0F);
             }
@@ -828,14 +807,6 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
 
         case CY_U3P_USB_EVENT_SETCONF:
             glUsbConfiguration = evdata;
-#if 0
-            if (glUsbConfiguration != 0) {
-                /* Start persistent EEM endpoints/channels only after USB is configured. */
-                NuandEEMStart();
-            } else {
-                NuandEEMStop();
-            }
-#endif
             break;
 
         case CY_U3P_USB_EVENT_RESET:
