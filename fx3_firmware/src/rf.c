@@ -38,6 +38,7 @@ static CyU3PDmaChannel glChHandlePtoU;
 static CyU3PDmaChannel glChHandleEEMUtoP;  /* USB→FPGA: EP 0x03 OUT → PIB_SOCKET_2 (TX2) */
 static CyU3PDmaChannel glChHandleEEMPtoU;  /* FPGA→USB: PIB_SOCKET_1 (RX1) → EP 0x83 IN  */
 
+static CyBool_t glEEMActive = CyFalse;
 static int loopback = 0;
 static int loopback_when_created;
 
@@ -237,6 +238,10 @@ void NuandEEMStart(void)
     CyU3PUSBSpeed_t usbSpeed = CyU3PUsbGetSpeed();
     uint16_t size = 0;
 
+    if (glEEMActive) {
+        return;
+    }
+
     /* Determine max packet size based on USB speed */
     switch (usbSpeed) {
         case CY_U3P_FULL_SPEED:
@@ -264,13 +269,13 @@ void NuandEEMStart(void)
     apiRetStatus = CyU3PSetEpConfig(BLADE_RF_EEM_EP_PRODUCER, &epCfg);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+        return;
     }
 
     apiRetStatus = CyU3PSetEpConfig(BLADE_RF_EEM_EP_CONSUMER, &epCfg);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+        return;
     }
 
     /* EEM DMA: USB OUT (EP 0x03) → FPGA PIB_SOCKET_2 (TX2) */
@@ -290,7 +295,7 @@ void NuandEEMStart(void)
     apiRetStatus = CyU3PDmaChannelCreate(&glChHandleEEMUtoP, CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+        return;
     }
 
     /* EEM DMA: FPGA PIB_SOCKET_1 (RX1) → USB IN (EP 0x83) */
@@ -300,7 +305,8 @@ void NuandEEMStart(void)
     apiRetStatus = CyU3PDmaChannelCreate(&glChHandleEEMPtoU, CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+        CyU3PDmaChannelDestroy(&glChHandleEEMUtoP);
+        return;
     }
 
     CyU3PUsbFlushEp(BLADE_RF_EEM_EP_PRODUCER);
@@ -309,14 +315,20 @@ void NuandEEMStart(void)
     apiRetStatus = CyU3PDmaChannelSetXfer(&glChHandleEEMUtoP, BLADE_DMA_TX_SIZE);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+        CyU3PDmaChannelDestroy(&glChHandleEEMPtoU);
+        CyU3PDmaChannelDestroy(&glChHandleEEMUtoP);
+        return;
     }
 
     apiRetStatus = CyU3PDmaChannelSetXfer(&glChHandleEEMPtoU, BLADE_DMA_TX_SIZE);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+        CyU3PDmaChannelDestroy(&glChHandleEEMPtoU);
+        CyU3PDmaChannelDestroy(&glChHandleEEMUtoP);
+        return;
     }
+
+    glEEMActive = CyTrue;
 }
 
 /* Cleanup and shutdown EEM DMA channels and endpoints.
@@ -325,6 +337,10 @@ void NuandEEMStop(void)
 {
     CyU3PEpConfig_t epCfg;
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
+
+    if (!glEEMActive) {
+        return;
+    }
 
     /* Flush and destroy EEM DMA channels */
     CyU3PUsbFlushEp(BLADE_RF_EEM_EP_PRODUCER);
@@ -339,14 +355,14 @@ void NuandEEMStop(void)
     apiRetStatus = CyU3PSetEpConfig(BLADE_RF_EEM_EP_PRODUCER, &epCfg);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
     }
 
     apiRetStatus = CyU3PSetEpConfig(BLADE_RF_EEM_EP_CONSUMER, &epCfg);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
     }
+
+    glEEMActive = CyFalse;
 }
 
 /* This function starts the RF data transport mechanism. This is the second
@@ -567,13 +583,21 @@ CyU3PReturnStatus_t NuandRFLinkResetEndpoint(uint8_t endpoint)
             break;
 
         case BLADE_RF_EEM_EP_PRODUCER:
-            status = ClearDMAChannel(endpoint, &glChHandleEEMUtoP,
-                                     BLADE_DMA_TX_SIZE);
+            if (glEEMActive) {
+                status = ClearDMAChannel(endpoint, &glChHandleEEMUtoP,
+                                         BLADE_DMA_TX_SIZE);
+            } else {
+                status = CY_U3P_SUCCESS;
+            }
             break;
 
         case BLADE_RF_EEM_EP_CONSUMER:
-            status = ClearDMAChannel(endpoint, &glChHandleEEMPtoU,
-                                     BLADE_DMA_TX_SIZE);
+            if (glEEMActive) {
+                status = ClearDMAChannel(endpoint, &glChHandleEEMPtoU,
+                                         BLADE_DMA_TX_SIZE);
+            } else {
+                status = CY_U3P_SUCCESS;
+            }
             break;
     }
 

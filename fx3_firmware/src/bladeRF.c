@@ -234,7 +234,7 @@ static void StopApplication()
         }
     }
     /* Always stop EEM on reset/disconnect */
-    NuandEEMStop();
+    //NuandEEMStop();
 }
 
 CyBool_t GetStatus(uint16_t endpoint) {
@@ -756,11 +756,40 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
 {
     uint8_t interface;
     uint8_t alt_interface;
+    uint8_t byte_hi_interface;
+    uint8_t byte_lo_alt;
+    uint8_t byte_lo_interface;
+    uint8_t byte_hi_alt;
     switch (evtype)
     {
         case CY_U3P_USB_EVENT_SETINTF:
-            interface = (evdata & 0xf0) >> 4;
-            alt_interface = evdata & 0xf;
+            /* FX3 SDK event payload has appeared in multiple formats.
+             * Support both byte orders plus the older nibble-packed form.
+             *
+             * Prefer the interface-0 interpretation when the byte-packed
+             * forms are ambiguous, because host mode switches always target
+             * interface 0 while interface 1 has no application mode changes.
+             */
+            byte_hi_interface = (uint8_t)((evdata >> 8) & 0xFF);
+            byte_lo_alt = (uint8_t)(evdata & 0xFF);
+            byte_lo_interface = byte_lo_alt;
+            byte_hi_alt = byte_hi_interface;
+
+            if ((byte_hi_interface == 1) && (byte_lo_alt == 0) &&
+                (byte_lo_interface == 0) && (byte_hi_alt <= USB_IF_SPI_FLASH) &&
+                (byte_hi_alt != glUsbAltInterface)) {
+                interface = byte_lo_interface;
+                alt_interface = byte_hi_alt;
+            } else if ((byte_hi_interface <= 1) && (byte_lo_alt <= USB_IF_SPI_FLASH)) {
+                interface = byte_hi_interface;
+                alt_interface = byte_lo_alt;
+            } else if ((byte_lo_interface <= 1) && (byte_hi_alt <= USB_IF_SPI_FLASH)) {
+                interface = byte_lo_interface;
+                alt_interface = byte_hi_alt;
+            } else {
+                interface = (uint8_t)((evdata & 0xF0) >> 4);
+                alt_interface = (uint8_t)(evdata & 0x0F);
+            }
 
             /* Interface 1 (CDC EEM) has only alt 0; track it and ignore here. */
             if (interface == 1) {
@@ -774,18 +803,16 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
             /* Don't do anything if we're setting the same interface over */
             if( alt_interface == glUsbAltInterface ) break ;
 
-            /* Alt 0 (disabled) is a quick exit; don't call blocking .stop() functions. */
-            if (alt_interface == 0) {
-                glUsbAltInterface = alt_interface;
-                break;
+            /* Stop whatever is currently active before changing interface. */
+            StopApplication();
+            if (glUsbAltInterface == USB_IF_SPI_FLASH) {
+                NuandFlashDeinit();
             }
 
-            /* Stop whatever we were doing */
-            switch(glUsbAltInterface) {
-                case USB_IF_CONFIG: NuandFpgaConfig.stop() ; break ;
-                case USB_IF_RF_LINK: NuandRFLink.stop(); break ;
-                case USB_IF_SPI_FLASH: NuandFlashDeinit(); break ;
-                default: break ;
+            /* Alt 0 means no active application mode. */
+            if (alt_interface == 0) {
+                glUsbAltInterface = 0;
+                break;
             }
 
             /* Start up the new one */
@@ -801,12 +828,21 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
 
         case CY_U3P_USB_EVENT_SETCONF:
             glUsbConfiguration = evdata;
+#if 0
+            if (glUsbConfiguration != 0) {
+                /* Start persistent EEM endpoints/channels only after USB is configured. */
+                NuandEEMStart();
+            } else {
+                NuandEEMStop();
+            }
+#endif
             break;
 
         case CY_U3P_USB_EVENT_RESET:
         case CY_U3P_USB_EVENT_DISCONNECT:
             /* Stop the loop back function. */
             StopApplication();
+            NuandEEMStop();
             glUsbAltInterface = 0;
             glUsbAltInterface1 = 0;
             break;
@@ -1025,9 +1061,6 @@ void bladeRFAppThread_Entry( uint32_t input)
     NuandFpgaConfigSwInit();
 
     bladeRFInit();
-
-    /* Initialise EEM interface */
-    NuandEEMStart();
 
     /* XXX Why do we need an 800ms delay here? It appears required for the FPGA
      * load...
