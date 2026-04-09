@@ -80,13 +80,21 @@ architecture hosted_bladerf of bladerf is
     signal eem_rx_fifo_empty_pclk : std_logic := '1';
     signal eem_rx_fifo_data_pclk  : std_logic_vector(31 downto 0) := (others => '0');
 
+    -- eem_deframer output → eem_stack input
     signal eem_packet_data_pclk   : std_logic_vector(31 downto 0) := (others => '0');
     signal eem_packet_valid_pclk  : std_logic := '0';
     signal eem_packet_start_pclk  : std_logic := '0';
     signal eem_packet_end_pclk    : std_logic := '0';
     signal eem_packet_empty_pclk  : std_logic_vector(1 downto 0) := (others => '0');
-    signal eem_packet_passthrough_pclk : std_logic_vector(31 downto 0) := (others => '0');
-    signal eem_packet_type_pclk   : std_logic_vector(1 downto 0) := (others => '0');
+    -- eem_stack application interface placeholders
+    signal eem_udp_rx_data_pclk   : std_logic_vector(7 downto 0) := (others => '0');
+    signal eem_udp_rx_active_pclk : std_logic := '0';
+    signal eem_broadcast_pclk     : std_logic := '0';
+    signal eem_dst_unreachable_pclk : std_logic := '0';
+    -- eem_tx_framer → FIFO → GPIF RX1
+    signal eem_out_fifo_write     : std_logic := '0';
+    signal eem_out_fifo_full      : std_logic := '0';
+    signal eem_out_fifo_data      : std_logic_vector(31 downto 0) := (others => '0');
 
     signal usb_speed_pclk         : std_logic;
     signal usb_speed_rx           : std_logic;
@@ -373,8 +381,7 @@ begin
 
     fx3_ctl_in <= fx3_ctl;
 
-    -- Strip CDC-EEM framing in the FX3 clock domain before handing frames to
-    -- the Ethernet/IP parser.
+    -- EEM deframer: strip CDC-EEM framing, emit word-stream with boundary markers.
     U_eem_deframer : entity work.eem_deframer
         port map (
             clock            => fx3_pclk_pll,
@@ -388,17 +395,53 @@ begin
             eth_packet_empty => eem_packet_empty_pclk
         );
 
-    -- Stage-2 EEM path: consume deframed host->FPGA Ethernet traffic directly
-    -- in the FX3 pclk domain.
-    U_eem_net : entity work.net
+    -- Full HPSDR-derived networking stack: ARP, ICMP, UDP receive and send.
+    -- The stack is entirely in the FX3 pclk domain.
+    -- TX frames are written directly to the FPGA→host RX1 FIFO.
+    U_eem_stack : entity work.eem_stack
         port map (
-            clock        => fx3_pclk_pll,
-            reset        => sys_reset_pclk,
-            data_in      => eem_packet_data_pclk,
-            packet_start => eem_packet_start_pclk,
-            data_valid   => eem_packet_valid_pclk,
-            data_out     => eem_packet_passthrough_pclk,
-            packet_type  => eem_packet_type_pclk
+            clock              => fx3_pclk_pll,
+            reset              => sys_reset_pclk,
+            eth_data_in        => eem_packet_data_pclk,
+            eth_data_valid     => eem_packet_valid_pclk,
+            eth_packet_start   => eem_packet_start_pclk,
+            eth_packet_end     => eem_packet_end_pclk,
+            eth_packet_empty   => eem_packet_empty_pclk,
+            eem_fifo_write     => eem_out_fifo_write,
+            eem_fifo_full      => eem_out_fifo_full,
+            eem_fifo_data      => eem_out_fifo_data,
+            udp_rx_data        => eem_udp_rx_data_pclk,
+            udp_rx_active      => eem_udp_rx_active_pclk,
+            udp_tx_data        => (others => '0'),
+            udp_tx_length      => (others => '0'),
+            udp_tx_enable      => '0',
+            udp_tx_active      => open,
+            udp_tx_port        => (others => '0'),
+            broadcast          => eem_broadcast_pclk,
+            dst_unreachable    => eem_dst_unreachable_pclk
+        );
+
+    -- Staging FIFO between eem_tx_framer output and GPIF RX1 read port.
+    -- Both sides run on fx3_pclk_pll so clocks are synchronised.
+    U_eem_out_fifo : entity work.eem_fifo
+        generic map (
+            CLOCKS_ARE_SYNCHRONIZED => "TRUE",
+            LPM_NUMWORDS            => 512
+        )
+        port map (
+            aclr    => sys_reset_pclk,
+            data    => eem_out_fifo_data,
+            wrclk   => fx3_pclk_pll,
+            wrreq   => eem_out_fifo_write,
+            wrfull  => eem_out_fifo_full,
+            rdclk   => fx3_pclk_pll,
+            rdreq   => eem_rx_fifo_read_pclk,
+            q       => eem_rx_fifo_data_pclk,
+            rdempty => eem_rx_fifo_empty_pclk,
+            wrempty => open,
+            rdfull  => open,
+            rdusedw => open,
+            wrusedw => open
         );
 
     toggle_led1 : process(fx3_pclk_pll)
