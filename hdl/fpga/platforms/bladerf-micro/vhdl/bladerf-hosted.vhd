@@ -72,6 +72,22 @@ architecture hosted_bladerf of bladerf is
     signal tx_meta_fifo           : meta_fifo_tx_t := META_FIFO_TX_T_DEFAULT;
     signal rx_meta_fifo           : meta_fifo_rx_t := META_FIFO_RX_T_DEFAULT;
 
+    -- EEM lane in FX3 pclk domain (no CDC FIFO in this stage)
+    signal eem_tx_fifo_write_pclk : std_logic;
+    signal eem_tx_fifo_full_pclk  : std_logic := '0';
+    signal eem_tx_fifo_data_pclk  : std_logic_vector(31 downto 0) := (others => '0');
+    signal eem_rx_fifo_read_pclk  : std_logic;
+    signal eem_rx_fifo_empty_pclk : std_logic := '1';
+    signal eem_rx_fifo_data_pclk  : std_logic_vector(31 downto 0) := (others => '0');
+
+    signal eem_packet_data_pclk   : std_logic_vector(31 downto 0) := (others => '0');
+    signal eem_packet_valid_pclk  : std_logic := '0';
+    signal eem_packet_start_pclk  : std_logic := '0';
+    signal eem_packet_end_pclk    : std_logic := '0';
+    signal eem_packet_empty_pclk  : std_logic_vector(1 downto 0) := (others => '0');
+    signal eem_packet_passthrough_pclk : std_logic_vector(31 downto 0) := (others => '0');
+    signal eem_packet_type_pclk   : std_logic_vector(1 downto 0) := (others => '0');
+
     signal usb_speed_pclk         : std_logic;
     signal usb_speed_rx           : std_logic;
     signal usb_speed_tx           : std_logic;
@@ -324,7 +340,14 @@ begin
             rx_meta_fifo_full   =>  rx_meta_fifo.rfull,
             rx_meta_fifo_empty  =>  rx_meta_fifo.rempty,
             rx_meta_fifo_usedr  =>  rx_meta_fifo.rused,
-            rx_meta_fifo_data   =>  rx_meta_fifo.rdata
+            rx_meta_fifo_data   =>  rx_meta_fifo.rdata,
+
+            eem_tx_fifo_write   =>  eem_tx_fifo_write_pclk,
+            eem_tx_fifo_full    =>  eem_tx_fifo_full_pclk,
+            eem_tx_fifo_data    =>  eem_tx_fifo_data_pclk,
+            eem_rx_fifo_read    =>  eem_rx_fifo_read_pclk,
+            eem_rx_fifo_empty   =>  eem_rx_fifo_empty_pclk,
+            eem_rx_fifo_data    =>  eem_rx_fifo_data_pclk
         );
 
     -- FX3 GPIF bidirectional signal control
@@ -349,6 +372,34 @@ begin
     end generate;
 
     fx3_ctl_in <= fx3_ctl;
+
+    -- Strip CDC-EEM framing in the FX3 clock domain before handing frames to
+    -- the Ethernet/IP parser.
+    U_eem_deframer : entity work.eem_deframer
+        port map (
+            clock            => fx3_pclk_pll,
+            reset            => sys_reset_pclk,
+            eem_data_in      => eem_tx_fifo_data_pclk,
+            eem_data_valid   => eem_tx_fifo_write_pclk,
+            eth_data_out     => eem_packet_data_pclk,
+            eth_data_valid   => eem_packet_valid_pclk,
+            eth_packet_start => eem_packet_start_pclk,
+            eth_packet_end   => eem_packet_end_pclk,
+            eth_packet_empty => eem_packet_empty_pclk
+        );
+
+    -- Stage-2 EEM path: consume deframed host->FPGA Ethernet traffic directly
+    -- in the FX3 pclk domain.
+    U_eem_net : entity work.net
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+            data_in      => eem_packet_data_pclk,
+            packet_start => eem_packet_start_pclk,
+            data_valid   => eem_packet_valid_pclk,
+            data_out     => eem_packet_passthrough_pclk,
+            packet_type  => eem_packet_type_pclk
+        );
 
     toggle_led1 : process(fx3_pclk_pll)
         variable count : natural range 0 to 10_000_000 := 10_000_000;
