@@ -75,7 +75,17 @@ entity fx3_gpif is
     rx_meta_fifo_full   :   in  std_logic;
     rx_meta_fifo_empty  :   in  std_logic;
     rx_meta_fifo_usedr  :   in  std_logic_vector;
-    rx_meta_fifo_data   :   in  std_logic_vector(31 downto 0)
+        rx_meta_fifo_data   :   in  std_logic_vector(31 downto 0);
+
+        -- EEM TX FIFO (host->FPGA, mapped to DMA TX2)
+        eem_tx_fifo_write   :   out std_logic;
+        eem_tx_fifo_full    :   in  std_logic;
+        eem_tx_fifo_data    :   out std_logic_vector(31 downto 0);
+
+        -- EEM RX FIFO (FPGA->host, mapped to DMA RX1)
+        eem_rx_fifo_read    :   out std_logic;
+        eem_rx_fifo_empty   :   in  std_logic;
+        eem_rx_fifo_data    :   in  std_logic_vector(31 downto 0)
   );
 end entity;
 
@@ -287,11 +297,13 @@ begin
             gpif_oe             <= '1';
             gpif_out            <= (others => '0');
             tx_fifo_data        <= (others => '0');
+            eem_tx_fifo_data    <= (others => '0');
             tx_meta_fifo_data   <= (others => '0');
         elsif (rising_edge(pclk)) then
             gpif_oe             <= '0';
             gpif_out            <= (others => '1');
             tx_fifo_data        <= gpif_in;
+            eem_tx_fifo_data    <= gpif_in;
             tx_meta_fifo_data   <= gpif_in;
 
             case (current.gpif_mode) is
@@ -300,7 +312,11 @@ begin
 
                 when RX =>
                     gpif_oe         <= '1';
-                    gpif_out        <= rx_fifo_data;
+                    if (current.rx_current_dma = RX1) then
+                        gpif_out    <= eem_rx_fifo_data;
+                    else
+                        gpif_out    <= rx_fifo_data;
+                    end if;
 
                 when RX_META =>
                     gpif_oe         <= '1';
@@ -321,6 +337,7 @@ begin
                 when TX =>
                     gpif_oe         <= '0';
                     tx_fifo_data    <= gpif_in;
+                    eem_tx_fifo_data <= gpif_in;
                 when TX_META =>
                     gpif_oe         <= '0';
                     tx_meta_fifo_data <= current.meta_buf(127 downto 96);
@@ -337,6 +354,10 @@ begin
         variable rx_dma_req : boolean;
         variable tx_dma_req : boolean;
         variable rx_meta_ok : boolean;
+        variable rx0_ready  : boolean;
+        variable rx1_ready  : boolean;
+        variable tx3_ready  : boolean;
+        variable tx2_ready  : boolean;
     begin
         if (reset = '1') then
             can_rx      <= false;
@@ -344,17 +365,22 @@ begin
         elsif (rising_edge(pclk)) then
             rx_dma_req := dma_req.rx0 = '1' or dma_req.rx1 = '1';
             rx_meta_ok := meta_enable = '1' nand rx_meta_fifo_empty = '1';
+            rx0_ready := rx_fifo_enough and rx_meta_ok;
+            rx1_ready := eem_rx_fifo_empty = '0';
 
             can_rx <= dma_rx_enable = '1' and
-                      rx_fifo_enough and
                       rx_dma_req and
-                      rx_meta_ok;
+                      ((dma_req.rx0 = '1' and rx0_ready) or
+                       (dma_req.rx1 = '1' and rx1_ready));
 
             tx_dma_req := dma_req.tx2 = '1' or dma_req.tx3 = '1';
+            tx3_ready := tx_fifo_enough;
+            tx2_ready := eem_tx_fifo_full = '0';
 
             can_tx <= dma_tx_enable = '1' and
-                      tx_fifo_enough and
-                      tx_dma_req;
+                      tx_dma_req and
+                      ((dma_req.tx3 = '1' and tx3_ready) or
+                       (dma_req.tx2 = '1' and tx2_ready));
         end if;
     end process;
 
@@ -416,18 +442,31 @@ begin
                 -- signal. However, if RX is about to overflow, we'll choose that.
                 if (current.dma_idle = '1') then
                     future.dma_downcount <= gpif_buf_size-1;
-                    if (can_rx and rx_fifo_critical) then
+                    if (can_rx and rx_fifo_critical and dma_req.rx0 = '1') then
                         future.ack_downcount    <= ACK_DOWNCOUNT_READ;
                         future.rx_current_dma   <= RX0;
                         future.state            <= SETUP_RD;
                     elsif (can_tx) then
-                        future.ack_downcount    <= ACK_DOWNCOUNT_WRITE;
-                        future.tx_current_dma   <= TX3;
-                        future.state            <= SETUP_WR;
+                        if (dma_req.tx3 = '1' and tx_fifo_enough) then
+                            future.ack_downcount    <= ACK_DOWNCOUNT_WRITE;
+                            future.tx_current_dma   <= TX3;
+                            future.state            <= SETUP_WR;
+                        elsif (dma_req.tx2 = '1' and eem_tx_fifo_full = '0') then
+                            future.ack_downcount    <= ACK_DOWNCOUNT_WRITE;
+                            future.tx_current_dma   <= TX2;
+                            future.state            <= SETUP_WR;
+                        end if;
                     elsif (can_rx) then
-                        future.ack_downcount    <= ACK_DOWNCOUNT_READ;
-                        future.rx_current_dma   <= RX0;
-                        future.state            <= SETUP_RD;
+                        if (dma_req.rx0 = '1' and rx_fifo_enough and
+                            (meta_enable = '0' or rx_meta_fifo_empty = '0')) then
+                            future.ack_downcount    <= ACK_DOWNCOUNT_READ;
+                            future.rx_current_dma   <= RX0;
+                            future.state            <= SETUP_RD;
+                        elsif (dma_req.rx1 = '1' and eem_rx_fifo_empty = '0') then
+                            future.ack_downcount    <= ACK_DOWNCOUNT_READ;
+                            future.rx_current_dma   <= RX1;
+                            future.state            <= SETUP_RD;
+                        end if;
                     end if;
                 end if;
 
@@ -440,7 +479,7 @@ begin
                 -- clocks.
 
                 -- GPIF, FIFO, next state depend on rx_meta_en
-                if (current.rx_meta_en = '0') then
+                if (current.rx_current_dma = RX1 or current.rx_meta_en = '0') then
                     future.gpif_mode    <= RX;
                     future.rx_fifo_rd   <= '1';
                     next_state          := SAMPLE_READ;
@@ -503,7 +542,7 @@ begin
                 -- as part of RX metadata.
                 future.underrun_clr     <= '1';
 
-                if (packet_enable = '1' and current.dma_downcount = 0 and current.meta_dword(0) = '1') then
+                if (current.rx_current_dma = RX0 and packet_enable = '1' and current.dma_downcount = 0 and current.meta_dword(0) = '1') then
                     future.gpif_mode        <= IDLE;
                 end if;
 
@@ -533,7 +572,7 @@ begin
                 -- When we're done in this state, check tx_meta_en to decide
                 -- where to go from here
                 if (current.ack_downcount = 0) then
-                    if (current.tx_meta_en = '0') then
+                    if (current.tx_current_dma = TX2 or current.tx_meta_en = '0') then
                         future.state        <= SAMPLE_WRITE;
                         future.gpif_mode    <= TX;
                     else
@@ -577,14 +616,14 @@ begin
                 future.tx_fifo_wr       <= '1';
 
                 -- Set target FIFO depending on tx_meta_en
-                if (current.tx_meta_en = '0') then
+                if (current.tx_current_dma = TX2 or current.tx_meta_en = '0') then
                     future.gpif_mode    <= TX;
                 else
                     future.gpif_mode    <= TX_META;
                 end if;
 
                 -- If meta_downcount is nonzero, flush meta_buf into meta FIFO
-                if (meta_enable = '1' and current.meta_downcount > 0 and
+                if (current.tx_current_dma = TX3 and meta_enable = '1' and current.meta_downcount > 0 and
                          (packet_enable = '0' or (packet_enable = '1' and current.dma_downcount < 6)) ) then
                     future.meta_downcount   <= max(current.meta_downcount-1, -1);
                     future.txm_fifo_wr  <= current.tx_meta_en;
@@ -639,9 +678,22 @@ begin
         dma2_tx_ack             <= current.dma_acks.tx2;
         dma3_tx_ack             <= current.dma_acks.tx3;
 
-        -- FIFO control
-        rx_fifo_read            <= current.rx_fifo_rd;
-        tx_fifo_write           <= current.tx_fifo_wr;
+        -- FIFO control: RX0/TX3 vendor path, RX1/TX2 EEM path
+        if (current.rx_current_dma = RX0) then
+            rx_fifo_read        <= current.rx_fifo_rd;
+            eem_rx_fifo_read    <= '0';
+        else
+            rx_fifo_read        <= '0';
+            eem_rx_fifo_read    <= current.rx_fifo_rd;
+        end if;
+
+        if (current.tx_current_dma = TX3) then
+            tx_fifo_write       <= current.tx_fifo_wr;
+            eem_tx_fifo_write   <= '0';
+        else
+            tx_fifo_write       <= '0';
+            eem_tx_fifo_write   <= current.tx_fifo_wr;
+        end if;
         tx_meta_fifo_write      <= current.txm_fifo_wr;
         rx_meta_fifo_read       <= current.rxm_fifo_rd;
     end process fsm_output_proc;
