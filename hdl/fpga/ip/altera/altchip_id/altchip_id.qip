@@ -23,8 +23,7 @@ set_global_assignment -entity "altchip_id" -library "altchip_id" -name IP_COMPON
 set_global_assignment -entity "altchip_id" -library "altchip_id" -name IP_COMPONENT_PARAMETER "REVWSUNFX0ZBTUlMWQ==::Q3ljbG9uZSBW::REVWSUNFX0ZBTUlMWQ=="
 set_global_assignment -entity "altchip_id" -library "altchip_id" -name IP_COMPONENT_PARAMETER "SURfVkFMVUU=::MTg0NDY3NDQwNzM3MDk1NTE2MTU=::UGxlYXNlIGVudGVyIHRoZSBkZXNpcmVkIFVuaXF1ZSBDaGlwIElEIGluIEhleGFkZWNpbWFsIGZvciBzaW11bGF0aW9uOg=="
 
-set_global_assignment -library "altchip_id" -name VHDL_FILE [file join $::quartus(qip_path) "altchip_id.vhd"]
-set_global_assignment -library "altchip_id" -name VERILOG_FILE [file join $::quartus(qip_path) "altchip_id.v"]
+set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) "altchip_id.v"]
 
 set_global_assignment -entity "altchip_id" -library "altchip_id" -name IP_TOOL_NAME "altchip_id"
 set_global_assignment -entity "altchip_id" -library "altchip_id" -name IP_TOOL_VERSION "20.1"
