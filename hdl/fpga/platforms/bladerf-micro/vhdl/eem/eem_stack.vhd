@@ -18,7 +18,6 @@
 -- as a simple 2-FF synchroniser with no functional crossing needed.
 --
 -- Parameters
---   LOCAL_MAC  : 48-bit MAC address for the bladeRF device
 --   LOCAL_IP   : 32-bit IPv4 address (static, default 192.168.1.10)
 --   LOCAL_PORT : 16-bit UDP port the application listens on (default 1024)
 
@@ -28,13 +27,13 @@ library ieee;
 
 entity eem_stack is
     generic (
-        LOCAL_MAC  : std_logic_vector(47 downto 0) := x"12_22_33_44_55_66";
         LOCAL_IP   : std_logic_vector(31 downto 0) := x"C0A8_010A";  -- 192.168.1.10
         LOCAL_PORT : std_logic_vector(15 downto 0) := x"0400"        -- 1024
     );
     port (
         clock              : in  std_logic;
         reset              : in  std_logic;
+        local_mac          : in  std_logic_vector(47 downto 0);
 
         -- EEM RX (host→FPGA, from eem_deframer)
         eth_data_in        : in  std_logic_vector(31 downto 0);
@@ -68,7 +67,7 @@ end entity;
 architecture arch of eem_stack is
 
     -- -----------------------------------------------------------------------
-    -- Signals driven from generics (Quartus requires signals, not constants
+    -- Signals driven from ports/generics (Quartus requires signals, not constants
     -- or generics, when connecting to Verilog component ports)
     -- -----------------------------------------------------------------------
     signal MAC_SLV       : std_logic_vector(47 downto 0);
@@ -272,7 +271,7 @@ architecture arch of eem_stack is
 
 begin
 
-    MAC_SLV        <= LOCAL_MAC;
+    MAC_SLV        <= local_mac;
     IP_SLV         <= LOCAL_IP;
     LOCAL_PORT_SIG <= LOCAL_PORT;
 

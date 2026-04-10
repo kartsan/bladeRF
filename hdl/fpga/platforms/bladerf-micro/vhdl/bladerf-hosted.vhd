@@ -91,6 +91,7 @@ architecture hosted_bladerf of bladerf is
     signal eem_udp_rx_active_pclk : std_logic := '0';
     signal eem_broadcast_pclk     : std_logic := '0';
     signal eem_dst_unreachable_pclk : std_logic := '0';
+    signal eem_local_mac_pclk     : std_logic_vector(47 downto 0) := (others => '0');
     -- eem_tx_framer → FIFO → GPIF RX1
     signal eem_out_fifo_write     : std_logic := '0';
     signal eem_out_fifo_full      : std_logic := '0';
@@ -395,6 +396,13 @@ begin
             eth_packet_empty => eem_packet_empty_pclk
         );
 
+    U_chip_id_mac : entity work.chip_id_mac
+        port map (
+            clock     => fx3_pclk_pll,
+            reset     => sys_reset_pclk,
+            local_mac => eem_local_mac_pclk
+        );
+
     -- Full HPSDR-derived networking stack: ARP, ICMP, UDP receive and send.
     -- The stack is entirely in the FX3 pclk domain.
     -- TX frames are written directly to the FPGA→host RX1 FIFO.
@@ -402,6 +410,7 @@ begin
         port map (
             clock              => fx3_pclk_pll,
             reset              => sys_reset_pclk,
+            local_mac          => eem_local_mac_pclk,
             eth_data_in        => eem_packet_data_pclk,
             eth_data_valid     => eem_packet_valid_pclk,
             eth_packet_start   => eem_packet_start_pclk,
