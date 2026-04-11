@@ -83,7 +83,7 @@ CyU3PReturnStatus_t NuandConfigureGpif(NuandGpifConfig config)
             return CY_U3P_ERROR_BAD_ARGUMENT;
     }
 
-
+    /* Initialize the PIB block. */
     pibClock.clkDiv = 4;
     pibClock.clkSrc = CY_U3P_SYS_CLK;
     pibClock.isHalfDiv = CyFalse;

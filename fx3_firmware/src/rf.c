@@ -256,6 +256,14 @@ void NuandEEMStart(void)
         return;
     }
 
+    /* EEM uses GPIF PIB sockets 1/2. Make sure RF-link GPIF state machine
+     * is loaded and running even when interface 0 mode is not RF_LINK. */
+    apiRetStatus = NuandConfigureGpif(GPIF_CONFIG_RF_LINK);
+    if (apiRetStatus != CY_U3P_SUCCESS) {
+        LOG_ERROR(apiRetStatus);
+        return;
+    }
+
     /* Determine max packet size based on USB speed */
     switch (usbSpeed) {
         case CY_U3P_FULL_SPEED:
@@ -347,6 +355,7 @@ void NuandEEMStart(void)
         return;
     }
 
+    NuandAllowSuspend(CyFalse);
     glEEMActive = CyTrue;
 }
 
@@ -382,6 +391,7 @@ void NuandEEMStop(void)
     }
 
     glEEMActive = CyFalse;
+    NuandAllowSuspend(CyTrue);
 }
 
 /* This function starts the RF data transport mechanism. This is the second
