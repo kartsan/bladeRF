@@ -41,6 +41,8 @@
 #define CY_FX_EP_PRODUCER               0x01    /* EP 1 OUT */
 #define BLADE_FPGA_EP_PRODUCER          0x02    /* EP 2 OUT */
 #define CY_FX_EP_CONSUMER               0x81    /* EP 1 IN */
+#define BLADE_RF_EEM_EP_PRODUCER        0x03    /* EP 3 OUT */
+#define BLADE_RF_EEM_EP_CONSUMER        0x83    /* EP 3 IN  */
 
 #define CY_FX_PRODUCER_USB_SOCKET    CY_U3P_UIB_SOCKET_PROD_1    /* USB Socket 1 is producer */
 #define BLADE_FPGA_CONFIG_SOCKET     CY_U3P_UIB_SOCKET_PROD_2    /* USB Socket 2 is producer */
@@ -58,6 +60,8 @@ extern const uint8_t CyFxUSBFSConfigDscr[];
 extern const uint8_t CyFxUSBHSConfigDscr[];
 extern const uint8_t CyFxUSBBOSDscr[];
 extern const uint8_t CyFxUSBSSConfigDscr[];
+extern const uint8_t CyFxUSBSSConfigDscr_DUAL[];
+extern const uint8_t CyFxUSBHSConfigDscr_DUAL[];
 extern const uint8_t CyFxUSBStringLangIDDscr[];
 extern const uint8_t CyFxUSBManufactureDscr[];
 extern const uint8_t CyFxUSBProductDscr[];
