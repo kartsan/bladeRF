@@ -60,16 +60,28 @@ reg [4:0] state = ST_IDLE;
 localparam RX_LEN = 5'd28;
 reg [4:0] byte_no;
 reg [31:0] remote_ip;
+reg [47:0] sender_mac;
+reg [7:0] txreq_wait;
 wire sending_sync;
 
 
 always @(posedge rx_clock)
-  case (state)
+  if (reset)
+    begin
+    state <= ST_IDLE;
+    byte_no <= 5'd0;
+    remote_ip <= 32'd0;
+    sender_mac <= 48'd0;
+    destination_mac <= 48'd0;
+    txreq_wait <= 8'd0;
+    end
+  else case (state)
     ST_IDLE:
       //rx_enable is high, start reception
       if (rx_enable) 
         begin 
-        destination_mac <= remote_mac; 
+        sender_mac <= 48'd0;
+        txreq_wait <= 8'd0;
         byte_no <= RX_LEN - 5'd2;
         state <= ST_RX; 
         end
@@ -92,6 +104,9 @@ always @(posedge rx_clock)
 //          //save sender's ip 
           10,11,12,13: remote_ip <= {remote_ip[23:0], rx_data};  
 
+          //save sender's mac
+          14,15,16,17,18,19: sender_mac <= {sender_mac[39:0], rx_data};
+
 //			  3: if (rx_data != local_ip[31-:8]) state <= ST_ERR;
 //			  2: if (rx_data != local_ip[31-:8]) state <= ST_ERR;
 //			  1: if (rx_data != local_ip[31-:8]) state <= ST_ERR;
@@ -103,14 +118,21 @@ always @(posedge rx_clock)
             //compare target ip to our local_ip     
             if (rx_data != local_ip[byte_no*8+7 -:8]) state <= ST_ERR;
             //packet received, request permission to send reply
-            else if (byte_no == 0) state <= ST_TXREQ;      
+            else if (byte_no == 0) begin
+              destination_mac <= sender_mac;
+              txreq_wait <= 8'hFF;
+              state <= ST_TXREQ;
+            end
           endcase    
           
          byte_no <= byte_no - 5'd1;
          end
       
     //wait for permission to send
-    ST_TXREQ: if (sending_sync) state <= ST_TX;    
+    ST_TXREQ:
+      if (sending_sync) state <= ST_TX;
+      else if (txreq_wait == 8'd0) state <= ST_IDLE;
+      else txreq_wait <= txreq_wait - 8'd1;
 
     //wait for the end of sending
     ST_TX: if (!sending_sync) state <= ST_IDLE;

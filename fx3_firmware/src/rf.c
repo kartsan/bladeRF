@@ -264,6 +264,11 @@ void NuandEEMStart(void)
         return;
     }
 
+    /* NuandFpgaConfigStop() asserts GPIO_SYS_RST when it shuts down the
+     * FPGA-load GPIF config.  Now that PCLK is running (so the FPGA PLL
+     * can lock), release the FPGA from reset. */
+    CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
+
     /* Determine max packet size based on USB speed */
     switch (usbSpeed) {
         case CY_U3P_FULL_SPEED:

@@ -80,19 +80,7 @@ architecture hosted_bladerf of bladerf is
     signal eem_rx_fifo_empty_pclk : std_logic := '1';
     signal eem_rx_fifo_data_pclk  : std_logic_vector(31 downto 0) := (others => '0');
 
-    -- eem_deframer output → eem_stack input
-    signal eem_packet_data_pclk   : std_logic_vector(31 downto 0) := (others => '0');
-    signal eem_packet_valid_pclk  : std_logic := '0';
-    signal eem_packet_start_pclk  : std_logic := '0';
-    signal eem_packet_end_pclk    : std_logic := '0';
-    signal eem_packet_empty_pclk  : std_logic_vector(1 downto 0) := (others => '0');
-    -- eem_stack application interface placeholders
-    signal eem_udp_rx_data_pclk   : std_logic_vector(7 downto 0) := (others => '0');
-    signal eem_udp_rx_active_pclk : std_logic := '0';
-    signal eem_broadcast_pclk     : std_logic := '0';
-    signal eem_dst_unreachable_pclk : std_logic := '0';
-    signal eem_local_mac_pclk     : std_logic_vector(47 downto 0) := (others => '0');
-    -- eem_tx_framer → FIFO → GPIF RX1
+    -- eem_out_fifo write port (direct loopback from TX2)
     signal eem_out_fifo_write     : std_logic := '0';
     signal eem_out_fifo_full      : std_logic := '0';
     signal eem_out_fifo_data      : std_logic_vector(31 downto 0) := (others => '0');
@@ -141,7 +129,8 @@ architecture hosted_bladerf of bladerf is
     signal tx_underflow_led       : std_logic := '1';
     signal rx_overflow_led        : std_logic := '1';
 
-    signal led1_blink             : std_logic;
+    signal led2_tx2_activity      : std_logic := '0';
+    signal led3_rx1_activity      : std_logic := '0';
 
     signal nios_sdo               : std_logic;
     signal nios_sdio              : std_logic;
@@ -382,60 +371,20 @@ begin
 
     fx3_ctl_in <= fx3_ctl;
 
-    -- EEM deframer: strip CDC-EEM framing, emit word-stream with boundary markers.
-    U_eem_deframer : entity work.eem_deframer
-        port map (
-            clock            => fx3_pclk_pll,
-            reset            => sys_reset_pclk,
-            eem_data_in      => eem_tx_fifo_data_pclk,
-            eem_data_valid   => eem_tx_fifo_write_pclk,
-            eth_data_out     => eem_packet_data_pclk,
-            eth_data_valid   => eem_packet_valid_pclk,
-            eth_packet_start => eem_packet_start_pclk,
-            eth_packet_end   => eem_packet_end_pclk,
-            eth_packet_empty => eem_packet_empty_pclk
-        );
+    -- Direct raw loopback: TX2 data written straight into eem_out_fifo.
+    -- The host sends exactly gpif_buf_size words (padded with EEM ZLPs) and
+    -- reads back the same count from RX1.  A 4096-word FIFO holds one full
+    -- super-speed DMA burst (2048 words) with margin so the write side never
+    -- sees backpressure before the read side starts draining.
+    eem_tx_fifo_full_pclk <= eem_out_fifo_full;
+    eem_out_fifo_write    <= eem_tx_fifo_write_pclk;
+    eem_out_fifo_data     <= eem_tx_fifo_data_pclk;
 
-    U_chip_id_mac : entity work.chip_id_mac
-        port map (
-            clock     => fx3_pclk_pll,
-            reset     => sys_reset_pclk,
-            local_mac => eem_local_mac_pclk
-        );
-
-    -- Full HPSDR-derived networking stack: ARP, ICMP, UDP receive and send.
-    -- The stack is entirely in the FX3 pclk domain.
-    -- TX frames are written directly to the FPGA→host RX1 FIFO.
-    U_eem_stack : entity work.eem_stack
-        port map (
-            clock              => fx3_pclk_pll,
-            reset              => sys_reset_pclk,
-            local_mac          => eem_local_mac_pclk,
-            eth_data_in        => eem_packet_data_pclk,
-            eth_data_valid     => eem_packet_valid_pclk,
-            eth_packet_start   => eem_packet_start_pclk,
-            eth_packet_end     => eem_packet_end_pclk,
-            eth_packet_empty   => eem_packet_empty_pclk,
-            eem_fifo_write     => eem_out_fifo_write,
-            eem_fifo_full      => eem_out_fifo_full,
-            eem_fifo_data      => eem_out_fifo_data,
-            udp_rx_data        => eem_udp_rx_data_pclk,
-            udp_rx_active      => eem_udp_rx_active_pclk,
-            udp_tx_data        => (others => '0'),
-            udp_tx_length      => (others => '0'),
-            udp_tx_enable      => '0',
-            udp_tx_active      => open,
-            udp_tx_port        => (others => '0'),
-            broadcast          => eem_broadcast_pclk,
-            dst_unreachable    => eem_dst_unreachable_pclk
-        );
-
-    -- Staging FIFO between eem_tx_framer output and GPIF RX1 read port.
-    -- Both sides run on fx3_pclk_pll so clocks are synchronised.
+    -- Staging FIFO
     U_eem_out_fifo : entity work.eem_fifo
         generic map (
             CLOCKS_ARE_SYNCHRONIZED => "TRUE",
-            LPM_NUMWORDS            => 512
+            LPM_NUMWORDS            => 4096
         )
         port map (
             aclr    => sys_reset_pclk,
@@ -453,17 +402,31 @@ begin
             wrusedw => open
         );
 
-    toggle_led1 : process(fx3_pclk_pll)
-        variable count : natural range 0 to 10_000_000 := 10_000_000;
+    led_activity : process(fx3_pclk_pll)
+        variable tx2_hold_count : natural range 0 to 8_000_000 := 0;
+        variable rx1_hold_count : natural range 0 to 8_000_000 := 0;
     begin
         if( rising_edge(fx3_pclk_pll) ) then
-            count := count - 1;
-            if( count = 0 ) then
-                count := 10_000_000;
-                led1_blink <= not led1_blink;
+            if( eem_tx_fifo_write_pclk = '1' ) then
+                led2_tx2_activity <= '1';
+                tx2_hold_count := 8_000_000;
+            elsif( tx2_hold_count > 0 ) then
+                tx2_hold_count := tx2_hold_count - 1;
+            else
+                led2_tx2_activity <= '0';
+            end if;
+
+            if( eem_rx_fifo_read_pclk = '1' ) then
+                led3_rx1_activity <= '1';
+                rx1_hold_count := 8_000_000;
+            elsif( rx1_hold_count > 0 ) then
+                rx1_hold_count := rx1_hold_count - 1;
+            else
+                led3_rx1_activity <= '0';
             end if;
         end if;
     end process;
+
 
 
     -- ========================================================================
@@ -603,9 +566,9 @@ begin
     tx_trigger_ctl <= unpack(tx_trigger_ctl_i, tx_trigger_line);
 
     -- LEDs
-    led(1) <= led1_blink        when nios_gpio.o.led_mode = '0' else not nios_gpio.o.leds(1);
-    led(2) <= tx_underflow_led  when nios_gpio.o.led_mode = '0' else not nios_gpio.o.leds(2);
-    led(3) <= rx_overflow_led   when nios_gpio.o.led_mode = '0' else not nios_gpio.o.leds(3);
+    led(1) <= fx3_pclk_pll_locked;
+    led(2) <= led2_tx2_activity;
+    led(3) <= led3_rx1_activity;
 
     -- DAC SPI (data latched on falling edge)
     dac_sclk <= not nios_sclk when nios_gpio.o.adf_chip_enable = '0' else '0';
