@@ -84,6 +84,7 @@ set(SRC_BLADERF
     "${SRC_DIR}/gpif.c"
     "${SRC_DIR}/logger.c"
     "${SRC_DIR}/rf.c"
+    "${SRC_DIR}/eem.c"
     "${SRC_DIR}/spi_flash_lib.c"
     "${FX3_FW_COMMON_DIR}/cyfx_gcc_startup.S"
     "${FX3_FW_COMMON_DIR}/cyfxtx.c"

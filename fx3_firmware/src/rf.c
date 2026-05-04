@@ -25,6 +25,7 @@
 #include <cyu3uart.h>
 #include "gpif.h"
 #include "rf.h"
+#include "eem.h"
 
 #define THIS_FILE LOGGER_ID_RF_C
 
@@ -347,6 +348,7 @@ static void NuandRFLinkStart(void)
     }
 
     UartBridgeStart();
+    NuandEEMLinkStart();
     glAppMode = MODE_RF_CONFIG;
 
 }
@@ -389,6 +391,8 @@ static void NuandRFLinkStop (void)
         LOG_ERROR(apiRetStatus);
         CyFxAppErrorHandler(apiRetStatus);
     }
+
+    NuandEEMLinkStop();
 
     /* Reset the GPIF */
     apiRetStatus = NuandConfigureGpif(GPIF_CONFIG_DISABLED);

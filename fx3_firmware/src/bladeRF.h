@@ -57,12 +57,20 @@
 // interface #2
 // doesn't actually use BULK, EP exists for debugging purposes
 
+// interface 1 - CDC EEM
+#define BLADE_RF_EEM_EP_PRODUCER            0x03
+#define BLADE_RF_EEM_EP_PRODUCER_USB_SOCKET CY_U3P_UIB_SOCKET_PROD_3
+#define BLADE_RF_EEM_EP_CONSUMER            0x83
+#define BLADE_RF_EEM_EP_CONSUMER_USB_SOCKET CY_U3P_UIB_SOCKET_CONS_3
+
 /* Extern definitions for the USB Descriptors */
 extern const uint8_t CyFxUSBDeviceQualDscr[];
 extern const uint8_t CyFxUSBFSConfigDscr[];
 extern const uint8_t CyFxUSBHSConfigDscr[];
 extern const uint8_t CyFxUSBBOSDscr[];
 extern const uint8_t CyFxUSBSSConfigDscr[];
+extern const uint8_t CyFxUSBSSConfigDscr_DUAL[];
+extern const uint8_t CyFxUSBHSConfigDscr_DUAL[];
 extern const uint8_t CyFxUSBStringLangIDDscr[];
 extern const uint8_t CyFxUSBManufactureDscr[];
 extern const uint8_t CyFxUSB20DeviceDscr_bladeRF1[];

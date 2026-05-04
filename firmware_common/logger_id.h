@@ -31,6 +31,7 @@
 #define LOGGER_ID_LOGGER_C                5
 #define LOGGER_ID_RF_C                    6
 #define LOGGER_ID_SPI_FLASH_LIB_C         7
+#define LOGGER_ID_EEM_C                   8
 
 #ifdef LOGGER_ID_STRING
 static inline const char * logger_id_string(uint8_t file_id)
@@ -52,6 +53,8 @@ static inline const char * logger_id_string(uint8_t file_id)
             return "rf.c";
         case LOGGER_ID_SPI_FLASH_LIB_C:
             return "spi_flash_lib.c";
+        case LOGGER_ID_EEM_C:
+            return "eem.c";
         default:
             return "<Unknown>";
     }
