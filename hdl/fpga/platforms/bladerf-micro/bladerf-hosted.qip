@@ -20,6 +20,7 @@ set_global_assignment -name VERILOG_FILE [file normalize                       f
 set_global_assignment -name QIP_FILE     [file normalize                       fx3_pll/fx3_pll.qip]
 
 # Nuand IP
+set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip synthesis/sync_fifo.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip synthesis/signal_generator.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip synthesis/synchronizer.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $nuand_ip synthesis/handshake.vhd]]

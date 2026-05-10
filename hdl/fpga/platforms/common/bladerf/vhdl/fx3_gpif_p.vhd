@@ -22,6 +22,8 @@ use ieee.std_logic_1164.all;
 
 package fx3_gpif_p is
     -- GPIF buf sizes for USB high-speed and super-speed
-    constant GPIF_BUF_SIZE_HS : natural := 1024;
-    constant GPIF_BUF_SIZE_SS : natural := 2048;
+    constant GPIF_BUF_SIZE_HS  : natural := 1024;
+    constant GPIF_BUF_SIZE_SS  : natural := 2048;
+    -- EEM buffer size in 32-bit words (covers one max Ethernet frame + EEM header)
+    constant GPIF_EEM_BUF_SIZE : natural := 512;
 end package fx3_gpif_p;
