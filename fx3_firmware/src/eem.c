@@ -33,6 +33,8 @@
 static CyU3PDmaChannel glChHandleEEMUtoP;   /* EP 0x03 OUT → PIB socket 2 (GPIF TX2) */
 static CyU3PDmaChannel glChHandleEEMPtoU;   /* PIB socket 1 (GPIF RX1) → EP 0x83 IN  */
 
+static CyBool_t glEEMActive = CyFalse;
+
 static uint8_t EEM_status_bits[] = {
     [BLADE_RF_EEM_EP_PRODUCER] = 0,
     [BLADE_RF_EEM_EP_CONSUMER] = 0,
@@ -42,6 +44,10 @@ void NuandEEMLinkStart(void)
 {
     uint16_t size = 0;
     CyU3PEpConfig_t epCfg;
+
+    if (glEEMActive) return;
+    NuandGpifRfLinkStart(CyTrue);
+
     CyU3PDmaChannelConfig_t dmaCfg;
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
     CyU3PUSBSpeed_t usbSpeed = CyU3PUsbGetSpeed();
@@ -120,12 +126,17 @@ void NuandEEMLinkStart(void)
         LOG_ERROR(apiRetStatus);
         CyFxAppErrorHandler(apiRetStatus);
     }
+
+    glEEMActive = CyTrue;
 }
 
 void NuandEEMLinkStop(void)
 {
     CyU3PEpConfig_t epCfg;
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
+
+    if (!glEEMActive) return;
+    glEEMActive = CyFalse;
 
     CyU3PUsbFlushEp(BLADE_RF_EEM_EP_PRODUCER);
     CyU3PUsbFlushEp(BLADE_RF_EEM_EP_CONSUMER);

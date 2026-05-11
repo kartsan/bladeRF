@@ -84,6 +84,8 @@ extern const uint8_t CyFxUSBProductDscr_bladeRF2[];
 
 CyU3PReturnStatus_t CyFxSpiEraseSector(CyBool_t /* isErase */, uint8_t /* sector */);
 void NuandGPIOReconfigure(CyBool_t /* fullGpif */, CyBool_t /* warm */);
+void NuandGpifRfLinkStart(CyBool_t /* warm */);
+void NuandGpifRfLinkReset(void);
 CyU3PReturnStatus_t ClearDMAChannel(uint8_t ep, CyU3PDmaChannel * handle,
                                     uint32_t count);
 void CyFxAppErrorHandler(CyU3PReturnStatus_t apiRetStatus);

@@ -29,6 +29,7 @@
 #include "bladeRF.h"
 #include "cyu3gpif.h"
 #include "cyu3pib.h"
+#include "gpif.h"
 #include "cyu3gpio.h"
 #include "pib_regs.h"
 
@@ -183,6 +184,30 @@ void NuandGPIOReconfigure(CyBool_t fullGpif, CyBool_t warm)
             CyFxAppErrorHandler(apiRetStatus);
         }
     }
+}
+
+static CyBool_t glGpifRfLinkActive = CyFalse;
+
+void NuandGpifRfLinkStart(CyBool_t warm)
+{
+    /* Always restore the IO matrix to 32-bit GPIF mode.
+     * NuandFlashInit() resets it to SPI/non-32-bit, so every RF or EEM
+     * start must undo that, regardless of whether the GPIF is already up. */
+    NuandGPIOReconfigure(CyTrue, warm);
+
+    if (!glGpifRfLinkActive) {
+        CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue);
+        CyU3PGpioSetValue(GPIO_RX_EN, CyFalse);
+        CyU3PGpioSetValue(GPIO_TX_EN, CyFalse);
+        CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
+        NuandConfigureGpif(GPIF_CONFIG_RF_LINK);
+        glGpifRfLinkActive = CyTrue;
+    }
+}
+
+void NuandGpifRfLinkReset(void)
+{
+    glGpifRfLinkActive = CyFalse;
 }
 
 uint16_t NuandGetProductID() {
@@ -768,8 +793,9 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
             alt_interface = evdata & 0xf;
 
             if (interface == 1) {
-                /* Interface 1 is CDC EEM — single alt setting, nothing to switch */
                 CyU3PUsbAckSetup();
+                if (glDeviceReady)
+                    NuandEEMLinkStart();
                 break;
             }
 
@@ -803,7 +829,7 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
 
         case CY_U3P_USB_EVENT_RESET:
         case CY_U3P_USB_EVENT_DISCONNECT:
-            /* Stop the loop back function. */
+            NuandEEMLinkStop();
             StopApplication();
             break;
 

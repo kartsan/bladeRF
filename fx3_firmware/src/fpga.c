@@ -26,6 +26,7 @@
 #include "bladeRF.h"
 #include "fpga.h"
 #include "gpif.h"
+#include "eem.h"
 #include "spi_flash_lib.h"
 
 #define THIS_FILE LOGGER_ID_FPGA_C
@@ -109,6 +110,9 @@ static void NuandFpgaConfigStart(void)
     bool doUsb = true;
 
     NuandSetFpgaConfigSource(NUAND_FPGA_CONFIG_SOURCE_INVALID);
+
+    NuandEEMLinkStop();
+    NuandGpifRfLinkReset();
 
     NuandAllowSuspend(CyFalse);
 
@@ -231,9 +235,9 @@ void NuandFpgaConfigStop(void)
         CyFxAppErrorHandler(apiRetStatus);
     }
 
+    NuandGpifRfLinkStart(CyTrue);
     NuandAllowSuspend(CyTrue);
     glAppMode = MODE_NO_CONFIG;
-    CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue);
 }
 
 uint8_t FPGA_status_bits[] = {

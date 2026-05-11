@@ -235,18 +235,7 @@ static void NuandRFLinkStart(void)
     CyU3PUSBSpeed_t usbSpeed = CyU3PUsbGetSpeed();
 
     NuandAllowSuspend(CyFalse);
-    NuandGPIOReconfigure(CyTrue, CyTrue);
-
-    CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue);
-    CyU3PGpioSetValue(GPIO_RX_EN, CyFalse);
-    CyU3PGpioSetValue(GPIO_TX_EN, CyFalse);
-    CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
-
-    apiRetStatus = NuandConfigureGpif(GPIF_CONFIG_RF_LINK);
-    if (apiRetStatus != CY_U3P_SUCCESS) {
-        LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
-    }
+    NuandGpifRfLinkStart(CyTrue);
 
     /* Determine max packet size based on USB speed */
     switch (usbSpeed)
@@ -348,7 +337,6 @@ static void NuandRFLinkStart(void)
     }
 
     UartBridgeStart();
-    NuandEEMLinkStart();
     glAppMode = MODE_RF_CONFIG;
 
 }
@@ -360,10 +348,6 @@ static void NuandRFLinkStop (void)
 {
     CyU3PEpConfig_t epCfg;
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
-
-    CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue);
-    CyU3PGpioSetValue(GPIO_RX_EN, CyFalse);
-    CyU3PGpioSetValue(GPIO_TX_EN, CyFalse);
 
     /* Flush endpoint memory buffers */
     CyU3PUsbFlushEp(BLADE_RF_SAMPLE_EP_PRODUCER);
@@ -387,15 +371,6 @@ static void NuandRFLinkStop (void)
 
     /* Disable consumer endpoint */
     apiRetStatus = CyU3PSetEpConfig(BLADE_RF_SAMPLE_EP_CONSUMER, &epCfg);
-    if (apiRetStatus != CY_U3P_SUCCESS) {
-        LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
-    }
-
-    NuandEEMLinkStop();
-
-    /* Reset the GPIF */
-    apiRetStatus = NuandConfigureGpif(GPIF_CONFIG_DISABLED);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
         CyFxAppErrorHandler(apiRetStatus);
