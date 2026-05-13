@@ -57,6 +57,12 @@
 // interface #2
 // doesn't actually use BULK, EP exists for debugging purposes
 
+// interface #1 (separate USB interface): CDC EEM
+// EEM endpoints are defined in cyfxbladeRF.h: BLADE_RF_EEM_EP_{PRODUCER,CONSUMER}
+// They share GPIF threads RX1/TX2 with the RFlink state machine.
+#define BLADE_RF_EEM_EP_PRODUCER_USB_SOCKET CY_U3P_UIB_SOCKET_PROD_3
+#define BLADE_RF_EEM_EP_CONSUMER_USB_SOCKET CY_U3P_UIB_SOCKET_CONS_3
+
 /* Extern definitions for the USB Descriptors */
 extern const uint8_t CyFxUSBDeviceQualDscr[];
 extern const uint8_t CyFxUSBFSConfigDscr[];
@@ -71,6 +77,8 @@ extern const uint8_t CyFxUSBProductDscr_bladeRF1[];
 extern const uint8_t CyFxUSB20DeviceDscr_bladeRF2[];
 extern const uint8_t CyFxUSB30DeviceDscr_bladeRF2[];
 extern const uint8_t CyFxUSBProductDscr_bladeRF2[];
+extern const uint8_t CyFxUSBSSConfigDscr_DUAL[];
+extern const uint8_t CyFxUSBHSConfigDscr_DUAL[];
 
 #include "cyu3externcend.h"
 

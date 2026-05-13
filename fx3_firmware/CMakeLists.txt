@@ -79,6 +79,7 @@ set(BLADERF_FW bladeRF_fw_v${VERSION_INFO_BASE})
 set(SRC_BLADERF
     "${SRC_DIR}/bladeRF.c"
     "${SRC_DIR}/cyfxbladeRFusbdscr.c"
+    "${SRC_DIR}/eem.c"
     "${SRC_DIR}/flash.c"
     "${SRC_DIR}/fpga.c"
     "${SRC_DIR}/gpif.c"
