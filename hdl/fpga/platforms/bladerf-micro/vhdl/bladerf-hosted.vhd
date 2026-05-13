@@ -87,6 +87,9 @@ architecture hosted_bladerf of bladerf is
     signal eem_tx_fifo_rdata      : std_logic_vector(31 downto 0);
     signal eem_tx_fifo_empty      : std_logic;
 
+    signal eem_rx_led             : std_logic := '1';
+    signal eem_dma_req_led        : std_logic := '1';
+
     signal usb_speed_pclk         : std_logic;
     signal usb_speed_rx           : std_logic;
     signal usb_speed_tx           : std_logic;
@@ -417,6 +420,47 @@ begin
             read_en     =>  eem_tx_fifo_rreq
         );
 
+    -- Light led(3) for 250 ms whenever the FX3 asserts dma2_tx_reqx (ctl_in(10) low):
+    -- data is ready on PIB socket 2, i.e. EEM data has arrived from the USB host.
+    eem_dma_req_activity : process(sys_reset_pclk, fx3_pclk_pll)
+        variable count : natural range 0 to 25_000_000 := 0;
+    begin
+        if (sys_reset_pclk = '1') then
+            eem_dma_req_led <= '1';
+            count := 0;
+        elsif (rising_edge(fx3_pclk_pll)) then
+            if (fx3_ctl_in(10) = '0') then   -- dma2_tx_reqx active low
+                eem_dma_req_led <= '0';
+                count := 25_000_000;
+            elsif (count > 0) then
+                count := count - 1;
+                if (count = 0) then
+                    eem_dma_req_led <= '1';
+                end if;
+            end if;
+        end if;
+    end process eem_dma_req_activity;
+
+    -- Light led(2) for 250 ms whenever the FX3 FSM writes EEM data into eem_tx_fifo
+    eem_rx_activity : process(sys_reset_pclk, fx3_pclk_pll)
+        variable count : natural range 0 to 25_000_000 := 0;
+    begin
+        if (sys_reset_pclk = '1') then
+            eem_rx_led <= '1';
+            count := 0;
+        elsif (rising_edge(fx3_pclk_pll)) then
+            if (eem_tx_fifo_wreq = '1') then
+                eem_rx_led <= '0';
+                count := 25_000_000;
+            elsif (count > 0) then
+                count := count - 1;
+                if (count = 0) then
+                    eem_rx_led <= '1';
+                end if;
+            end if;
+        end if;
+    end process eem_rx_activity;
+
     toggle_led1 : process(fx3_pclk_pll)
         variable count : natural range 0 to 10_000_000 := 10_000_000;
     begin
@@ -568,8 +612,8 @@ begin
 
     -- LEDs
     led(1) <= led1_blink        when nios_gpio.o.led_mode = '0' else not nios_gpio.o.leds(1);
-    led(2) <= tx_underflow_led  when nios_gpio.o.led_mode = '0' else not nios_gpio.o.leds(2);
-    led(3) <= rx_overflow_led   when nios_gpio.o.led_mode = '0' else not nios_gpio.o.leds(3);
+    led(2) <= eem_rx_led        when nios_gpio.o.led_mode = '0' else not nios_gpio.o.leds(2);
+    led(3) <= eem_dma_req_led   when nios_gpio.o.led_mode = '0' else not nios_gpio.o.leds(3);
 
     -- DAC SPI (data latched on falling edge)
     dac_sclk <= not nios_sclk when nios_gpio.o.adf_chip_enable = '0' else '0';

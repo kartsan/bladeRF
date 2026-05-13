@@ -110,3 +110,8 @@ CyU3PReturnStatus_t NuandConfigureGpif(NuandGpifConfig config)
 
     return CY_U3P_SUCCESS;
 }
+
+CyU3PReturnStatus_t NuandRestartGpifSM(void)
+{
+    return CyU3PGpifSMStart(RFLINK_START, RFLINK_ALPHA_START);
+}

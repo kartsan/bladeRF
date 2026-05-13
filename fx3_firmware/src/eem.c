@@ -27,6 +27,7 @@
 #include <cyu3error.h>
 #include <cyu3usb.h>
 #include "eem.h"
+#include "gpif.h"
 
 #define THIS_FILE LOGGER_ID_EEM_C
 
@@ -34,6 +35,22 @@ static CyU3PDmaChannel glChHandleEEMUtoP;   /* EP 0x03 OUT → PIB socket 2 (GPI
 static CyU3PDmaChannel glChHandleEEMPtoU;   /* PIB socket 1 (GPIF RX1) → EP 0x83 IN  */
 
 static CyBool_t glEEMActive = CyFalse;
+
+/* Set to 1 to route EP 0x03 OUT → EP 0x83 IN on the FX3, bypassing GPIF.
+ * Use for diagnosing whether EEM DMA channels work independently of the FPGA.
+ * After testing, set back to 0 for normal operation. */
+static int eem_loopback = 1;
+static int eem_loopback_when_created;
+
+void NuandEEMLinkLoopBack(int lp)
+{
+    eem_loopback = lp;
+}
+
+int NuandEEMLinkGetLoopBack(void)
+{
+    return eem_loopback;
+}
 
 static uint8_t EEM_status_bits[] = {
     [BLADE_RF_EEM_EP_PRODUCER] = 0,
@@ -46,6 +63,7 @@ void NuandEEMLinkStart(void)
     CyU3PEpConfig_t epCfg;
 
     if (glEEMActive) return;
+    LOG_INFO(1);    /* breadcrumb: NuandEEMLinkStart entered */
     NuandGpifRfLinkStart(CyTrue);
 
     CyU3PDmaChannelConfig_t dmaCfg;
@@ -83,7 +101,7 @@ void NuandEEMLinkStart(void)
 
     CyU3PMemSet((uint8_t *)&dmaCfg, 0, sizeof(dmaCfg));
     dmaCfg.size           = size * 4;   /* 4 max-packets: fits one full Ethernet frame */
-    dmaCfg.count          = BLADE_DMA_BUF_COUNT;
+    dmaCfg.count          = eem_loopback ? 16 : BLADE_DMA_BUF_COUNT;
     dmaCfg.dmaMode        = CY_U3P_DMA_MODE_BYTE;
     dmaCfg.notification   = 0;
     dmaCfg.cb             = 0;
@@ -92,24 +110,41 @@ void NuandEEMLinkStart(void)
     dmaCfg.consHeader     = 0;
     dmaCfg.prodAvailCount = 0;
 
-    /* host → FPGA: USB socket 3 (EP 0x03 OUT) → PIB socket 2 (GPIF TX2) */
-    dmaCfg.prodSckId = BLADE_RF_EEM_EP_PRODUCER_USB_SOCKET;
-    dmaCfg.consSckId = CY_U3P_PIB_SOCKET_2;
-    apiRetStatus = CyU3PDmaChannelCreate(&glChHandleEEMUtoP,
-                                         CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
-    if (apiRetStatus != CY_U3P_SUCCESS) {
-        LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
-    }
+    eem_loopback_when_created = eem_loopback;
 
-    /* FPGA → host: PIB socket 1 (GPIF RX1) → USB socket 3 (EP 0x83 IN) */
-    dmaCfg.prodSckId = CY_U3P_PIB_SOCKET_1;
-    dmaCfg.consSckId = BLADE_RF_EEM_EP_CONSUMER_USB_SOCKET;
-    apiRetStatus = CyU3PDmaChannelCreate(&glChHandleEEMPtoU,
-                                         CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
-    if (apiRetStatus != CY_U3P_SUCCESS) {
-        LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+    if (eem_loopback) {
+        /* Loopback: EP 0x03 OUT → EP 0x83 IN, bypassing GPIF/PIB entirely */
+        dmaCfg.prodSckId = BLADE_RF_EEM_EP_PRODUCER_USB_SOCKET;
+        dmaCfg.consSckId = BLADE_RF_EEM_EP_CONSUMER_USB_SOCKET;
+        apiRetStatus = CyU3PDmaChannelCreate(&glChHandleEEMUtoP,
+                                             CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
+        if (apiRetStatus != CY_U3P_SUCCESS) {
+            LOG_ERROR(apiRetStatus);
+            LOG_INFO(7);
+            CyFxAppErrorHandler(apiRetStatus);
+        }
+    } else {
+        /* Normal: host → FPGA: USB socket 3 (EP 0x03 OUT) → PIB socket 2 (GPIF TX2) */
+        dmaCfg.prodSckId = BLADE_RF_EEM_EP_PRODUCER_USB_SOCKET;
+        dmaCfg.consSckId = CY_U3P_PIB_SOCKET_2;
+        apiRetStatus = CyU3PDmaChannelCreate(&glChHandleEEMUtoP,
+                                             CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
+        if (apiRetStatus != CY_U3P_SUCCESS) {
+            LOG_ERROR(apiRetStatus);
+            LOG_INFO(6);
+            CyFxAppErrorHandler(apiRetStatus);
+        }
+
+        /* Normal: FPGA → host: PIB socket 1 (GPIF RX1) → USB socket 3 (EP 0x83 IN) */
+        dmaCfg.prodSckId = CY_U3P_PIB_SOCKET_1;
+        dmaCfg.consSckId = BLADE_RF_EEM_EP_CONSUMER_USB_SOCKET;
+        apiRetStatus = CyU3PDmaChannelCreate(&glChHandleEEMPtoU,
+                                             CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
+        if (apiRetStatus != CY_U3P_SUCCESS) {
+            LOG_ERROR(apiRetStatus);
+            LOG_INFO(5);
+            CyFxAppErrorHandler(apiRetStatus);
+        }
     }
 
     CyU3PUsbFlushEp(BLADE_RF_EEM_EP_PRODUCER);
@@ -118,16 +153,27 @@ void NuandEEMLinkStart(void)
     apiRetStatus = CyU3PDmaChannelSetXfer(&glChHandleEEMUtoP, BLADE_DMA_TX_SIZE);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
+        LOG_INFO(4);
         CyFxAppErrorHandler(apiRetStatus);
     }
 
-    apiRetStatus = CyU3PDmaChannelSetXfer(&glChHandleEEMPtoU, BLADE_DMA_TX_SIZE);
-    if (apiRetStatus != CY_U3P_SUCCESS) {
-        LOG_ERROR(apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+    if (!eem_loopback_when_created) {
+        apiRetStatus = CyU3PDmaChannelSetXfer(&glChHandleEEMPtoU, BLADE_DMA_TX_SIZE);
+        if (apiRetStatus != CY_U3P_SUCCESS) {
+            LOG_ERROR(apiRetStatus);
+            LOG_INFO(3);
+            CyFxAppErrorHandler(apiRetStatus);
+        }
     }
 
     glEEMActive = CyTrue;
+    LOG_INFO(2);    /* breadcrumb: NuandEEMLinkStart completed */
+
+    if (!eem_loopback_when_created) {
+        /* Restart the GPIF SM so it re-evaluates thread 2 DMA (PIB socket 2)
+         * which was created after the SM was originally started. */
+        NuandRestartGpifSM();
+    }
 }
 
 void NuandEEMLinkStop(void)
@@ -138,11 +184,18 @@ void NuandEEMLinkStop(void)
     if (!glEEMActive) return;
     glEEMActive = CyFalse;
 
+    CyU3PDmaChannelReset(&glChHandleEEMUtoP);
+    if (!eem_loopback_when_created)
+        CyU3PDmaChannelReset(&glChHandleEEMPtoU);
+
     CyU3PUsbFlushEp(BLADE_RF_EEM_EP_PRODUCER);
     CyU3PUsbFlushEp(BLADE_RF_EEM_EP_CONSUMER);
 
     CyU3PDmaChannelDestroy(&glChHandleEEMUtoP);
-    CyU3PDmaChannelDestroy(&glChHandleEEMPtoU);
+    if (!eem_loopback_when_created) {
+        LOG_INFO(10);
+        CyU3PDmaChannelDestroy(&glChHandleEEMPtoU);
+    }
 
     CyU3PMemSet((uint8_t *)&epCfg, 0, sizeof(epCfg));
     epCfg.enable = CyFalse;
@@ -150,14 +203,17 @@ void NuandEEMLinkStop(void)
     apiRetStatus = CyU3PSetEpConfig(BLADE_RF_EEM_EP_PRODUCER, &epCfg);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
+        LOG_INFO(11);
         CyFxAppErrorHandler(apiRetStatus);
     }
 
     apiRetStatus = CyU3PSetEpConfig(BLADE_RF_EEM_EP_CONSUMER, &epCfg);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
+        LOG_INFO(12);
         CyFxAppErrorHandler(apiRetStatus);
     }
+        LOG_INFO(13);
 }
 
 static CyU3PReturnStatus_t NuandEEMLinkResetEndpoint(uint8_t endpoint)
@@ -169,7 +225,11 @@ static CyU3PReturnStatus_t NuandEEMLinkResetEndpoint(uint8_t endpoint)
             status = ClearDMAChannel(endpoint, &glChHandleEEMUtoP, BLADE_DMA_TX_SIZE);
             break;
         case BLADE_RF_EEM_EP_CONSUMER:
-            status = ClearDMAChannel(endpoint, &glChHandleEEMPtoU, BLADE_DMA_TX_SIZE);
+            if (!eem_loopback_when_created) {
+                status = ClearDMAChannel(endpoint, &glChHandleEEMPtoU, BLADE_DMA_TX_SIZE);
+            } else {
+                status = CY_U3P_SUCCESS;
+            }
             break;
     }
     return status;

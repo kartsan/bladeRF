@@ -29,4 +29,7 @@ extern const struct NuandApplication NuandEEMLink;
 void NuandEEMLinkStart(void);
 void NuandEEMLinkStop(void);
 
+void NuandEEMLinkLoopBack(int lp);
+int  NuandEEMLinkGetLoopBack(void);
+
 #endif /* _EEM_H_ */

@@ -40,5 +40,12 @@ typedef enum {
  */
 CyU3PReturnStatus_t NuandConfigureGpif(NuandGpifConfig config);
 
+/**
+ * Restart the RF-link GPIF state machine from its initial state.
+ * Call after creating a new DMA channel for a GPIF thread so the SM
+ * re-evaluates thread readiness (e.g. after EEM DMA channel creation).
+ */
+CyU3PReturnStatus_t NuandRestartGpifSM(void);
+
 #endif
 

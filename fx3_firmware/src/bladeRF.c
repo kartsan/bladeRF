@@ -511,6 +511,7 @@ CyBool_t NuandHandleVendorRequest(
 
     case BLADE_USB_CMD_SET_LOOPBACK:
         NuandRFLinkLoopBack(wValue);
+        NuandEEMLinkLoopBack(wValue);
         CyU3PUsbSendRetCode(wValue);
     break;
 
@@ -1064,8 +1065,19 @@ void bladeRFAppThread_Entry( uint32_t input)
 
     glDeviceReady = CyTrue;
 
+    /* The OS kernel may have sent SET_INTERFACE 1 (CDC EEM) before glDeviceReady
+     * was set, causing NuandEEMLinkStart() to be skipped in the USB event callback.
+     * Start it here unconditionally; the glEEMActive guard inside prevents double-init. */
+    NuandEEMLinkStart();
+
     while ( 1 ) {
-        /* Additional application-specific code can go here */
+        /* Restart EEM if it was stopped (e.g. after FPGA reload via USB).
+         * NuandEEMLinkStart() is a no-op when EEM is already active.
+         * Skip during FPGA config: NuandFpgaConfigStart() clears glEEMActive and
+         * sets MODE_FPGA_CONFIG; calling NuandEEMLinkStart() then would reconfigure
+         * the GPIF away from FPGA_LOAD mode mid-transfer. */
+        if (glAppMode != MODE_FPGA_CONFIG)
+            NuandEEMLinkStart();
         CyU3PThreadSleep(1000);
     }
 }
