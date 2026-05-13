@@ -914,14 +914,14 @@ void bladeRFInit(void)
     }
 
     /* Super speed configuration descriptor */
-    apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBSSConfigDscr);
+    apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_SS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBSSConfigDscr_DUAL);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
         CyFxAppErrorHandler(apiRetStatus);
     }
 
     /* High speed configuration descriptor */
-    apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBHSConfigDscr);
+    apiRetStatus = CyU3PUsbSetDesc(CY_U3P_USB_SET_HS_CONFIG_DESCR, 0, (uint8_t *)CyFxUSBHSConfigDscr_DUAL);
     if (apiRetStatus != CY_U3P_SUCCESS) {
         LOG_ERROR(apiRetStatus);
         CyFxAppErrorHandler(apiRetStatus);
