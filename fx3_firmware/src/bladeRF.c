@@ -232,6 +232,10 @@ static void StopApplication()
             NuandFpgaConfig.stop();
         }
     }
+
+    /* Tear down the shared GPIF + EEM datapath on reset/disconnect (and
+     * before a bootloader jump). It is re-established on SET_CONFIG. */
+    NuandGpifLinkStop();
 }
 
 CyBool_t GetStatus(uint16_t endpoint) {
@@ -371,8 +375,6 @@ CyBool_t NuandHandleVendorRequest(
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
     int retStatus;
     uint16_t readC;
-    CyBool_t txen, rxen;
-    txen = rxen = CyFalse ;
     isHandled = CyTrue;
 
     /* Device is not ready to handle requests */
@@ -392,13 +394,9 @@ CyBool_t NuandHandleVendorRequest(
         apiRetStatus = CY_U3P_SUCCESS;
         use_feature = wValue;
 
-        CyU3PGpioGetValue(GPIO_TX_EN, &txen) ;
-        CyU3PGpioGetValue(GPIO_RX_EN, &rxen) ;
-        if (txen == CyFalse && rxen == CyFalse) {
-            CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue) ;
-            CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
-        }
-
+        /* No GPIO_SYS_RST pulse here: it resets the shared fx3_gpif FSM and
+         * the EEM FIFOs. The FSM is reset once in NuandGpifLinkStart(), and
+         * the RF sample FIFOs self-clear when rx_enable deasserts. */
         CyU3PGpioSetValue(GPIO_RX_EN, use_feature ? CyTrue : CyFalse);
 
         if (!use_feature) {
@@ -416,13 +414,7 @@ CyBool_t NuandHandleVendorRequest(
         apiRetStatus = CY_U3P_SUCCESS;
         use_feature = wValue;
 
-        CyU3PGpioGetValue(GPIO_TX_EN, &txen) ;
-        CyU3PGpioGetValue(GPIO_RX_EN, &rxen) ;
-        if (txen == CyFalse && rxen == CyFalse) {
-            CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue) ;
-            CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
-        }
-
+        /* No GPIO_SYS_RST pulse here (see BLADE_USB_CMD_RF_RX). */
         CyU3PGpioSetValue(GPIO_TX_EN, use_feature ? CyTrue : CyFalse);
 
         if (!use_feature) {
@@ -780,6 +772,9 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
 
         case CY_U3P_USB_EVENT_SETCONF:
             glUsbConfiguration = evdata;
+            /* USB is now configured; if the FPGA is already loaded this
+             * brings up the shared GPIF + EEM datapath (idempotent). */
+            NuandTryStartGpifLink();
             break;
 
         case CY_U3P_USB_EVENT_RESET:
@@ -1018,6 +1013,11 @@ void bladeRFAppThread_Entry( uint32_t input)
     }
 
     glDeviceReady = CyTrue;
+
+    /* The FPGA is loaded and the device is ready: bring up the shared GPIF
+     * (FX3 PCLK + RF/EEM state machine) and the EEM datapath, so EEM works
+     * without waiting for the host to select the RF sample interface. */
+    NuandTryStartGpifLink();
 
     while ( 1 ) {
         /* Additional application-specific code can go here */

@@ -32,4 +32,16 @@ void NuandRFLinkLoopBack(int);
 /* Check if FW sample loopback is enabled */
 int NuandRFLinkGetLoopBack();
 
+/* Shared GPIF/EEM link: the FX3 PCLK and the GPIF II state machine that the RF
+ * sample and EEM datapaths both ride on, plus the EEM endpoints/DMA. Owned by
+ * the device-ready lifecycle, independent of the RF sample interface.
+ * NuandConfigureGpif(GPIF_CONFIG_RF_LINK) must only ever be driven through
+ * these; reloading it elsewhere resets the shared state machine. */
+void NuandGpifLinkStart(void);
+void NuandGpifLinkStop(void);
+
+/* Bring the GPIF/EEM link up once its preconditions hold (boot init done, USB
+ * configured, FPGA configured). Idempotent; call from lifecycle hooks. */
+void NuandTryStartGpifLink(void);
+
 #endif /* _RF_H_ */

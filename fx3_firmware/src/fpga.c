@@ -26,6 +26,7 @@
 #include "bladeRF.h"
 #include "fpga.h"
 #include "gpif.h"
+#include "rf.h"
 #include "spi_flash_lib.h"
 
 #define THIS_FILE LOGGER_ID_FPGA_C
@@ -107,6 +108,11 @@ static void NuandFpgaConfigStart(void)
     CyU3PUSBSpeed_t usbSpeed = CyU3PUsbGetSpeed();
     static int first_call = 1;
     bool doUsb = true;
+
+    /* Reprogramming the FPGA reinitializes the PIB; tear down the shared
+     * GPIF + EEM datapath first so its DMA channels don't outlive their
+     * PIB sockets. */
+    NuandGpifLinkStop();
 
     NuandSetFpgaConfigSource(NUAND_FPGA_CONFIG_SOURCE_INVALID);
 
@@ -234,6 +240,11 @@ void NuandFpgaConfigStop(void)
     NuandAllowSuspend(CyTrue);
     glAppMode = MODE_NO_CONFIG;
     CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue);
+
+    /* After a host FPGA (re)load, bring the shared GPIF + EEM datapath back
+     * up. No-op during the boot-time flash autoload (glDeviceReady is still
+     * false then; bladeRFAppThread_Entry starts it explicitly). */
+    NuandTryStartGpifLink();
 }
 
 uint8_t FPGA_status_bits[] = {

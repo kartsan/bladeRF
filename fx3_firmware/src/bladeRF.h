@@ -93,6 +93,8 @@ void NuandFpgaConfigSwFlipLut_bladeRF1(uint16_t flipLut[256]);
 void NuandFpgaConfigSwFlipLut_bladeRF2(uint16_t flipLut[256]);
 
 extern uint32_t glAppMode;
+extern CyBool_t glDeviceReady;
+extern uint8_t glUsbConfiguration;
 
 struct NuandApplication {
     void (*start)(void);
