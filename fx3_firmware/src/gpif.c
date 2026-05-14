@@ -29,6 +29,7 @@
  * only one place */
 #include "cyfxgpif_C4loader.h"
 #include "cyfxgpif_RFlink.h"
+#include "cyfxgpif_EEMlink.h"
 
 #define THIS_FILE LOGGER_ID_GPIF_C
 
@@ -73,6 +74,12 @@ CyU3PReturnStatus_t NuandConfigureGpif(NuandGpifConfig config)
             gpif_config = &C4loader_CyFxGpifConfig;
             gpif_state_index = C4LOADER_START;
             gpif_initial_alpha = C4LOADER_ALPHA_START;
+            break;
+
+        case GPIF_CONFIG_EEMLINK:
+            gpif_config = &EEMlink_CyFxGpifConfig;
+            gpif_state_index = EEMLINK_START;
+            gpif_initial_alpha = EEMLINK_ALPHA_START;
             break;
 
         case GPIF_CONFIG_DISABLED:

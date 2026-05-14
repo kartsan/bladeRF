@@ -29,6 +29,7 @@ typedef enum {
     GPIF_CONFIG_DISABLED,   /**< GPIF is disabled */
     GPIF_CONFIG_RF_LINK,    /**< GPIF configured for streaming RF samples */
     GPIF_CONFIG_FPGA_LOAD,  /**< GPIF configured for FPGA loading */
+    GPIF_CONFIG_EEMLINK,    /**< GPIF configured for CDC EEM bulk path */
 } NuandGpifConfig;
 
 /**
