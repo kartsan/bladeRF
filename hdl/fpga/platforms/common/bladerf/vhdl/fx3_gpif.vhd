@@ -75,7 +75,17 @@ entity fx3_gpif is
     rx_meta_fifo_full   :   in  std_logic;
     rx_meta_fifo_empty  :   in  std_logic;
     rx_meta_fifo_usedr  :   in  std_logic_vector;
-    rx_meta_fifo_data   :   in  std_logic_vector(31 downto 0)
+    rx_meta_fifo_data   :   in  std_logic_vector(31 downto 0);
+
+    -- EEM RX FIFO (FPGA->host, RX1 channel, pclk-synchronous)
+    eem_rx_fifo_read    :   out std_logic;
+    eem_rx_fifo_empty   :   in  std_logic;
+    eem_rx_fifo_data    :   in  std_logic_vector(31 downto 0);
+
+    -- EEM TX FIFO (host->FPGA, TX2 channel, pclk-synchronous)
+    eem_tx_fifo_write   :   out std_logic;
+    eem_tx_fifo_full    :   in  std_logic;
+    eem_tx_fifo_data    :   out std_logic_vector(31 downto 0)
   );
 end entity;
 
@@ -150,6 +160,8 @@ architecture sample_shuffler of fx3_gpif is
         dma_acks        :   dma_handshake_t;
         rx_current_dma  :   dma_channel_t;
         tx_current_dma  :   dma_channel_t;
+        eem_rx_fifo_rd  :   std_logic;
+        eem_tx_fifo_wr  :   std_logic;
     end record;
 
     constant FSM_RESET_VALUE : fsm_t := (
@@ -174,13 +186,17 @@ architecture sample_shuffler of fx3_gpif is
         meta_buf        =>  (others => '0'),
         dma_acks        =>  (others => '0'),
         rx_current_dma  =>  RX0,
-        tx_current_dma  =>  TX3
+        tx_current_dma  =>  TX3,
+        eem_rx_fifo_rd  =>  '0',
+        eem_tx_fifo_wr  =>  '0'
     );
 
     signal current, future      :   fsm_t := FSM_RESET_VALUE;
 
-    signal can_rx               :   boolean;
-    signal can_tx               :   boolean;
+    signal can_rx_rf            :   boolean;
+    signal can_rx_eem           :   boolean;
+    signal can_tx_rf            :   boolean;
+    signal can_tx_eem           :   boolean;
     signal rx_fifo_enough       :   boolean;
     signal tx_fifo_enough       :   boolean;
     signal rx_fifo_critical     :   boolean;
@@ -190,12 +206,16 @@ architecture sample_shuffler of fx3_gpif is
     signal gpif_buf_size        :   natural range GPIF_BUF_SIZE_HS to GPIF_BUF_SIZE_SS := GPIF_BUF_SIZE_SS;
 
     attribute preserve                  :   boolean;
-    attribute preserve  of can_rx       :   signal is true;
-    attribute preserve  of can_tx       :   signal is true;
+    attribute preserve  of can_rx_rf    :   signal is true;
+    attribute preserve  of can_rx_eem   :   signal is true;
+    attribute preserve  of can_tx_rf    :   signal is true;
+    attribute preserve  of can_tx_eem   :   signal is true;
 
     attribute keep                      :   boolean;
-    attribute keep      of can_rx       :   signal is true;
-    attribute keep      of can_tx       :   signal is true;
+    attribute keep      of can_rx_rf    :   signal is true;
+    attribute keep      of can_rx_eem   :   signal is true;
+    attribute keep      of can_tx_rf    :   signal is true;
+    attribute keep      of can_tx_eem   :   signal is true;
 
     -- acknowledge(dma_channel) returns a dma_handshake_t with all bits 0
     -- except the bit corresponding to dma_channel
@@ -288,11 +308,13 @@ begin
             gpif_out            <= (others => '0');
             tx_fifo_data        <= (others => '0');
             tx_meta_fifo_data   <= (others => '0');
+            eem_tx_fifo_data    <= (others => '0');
         elsif (rising_edge(pclk)) then
             gpif_oe             <= '0';
             gpif_out            <= (others => '1');
             tx_fifo_data        <= gpif_in;
             tx_meta_fifo_data   <= gpif_in;
+            eem_tx_fifo_data    <= gpif_in;
 
             case (current.gpif_mode) is
                 when IDLE =>
@@ -300,7 +322,15 @@ begin
 
                 when RX =>
                     gpif_oe         <= '1';
-                    gpif_out        <= rx_fifo_data;
+                    if (current.rx_current_dma = RX1) then
+                        if (eem_rx_fifo_empty = '0') then
+                            gpif_out    <= eem_rx_fifo_data;
+                        else
+                            gpif_out    <= (others => '0');
+                        end if;
+                    else
+                        gpif_out    <= rx_fifo_data;
+                    end if;
 
                 when RX_META =>
                     gpif_oe         <= '1';
@@ -334,27 +364,34 @@ begin
     end process gpif_mux;
 
     can_and_should : process(pclk, reset)
-        variable rx_dma_req : boolean;
-        variable tx_dma_req : boolean;
         variable rx_meta_ok : boolean;
     begin
         if (reset = '1') then
-            can_rx      <= false;
-            can_tx      <= false;
+            can_rx_rf   <= false;
+            can_rx_eem  <= false;
+            can_tx_rf   <= false;
+            can_tx_eem  <= false;
         elsif (rising_edge(pclk)) then
-            rx_dma_req := dma_req.rx0 = '1' or dma_req.rx1 = '1';
             rx_meta_ok := meta_enable = '1' nand rx_meta_fifo_empty = '1';
 
-            can_rx <= dma_rx_enable = '1' and
-                      rx_fifo_enough and
-                      rx_dma_req and
-                      rx_meta_ok;
+            -- RF RX (RX0): need a full GPIF buffer of samples + DMA request
+            can_rx_rf  <= dma_rx_enable = '1' and
+                          rx_fifo_enough and
+                          dma_req.rx0 = '1' and
+                          rx_meta_ok;
 
-            tx_dma_req := dma_req.tx2 = '1' or dma_req.tx3 = '1';
+            -- EEM RX (RX1): any data in FIFO + DMA request
+            can_rx_eem <= dma_req.rx1 = '1' and
+                          eem_rx_fifo_empty = '0';
 
-            can_tx <= dma_tx_enable = '1' and
-                      tx_fifo_enough and
-                      tx_dma_req;
+            -- RF TX (TX3): room in TX FIFO + DMA request
+            can_tx_rf  <= dma_tx_enable = '1' and
+                          tx_fifo_enough and
+                          dma_req.tx3 = '1';
+
+            -- EEM TX (TX2): EEM FIFO not full + DMA request
+            can_tx_eem <= dma_req.tx2 = '1' and
+                          eem_tx_fifo_full = '0';
         end if;
     end process;
 
@@ -380,10 +417,12 @@ begin
         next_state          := IDLE;
 
         -- Deassert fifo reads/writes
-        future.rx_fifo_rd   <= '0';
-        future.tx_fifo_wr   <= '0';
-        future.rxm_fifo_rd  <= '0';
-        future.txm_fifo_wr  <= '0';
+        future.rx_fifo_rd       <= '0';
+        future.tx_fifo_wr       <= '0';
+        future.rxm_fifo_rd      <= '0';
+        future.txm_fifo_wr      <= '0';
+        future.eem_rx_fifo_rd   <= '0';
+        future.eem_tx_fifo_wr   <= '0';
 
         -- Deassert underrun set/clear
         future.underrun_set <= '0';
@@ -415,16 +454,29 @@ begin
                 -- prioritize the TX first; this helps avoid discontinuities on the TX
                 -- signal. However, if RX is about to overflow, we'll choose that.
                 if (current.dma_idle = '1') then
-                    future.dma_downcount <= gpif_buf_size-1;
-                    if (can_rx and rx_fifo_critical) then
+                    -- Priority: RF RX critical > RF TX > EEM RX > EEM TX > RF RX normal
+                    if (can_rx_rf and rx_fifo_critical) then
+                        future.dma_downcount    <= gpif_buf_size - 1;
                         future.ack_downcount    <= ACK_DOWNCOUNT_READ;
                         future.rx_current_dma   <= RX0;
                         future.state            <= SETUP_RD;
-                    elsif (can_tx) then
+                    elsif (can_tx_rf) then
+                        future.dma_downcount    <= gpif_buf_size - 1;
                         future.ack_downcount    <= ACK_DOWNCOUNT_WRITE;
                         future.tx_current_dma   <= TX3;
                         future.state            <= SETUP_WR;
-                    elsif (can_rx) then
+                    elsif (can_rx_eem) then
+                        future.dma_downcount    <= GPIF_EEM_BUF_SIZE - 1;
+                        future.ack_downcount    <= ACK_DOWNCOUNT_READ;
+                        future.rx_current_dma   <= RX1;
+                        future.state            <= SETUP_RD;
+                    elsif (can_tx_eem) then
+                        future.dma_downcount    <= GPIF_EEM_BUF_SIZE - 1;
+                        future.ack_downcount    <= ACK_DOWNCOUNT_WRITE;
+                        future.tx_current_dma   <= TX2;
+                        future.state            <= SETUP_WR;
+                    elsif (can_rx_rf) then
+                        future.dma_downcount    <= gpif_buf_size - 1;
                         future.ack_downcount    <= ACK_DOWNCOUNT_READ;
                         future.rx_current_dma   <= RX0;
                         future.state            <= SETUP_RD;
@@ -439,8 +491,15 @@ begin
                 -- acknowledging the DMA request for ACK_DOWNCOUNT_READ
                 -- clocks.
 
-                -- GPIF, FIFO, next state depend on rx_meta_en
-                if (current.rx_meta_en = '0') then
+                -- GPIF, FIFO, next state depend on channel and rx_meta_en
+                if (current.rx_current_dma = RX1) then
+                    -- EEM: no metadata, go directly to data
+                    future.gpif_mode    <= RX;
+                    if (eem_rx_fifo_empty = '0') then
+                        future.eem_rx_fifo_rd   <= '1';
+                    end if;
+                    next_state          := SAMPLE_READ;
+                elsif (current.rx_meta_en = '0') then
                     future.gpif_mode    <= RX;
                     future.rx_fifo_rd   <= '1';
                     next_state          := SAMPLE_READ;
@@ -493,18 +552,25 @@ begin
                 future.meta_downcount   <= max(current.meta_downcount-1, -1);
 
             when SAMPLE_READ =>
-                -- Service the sample FIFO.
+                -- Service the sample or EEM FIFO.
                 future.gpif_mode        <= RX;
-                future.rx_fifo_rd       <= '1';
-                future.finishing_rx       <= '1';
+                future.finishing_rx     <= '1';
 
-                -- Clear the underrun indicator.  This is set in the event
-                -- of a TX underrun condition, and is sent back to the host
-                -- as part of RX metadata.
-                future.underrun_clr     <= '1';
+                if (current.rx_current_dma = RX1) then
+                    -- EEM: read if data available, else zero-pad with EPD (0x00000000)
+                    if (eem_rx_fifo_empty = '0') then
+                        future.eem_rx_fifo_rd   <= '1';
+                    end if;
+                else
+                    -- RF: normal sample read with underrun clear
+                    future.rx_fifo_rd       <= '1';
 
-                if (packet_enable = '1' and current.dma_downcount = 0 and current.meta_dword(0) = '1') then
-                    future.gpif_mode        <= IDLE;
+                    -- Clear the underrun indicator sent back to the host in metadata
+                    future.underrun_clr     <= '1';
+
+                    if (packet_enable = '1' and current.dma_downcount = 0 and current.meta_dword(0) = '1') then
+                        future.gpif_mode    <= IDLE;
+                    end if;
                 end if;
 
                 -- Once the DMA countdown is done, conclude this transaction
@@ -530,10 +596,10 @@ begin
                     future.gpif_mode    <= TX_IGNORE;
                 end if;
 
-                -- When we're done in this state, check tx_meta_en to decide
-                -- where to go from here
+                -- When we're done in this state, check channel and tx_meta_en
                 if (current.ack_downcount = 0) then
-                    if (current.tx_meta_en = '0') then
+                    if (current.tx_current_dma = TX2 or current.tx_meta_en = '0') then
+                        -- EEM has no metadata; also handles RF with meta disabled
                         future.state        <= SAMPLE_WRITE;
                         future.gpif_mode    <= TX;
                     else
@@ -573,22 +639,29 @@ begin
                 end if;
 
             when SAMPLE_WRITE =>
-                -- Move data from GPIF to the TX sample FIFO
-                future.tx_fifo_wr       <= '1';
-
-                -- Set target FIFO depending on tx_meta_en
-                if (current.tx_meta_en = '0') then
-                    future.gpif_mode    <= TX;
+                -- Move data from GPIF to the TX sample or EEM FIFO
+                if (current.tx_current_dma = TX2) then
+                    -- EEM TX: write to EEM FIFO, no metadata
+                    future.gpif_mode        <= TX;
+                    future.eem_tx_fifo_wr   <= '1';
                 else
-                    future.gpif_mode    <= TX_META;
-                end if;
+                    -- RF TX: write to sample FIFO with optional metadata flush
+                    future.tx_fifo_wr       <= '1';
 
-                -- If meta_downcount is nonzero, flush meta_buf into meta FIFO
-                if (meta_enable = '1' and current.meta_downcount > 0 and
-                         (packet_enable = '0' or (packet_enable = '1' and current.dma_downcount < 6)) ) then
-                    future.meta_downcount   <= max(current.meta_downcount-1, -1);
-                    future.txm_fifo_wr  <= current.tx_meta_en;
-                    future.meta_buf(127 downto 0) <= current.meta_buf(95 downto 0) & x"00000000";
+                    -- Set target FIFO depending on tx_meta_en
+                    if (current.tx_meta_en = '0') then
+                        future.gpif_mode    <= TX;
+                    else
+                        future.gpif_mode    <= TX_META;
+                    end if;
+
+                    -- If meta_downcount is nonzero, flush meta_buf into meta FIFO
+                    if (meta_enable = '1' and current.meta_downcount > 0 and
+                             (packet_enable = '0' or (packet_enable = '1' and current.dma_downcount < 6)) ) then
+                        future.meta_downcount   <= max(current.meta_downcount-1, -1);
+                        future.txm_fifo_wr      <= current.tx_meta_en;
+                        future.meta_buf(127 downto 0) <= current.meta_buf(95 downto 0) & x"00000000";
+                    end if;
                 end if;
 
                 -- Determine when we are finished with the DMA transaction
@@ -644,6 +717,8 @@ begin
         tx_fifo_write           <= current.tx_fifo_wr;
         tx_meta_fifo_write      <= current.txm_fifo_wr;
         rx_meta_fifo_read       <= current.rxm_fifo_rd;
+        eem_rx_fifo_read        <= current.eem_rx_fifo_rd;
+        eem_tx_fifo_write       <= current.eem_tx_fifo_wr;
     end process fsm_output_proc;
 
 end architecture sample_shuffler;
