@@ -10,6 +10,7 @@ vcom -work nuand -2008 ../vhdl/bladerf_p.vhd
 vcom -work nuand -2008 ../vhdl/bladerf.vhd
 vcom -work nuand -2008 ../vhdl/rx.vhd
 vcom -work nuand -2008 ../vhdl/tx.vhd
+vcom -work nuand -2008 ../vhdl/eem/eem_rx_consumer.vhd
 vcom -work nuand -2008 ../vhdl/bladerf-hosted.vhd
 
 vcom -work nuand -2008 ../vhdl/tb/fx3_pll.vhd

@@ -72,10 +72,16 @@ architecture hosted_bladerf of bladerf is
     signal tx_meta_fifo           : meta_fifo_tx_t := META_FIFO_TX_T_DEFAULT;
     signal rx_meta_fifo           : meta_fifo_rx_t := META_FIFO_RX_T_DEFAULT;
 
+    -- EEM debug loopback: when true, eem_tx_fifo (host->FPGA) is spliced
+    -- straight back into eem_rx_fifo (FPGA->host). Stand-in for the real
+    -- eem_tx_framer / EEM-RX logic -- set false (or remove) once that exists.
+    constant EEM_LOOPBACK         : boolean := false;
+
     -- EEM RX FIFO: eem_tx_framer -> fx3_gpif (FPGA->host, RX1, pclk domain)
     signal eem_rx_fifo_rreq       : std_logic := '0';
     signal eem_rx_fifo_rdata      : std_logic_vector(31 downto 0);
     signal eem_rx_fifo_empty      : std_logic;
+    signal eem_rx_fifo_full       : std_logic;
     signal eem_rx_fifo_wdata      : std_logic_vector(31 downto 0) := (others => '0');
     signal eem_rx_fifo_wreq       : std_logic := '0';
 
@@ -86,6 +92,12 @@ architecture hosted_bladerf of bladerf is
     signal eem_tx_fifo_rreq       : std_logic := '0';
     signal eem_tx_fifo_rdata      : std_logic_vector(31 downto 0);
     signal eem_tx_fifo_empty      : std_logic;
+
+    -- eem_rx_consumer observability (host->FPGA EEM packet reception)
+    signal eem_pkt_done_pulse     : std_logic := '0';
+    signal eem_pkt_count          : std_logic_vector(15 downto 0) := (others => '0');
+    signal eem_last_eth_length    : std_logic_vector(13 downto 0) := (others => '0');
+    signal eem_last_bmtype        : std_logic := '0';
 
     signal eem_rx_led             : std_logic := '1';
     signal eem_dma_req_led        : std_logic := '1';
@@ -391,7 +403,7 @@ begin
         port map (
             areset      =>  sys_reset_pclk,
             clock       =>  fx3_pclk_pll,
-            full        =>  open,
+            full        =>  eem_rx_fifo_full,
             empty       =>  eem_rx_fifo_empty,
             used_words  =>  open,
             data_in     =>  eem_rx_fifo_wdata,
@@ -420,6 +432,73 @@ begin
             read_en     =>  eem_tx_fifo_rreq
         );
 
+    -- ========================================================================
+    -- EEM debug loopback
+    -- ------------------------------------------------------------------------
+    -- Splices eem_tx_fifo (host->FPGA, TX2) straight back into eem_rx_fifo
+    -- (FPGA->host, RX1), exercising the whole FX3<->FPGA EEM datapath in both
+    -- directions. Stands in for the not-yet-implemented eem_tx_framer / EEM-RX
+    -- logic and drives the same three signals -- remove it, or set
+    -- EEM_LOOPBACK false, once that logic exists.
+    --
+    -- sync_fifo's data_out is registered: only valid one cycle after 'empty'
+    -- deasserts, and stale for a cycle after a read. The free-running phase plus
+    -- the tx_not_empty_d guard keep a full idle window around every read, so one
+    -- word moves every 4 pclk cycles -- far above EEM's actual bandwidth need.
+    -- ========================================================================
+    eem_loopback_gen : if EEM_LOOPBACK generate
+        eem_loopback : process(sys_reset_pclk, fx3_pclk_pll)
+            variable phase          : unsigned(1 downto 0) := (others => '0');
+            variable tx_not_empty_d : std_logic := '0';
+        begin
+            if (sys_reset_pclk = '1') then
+                phase             := (others => '0');
+                tx_not_empty_d    := '0';
+                eem_tx_fifo_rreq  <= '0';
+                eem_rx_fifo_wreq  <= '0';
+                eem_rx_fifo_wdata <= (others => '0');
+            elsif (rising_edge(fx3_pclk_pll)) then
+                eem_tx_fifo_rreq <= '0';
+                eem_rx_fifo_wreq <= '0';
+
+                if (phase = 0) then
+                    -- tx_not_empty_d => eem_tx_fifo_rdata has had a cycle to
+                    -- settle to the head word
+                    if (tx_not_empty_d = '1' and eem_rx_fifo_full = '0') then
+                        eem_rx_fifo_wdata <= eem_tx_fifo_rdata;  -- settled head word
+                        eem_tx_fifo_rreq  <= '1';                -- pop it
+                        eem_rx_fifo_wreq  <= '1';                -- echo it back
+                        phase := phase + 1;
+                    end if;
+                else
+                    phase := phase + 1;   -- 1 -> 2 -> 3 -> 0 recovery window
+                end if;
+
+                tx_not_empty_d := not eem_tx_fifo_empty;
+            end if;
+        end process eem_loopback;
+    else generate
+        -- Real host->FPGA EEM RX path: parse the EEM header on every packet
+        -- to count packets and discard the payload (TX-direction bringup
+        -- only; payload routing comes later). Drains eem_tx_fifo at one
+        -- read per two pclk cycles, which is well above EEM bandwidth need
+        -- and keeps eem_tx_fifo_full low so GPIF TX2 acks stay open.
+        U_eem_rx_consumer : entity work.eem_rx_consumer
+            port map (
+                clock           => fx3_pclk_pll,
+                reset           => sys_reset_pclk,
+
+                fifo_empty      => eem_tx_fifo_empty,
+                fifo_rdata      => eem_tx_fifo_rdata,
+                fifo_rreq       => eem_tx_fifo_rreq,
+
+                pkt_done_pulse  => eem_pkt_done_pulse,
+                pkt_count       => eem_pkt_count,
+                last_eth_length => eem_last_eth_length,
+                last_bmtype     => eem_last_bmtype
+            );
+    end generate eem_loopback_gen;
+
     -- Light led(3) for 250 ms whenever the FX3 asserts dma2_tx_reqx (ctl_in(10) low):
     -- data is ready on PIB socket 2, i.e. EEM data has arrived from the USB host.
     eem_dma_req_activity : process(sys_reset_pclk, fx3_pclk_pll)
@@ -429,7 +508,7 @@ begin
             eem_dma_req_led <= '1';
             count := 0;
         elsif (rising_edge(fx3_pclk_pll)) then
-            if (fx3_ctl_in(10) = '0') then   -- dma2_tx_reqx active low
+            if (fx3_ctl_in(6) = '0') then   -- dma2_tx_reqx active low
                 eem_dma_req_led <= '0';
                 count := 25_000_000;
             elsif (count > 0) then
@@ -441,7 +520,9 @@ begin
         end if;
     end process eem_dma_req_activity;
 
-    -- Light led(2) for 250 ms whenever the FX3 FSM writes EEM data into eem_tx_fifo
+    -- Light led(2) for 250 ms on every fully-parsed EEM packet (header + payload
+    -- drained from eem_tx_fifo by eem_rx_consumer). One pulse per real host
+    -- packet received, so idle traffic blinks at ARP/RS cadence.
     eem_rx_activity : process(sys_reset_pclk, fx3_pclk_pll)
         variable count : natural range 0 to 25_000_000 := 0;
     begin
@@ -449,7 +530,7 @@ begin
             eem_rx_led <= '1';
             count := 0;
         elsif (rising_edge(fx3_pclk_pll)) then
-            if (eem_tx_fifo_wreq = '1') then
+            if (eem_pkt_done_pulse = '1') then
                 eem_rx_led <= '0';
                 count := 25_000_000;
             elsif (count > 0) then

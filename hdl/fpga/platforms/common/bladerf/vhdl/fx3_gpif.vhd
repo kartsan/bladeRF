@@ -641,9 +641,26 @@ begin
             when SAMPLE_WRITE =>
                 -- Move data from GPIF to the TX sample or EEM FIFO
                 if (current.tx_current_dma = TX2) then
-                    -- EEM TX: write to EEM FIFO, no metadata
+                    -- EEM TX: write only while the FX3 socket-2 buffer still
+                    -- has data to give us. dma_req.tx2 = not dma2_tx_reqx
+                    -- mirrors DMA_RDY_TH2 (FLAG2); when it drops, IF_TX_2
+                    -- transitions to DONE on the FX3 side and we mirror that
+                    -- here. This keeps eem_tx_fifo content tightly aligned
+                    -- with real URB bytes -- no 512-word tail of bus garbage,
+                    -- which an EEM-RX consumer downstream relies on for
+                    -- per-packet header alignment.
+                    --
+                    -- Note on timing: eem_tx_fifo_data is registered from
+                    -- gpif_in in gpif_mux, and eem_tx_fifo_wr is registered
+                    -- here. They land on the FIFO in the same cycle, so the
+                    -- final word that arrived while dma_req.tx2 was still
+                    -- high is captured cleanly; the cycle where dma_req.tx2
+                    -- = '0' deasserts both wr and the state transition.
                     future.gpif_mode        <= TX;
-                    future.eem_tx_fifo_wr   <= '1';
+                    future.eem_tx_fifo_wr   <= dma_req.tx2;
+                    if (dma_req.tx2 = '0') then
+                        future.state        <= FINISHED;
+                    end if;
                 else
                     -- RF TX: write to sample FIFO with optional metadata flush
                     future.tx_fifo_wr       <= '1';
@@ -662,11 +679,13 @@ begin
                         future.txm_fifo_wr      <= current.tx_meta_en;
                         future.meta_buf(127 downto 0) <= current.meta_buf(95 downto 0) & x"00000000";
                     end if;
-                end if;
 
-                -- Determine when we are finished with the DMA transaction
-                if (current.dma_downcount = 0) then
-                    future.state        <= FINISHED;
+                    -- Determine when we are finished with the DMA transaction
+                    -- (RF TX uses the fixed-length downcount; EEM TX above
+                    -- terminates on dma_req.tx2 instead).
+                    if (current.dma_downcount = 0) then
+                        future.state        <= FINISHED;
+                    end if;
                 end if;
 
                 future.dma_downcount    <= max(current.dma_downcount-1, -1);
