@@ -1,6 +1,6 @@
 /*
  * Project Name: RFlink.cyfx
- * Time : 05/14/2026 19:32:58
+ * Time : 05/18/2026 12:44:21
  * Device Type: FX3
  * Project Type: GPIF2
  *
@@ -21,7 +21,7 @@
 /* Summary
    Number of states in the state machine
  */
-#define CY_NUMBER_OF_STATES 10
+#define CY_NUMBER_OF_STATES 11
 
 /* Summary
    Mapping of user defined state names to state indices
@@ -30,12 +30,13 @@
 #define RFLINK_INIT 1
 #define RFLINK_IF_RX_0 3
 #define RFLINK_IF_RX_1 5
-#define RFLINK_IF_TX_2 6
+#define RFLINK_IF_TX_2 7
 #define RFLINK_DONE 4
 #define RFLINK_WAIT_0 2
-#define RFLINK_IF_TX_3 9
-#define RFLINK_IF_TX 7
-#define RFLINK_IF_RX 8
+#define RFLINK_IF_TX_3 10
+#define RFLINK_IF_TX 8
+#define RFLINK_IF_RX 9
+#define RFLINK_WRAPUP_RX1 6
 
 
 /* Summary
@@ -48,7 +49,7 @@
    Transition function values used in the state machine.
  */
 uint16_t Rflink_CyFxGpifTransition[]  = {
-    0x0000, 0xAAAA, 0x5555, 0xCCCC, 0xFFFF, 0xEEEE, 0xFFF0
+    0x0000, 0xAAAA, 0x5555, 0xCCCC, 0xFFFF, 0xEEEE, 0xFFF0, 0x3333
 };
 
 /* Summary
@@ -60,17 +61,18 @@ uint16_t Rflink_CyFxGpifTransition[]  = {
 CyU3PGpifWaveData Rflink_CyFxGpifWavedata[]  = {
     {{0x4E739C01,0x00001000,0x80000000},{0x00000000,0x00000000,0x00000000}},
     {{0x50806202,0x0000000C,0x80000000},{0x00000000,0x00000000,0x00000000}},
-    {{0x1E706207,0x0C00C0C6,0x80000000},{0x1E702008,0x00010106,0x80000000}},
+    {{0x1E706208,0x0C00C0C6,0x80000000},{0x1E702009,0x00010106,0x80000000}},
     {{0x4E739C04,0x00001000,0x80000000},{0x00000000,0x00000000,0x00000000}},
-    {{0x2E739A06,0x08000000,0x80000000},{0x2E739A09,0x0C000000,0x80000000}},
-    {{0x2E739A03,0x20000000,0x80000000},{0x2E739A05,0x24000000,0x80000000}}
+    {{0x4E739C04,0x00001000,0x80000000},{0x4E739C06,0x00000000,0x80100000}},
+    {{0x2E739A07,0x08000000,0x80000000},{0x2E739A0A,0x0C000000,0x80000000}},
+    {{0x2E739A03,0x20000000,0x80000000},{0x2E703A05,0x2400000E,0x80000000}}
 };
 
 /* Summary
    Table that maps state indices to the descriptor table indices.
  */
 uint8_t Rflink_CyFxGpifWavedataPosition[]  = {
-    0,1,2,3,1,3,3,4,5,3
+    0,1,2,3,1,4,3,3,5,6,3
 };
 
 /* Summary
