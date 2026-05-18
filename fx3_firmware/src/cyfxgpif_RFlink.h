@@ -1,6 +1,6 @@
 /*
  * Project Name: RFlink.cyfx
- * Time : 05/18/2026 12:44:21
+ * Time : 05/18/2026 12:50:34
  * Device Type: FX3
  * Project Type: GPIF2
  *
@@ -21,7 +21,7 @@
 /* Summary
    Number of states in the state machine
  */
-#define CY_NUMBER_OF_STATES 11
+#define CY_RFLINK_NUMBER_OF_STATES 11
 
 /* Summary
    Mapping of user defined state names to state indices
@@ -63,7 +63,7 @@ CyU3PGpifWaveData Rflink_CyFxGpifWavedata[]  = {
     {{0x50806202,0x0000000C,0x80000000},{0x00000000,0x00000000,0x00000000}},
     {{0x1E706208,0x0C00C0C6,0x80000000},{0x1E702009,0x00010106,0x80000000}},
     {{0x4E739C04,0x00001000,0x80000000},{0x00000000,0x00000000,0x00000000}},
-    {{0x4E739C04,0x00001000,0x80000000},{0x4E739C06,0x00000000,0x80100000}},
+    {{0x4E739C04,0x00001000,0x80000000},{0x4E739C06,0x04000000,0x80100000}},
     {{0x2E739A07,0x08000000,0x80000000},{0x2E739A0A,0x0C000000,0x80000000}},
     {{0x2E739A03,0x20000000,0x80000000},{0x2E703A05,0x2400000E,0x80000000}}
 };

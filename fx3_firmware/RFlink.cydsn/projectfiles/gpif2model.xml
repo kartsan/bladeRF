@@ -209,7 +209,7 @@
       <RepeatUntillNextTransition>True</RepeatUntillNextTransition>
       <RepeatCount>0</RepeatCount>
       <Action ElementId="COMMIT0" ActionType="COMMIT">
-        <ThreadNumber>Thread0</ThreadNumber>
+        <ThreadNumber>Thread1</ThreadNumber>
       </Action>
     </State>
     <Transition ElementId="TRANSITION3" SourceState="STATE2" DestinationState="STATE3" Equation="!RX_1" />
