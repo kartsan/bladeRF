@@ -72,35 +72,29 @@ architecture hosted_bladerf of bladerf is
     signal tx_meta_fifo           : meta_fifo_tx_t := META_FIFO_TX_T_DEFAULT;
     signal rx_meta_fifo           : meta_fifo_rx_t := META_FIFO_RX_T_DEFAULT;
 
-    -- EEM RX path (FPGA -> host, GPIF RX1): DORMANT.
+    -- EEM RX path (FPGA -> host, GPIF RX1): driven by eem_tx_framer.
     --
-    -- The bring-up test injector (a ROM-style fake-frame producer) was
-    -- removed once the full chain was proven end-to-end on 2026-05-19.
-    -- See memory note project_eem_gpif_link_bringup.md for the record.
-    --
-    -- The signals below are tied off in the architecture body so that
-    -- fx3_gpif sees the FIFO as permanently empty and never enters IF_RX_1.
-    -- When a real producer arrives (eem_tx_framer), two traps in the
-    -- current nuand sync_fifo are worth knowing about:
-    --
-    --   1. The READ_AHEAD generic is declared but unused in the entity
-    --      body; sync_fifo always has a registered data_out (1-cycle
-    --      latency from read pulse). Combined with the gpif_mux register
-    --      on gpif_out, that gives a 2-cycle pipeline that duplicates the
-    --      first word of every burst on the GPIF bus.
-    --   2. Simultaneous read+write silently corrupts state: both
-    --      addresses stall, used count freezes, data_in clobbers
-    --      ram[old write_addr] while data_out returns ram[old read_addr]
-    --      indefinitely.
-    --
-    -- A real producer therefore needs either a fixed sync_fifo (proper
-    -- FWFT when READ_AHEAD=true, correct simultaneous read+write) or a
-    -- different FIFO altogether. See also memory note
-    -- project_eem_gpif_wrapup_rx1_artifacts.md for additional FSM-side
-    -- quirks (ZLP after every commit, last-word-of-burst dropped).
+    -- The framer presents a show-ahead 32-bit interface from a small
+    -- register-array (combinatorial read).  This bypasses the two known
+    -- traps of nuand sync_fifo (READ_AHEAD generic unused -> always 1-cycle
+    -- latency, simultaneous read+write silently corrupts state) that broke
+    -- the first attempt during bringup; see memory notes
+    -- project_eem_gpif_link_bringup.md and project_eem_gpif_wrapup_rx1_artifacts.md.
     signal eem_rx_fifo_rreq  : std_logic;
     signal eem_rx_fifo_rdata : std_logic_vector(31 downto 0);
     signal eem_rx_fifo_empty : std_logic;
+
+    -- Byte-stream between the test frame source and eem_tx_framer.
+    signal eem_tx_src_data   : std_logic_vector(7 downto 0);
+    signal eem_tx_src_valid  : std_logic;
+    signal eem_tx_src_sop    : std_logic;
+    signal eem_tx_src_eop    : std_logic;
+    signal eem_tx_src_len    : unsigned(13 downto 0);
+    signal eem_tx_src_ready  : std_logic;
+
+    -- eem_tx_framer observability (FPGA -> host EEM packet transmission)
+    signal eem_tx_pkt_done   : std_logic;
+    signal eem_tx_pkt_count  : std_logic_vector(15 downto 0);
 
     -- EEM TX FIFO: fx3_gpif -> EEM RX logic (host->FPGA, TX2, pclk domain)
     signal eem_tx_fifo_wreq       : std_logic := '0';
@@ -409,11 +403,11 @@ begin
     -- EEM SYNCHRONOUS FIFOs (pclk domain only, no clock-domain crossing)
     -- ========================================================================
 
-    -- Note: the EEM RX (FPGA->host) FIFO is intentionally absent. The current
-    -- bring-up uses a ROM-style test injector (see eem_rx_inject below) that
-    -- drives eem_rx_fifo_rdata / eem_rx_fifo_empty directly. Adding a real
-    -- producer means re-introducing a FIFO here -- with the caveats called
-    -- out on the eem_rx_fifo_* signal declarations above.
+    -- Note: the EEM RX (FPGA->host) path has no FIFO instance. eem_tx_framer
+    -- presents a show-ahead 32-bit interface directly from its internal
+    -- register-array buffer; see eem_tx_framer.vhd for why (Cyclone V BRAMs
+    -- always have a registered output, which breaks the 0-cycle-latency
+    -- timing fx3_gpif's SAMPLE_READ requires for RX1).
 
     -- EEM TX: fx3_gpif writes here via TX2 DMA channel; EEM RX logic reads.
     -- Read side (eem_tx_fifo_rreq / eem_tx_fifo_rdata) connects to EEM RX logic.
@@ -459,12 +453,54 @@ begin
             last_bmtype     => eem_last_bmtype
         );
 
-    -- FPGA -> host EEM RX path is dormant until a real producer exists.
-    -- Tie inputs off so fx3_gpif sees the FIFO as permanently empty: the
-    -- IDLE state's can_rx_eem condition stays false, the FSM never enters
-    -- SETUP_RD-with-RX1, and eem_rx_fifo_rreq is never pulsed.
-    eem_rx_fifo_empty <= '1';
-    eem_rx_fifo_rdata <= (others => '0');
+    -- ========================================================================
+    -- FPGA -> host EEM TX path
+    -- ------------------------------------------------------------------------
+    -- eem_test_frame_src emits the 50-byte 0x88B5 test frame once per second
+    -- through a byte-stream interface; eem_tx_framer wraps it in a CDC EEM
+    -- data packet (2-byte hdr + 4-byte 0xDEADBEEF FCS sentinel) and presents
+    -- it word-by-word to fx3_gpif's RX1 SAMPLE_READ via a show-ahead FIFO
+    -- interface backed by a small register-array.  fx3_gpif handles the
+    -- WRAPUP_RX1 / COMMIT(Thread1) handshake to the FX3 GPIF II FSM.
+    -- ========================================================================
+    U_eem_test_frame_src : entity work.eem_test_frame_src
+        generic map (
+            PERIOD_TICKS => 100_000_000   -- 1 Hz at fx3_pclk_pll = 100 MHz
+        )
+        port map (
+            clock            => fx3_pclk_pll,
+            reset            => sys_reset_pclk,
+
+            frame_out_data   => eem_tx_src_data,
+            frame_out_valid  => eem_tx_src_valid,
+            frame_out_sop    => eem_tx_src_sop,
+            frame_out_eop    => eem_tx_src_eop,
+            frame_out_length => eem_tx_src_len,
+            frame_out_ready  => eem_tx_src_ready
+        );
+
+    U_eem_tx_framer : entity work.eem_tx_framer
+        generic map (
+            BUF_DEPTH => 64
+        )
+        port map (
+            clock           => fx3_pclk_pll,
+            reset           => sys_reset_pclk,
+
+            frame_in_data   => eem_tx_src_data,
+            frame_in_valid  => eem_tx_src_valid,
+            frame_in_sop    => eem_tx_src_sop,
+            frame_in_eop    => eem_tx_src_eop,
+            frame_in_length => eem_tx_src_len,
+            frame_in_ready  => eem_tx_src_ready,
+
+            fifo_empty      => eem_rx_fifo_empty,
+            fifo_rdata      => eem_rx_fifo_rdata,
+            fifo_rreq       => eem_rx_fifo_rreq,
+
+            pkt_done_pulse  => eem_tx_pkt_done,
+            pkt_count       => eem_tx_pkt_count
+        );
 
     -- Light led(3) for 250 ms whenever the FX3 asserts dma2_tx_reqx (ctl_in(10) low):
     -- data is ready on PIB socket 2, i.e. EEM data has arrived from the USB host.
