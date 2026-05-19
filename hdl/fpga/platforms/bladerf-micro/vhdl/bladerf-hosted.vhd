@@ -72,18 +72,29 @@ architecture hosted_bladerf of bladerf is
     signal tx_meta_fifo           : meta_fifo_tx_t := META_FIFO_TX_T_DEFAULT;
     signal rx_meta_fifo           : meta_fifo_rx_t := META_FIFO_RX_T_DEFAULT;
 
-    -- EEM debug loopback: when true, eem_tx_fifo (host->FPGA) is spliced
-    -- straight back into eem_rx_fifo (FPGA->host). Stand-in for the real
-    -- eem_tx_framer / EEM-RX logic -- set false (or remove) once that exists.
-    constant EEM_LOOPBACK         : boolean := false;
-
-    -- EEM RX FIFO: eem_tx_framer -> fx3_gpif (FPGA->host, RX1, pclk domain)
-    signal eem_rx_fifo_rreq       : std_logic := '0';
-    signal eem_rx_fifo_rdata      : std_logic_vector(31 downto 0);
-    signal eem_rx_fifo_empty      : std_logic;
-    signal eem_rx_fifo_full       : std_logic;
-    signal eem_rx_fifo_wdata      : std_logic_vector(31 downto 0) := (others => '0');
-    signal eem_rx_fifo_wreq       : std_logic := '0';
+    -- EEM RX path (FPGA -> host, GPIF RX1): currently a ROM-style test injector
+    -- (see eem_rx_inject block) drives these signals directly. The injector has
+    -- true show-ahead semantics: eem_rx_fifo_rdata is combinatorial from a
+    -- constant frame array, and eem_rx_fifo_rreq advances the read address.
+    --
+    -- When a real producer arrives, it will need a real FIFO -- and two traps
+    -- in the current nuand sync_fifo to be aware of:
+    --
+    --   1. The READ_AHEAD generic is declared but unused in the entity body;
+    --      sync_fifo always has a registered data_out (1-cycle latency from
+    --      read pulse). Combined with the gpif_mux register on gpif_out, that
+    --      gives a 2-cycle pipeline that duplicates the first word of every
+    --      burst on the GPIF bus.
+    --   2. Simultaneous read+write silently corrupts state: both addresses
+    --      stall, used count freezes, data_in clobbers ram[old write_addr]
+    --      while data_out returns ram[old read_addr] indefinitely.
+    --
+    -- A real producer therefore needs either a fixed sync_fifo (proper FWFT
+    -- when READ_AHEAD=true, correct simultaneous read+write) or a different
+    -- FIFO altogether.
+    signal eem_rx_fifo_rreq  : std_logic;
+    signal eem_rx_fifo_rdata : std_logic_vector(31 downto 0);
+    signal eem_rx_fifo_empty : std_logic;
 
     -- EEM TX FIFO: fx3_gpif -> EEM RX logic (host->FPGA, TX2, pclk domain)
     signal eem_tx_fifo_wreq       : std_logic := '0';
@@ -392,25 +403,11 @@ begin
     -- EEM SYNCHRONOUS FIFOs (pclk domain only, no clock-domain crossing)
     -- ========================================================================
 
-    -- EEM RX: eem_tx_framer writes here; fx3_gpif reads via RX1 DMA channel.
-    -- Write side (eem_rx_fifo_wdata / eem_rx_fifo_wreq) connects to eem_tx_framer.
-    U_eem_rx_fifo : entity work.sync_fifo
-        generic map (
-            DEPTH       =>  1024,
-            WIDTH       =>  32,
-            READ_AHEAD  =>  true
-        )
-        port map (
-            areset      =>  sys_reset_pclk,
-            clock       =>  fx3_pclk_pll,
-            full        =>  eem_rx_fifo_full,
-            empty       =>  eem_rx_fifo_empty,
-            used_words  =>  open,
-            data_in     =>  eem_rx_fifo_wdata,
-            write_en    =>  eem_rx_fifo_wreq,
-            data_out    =>  eem_rx_fifo_rdata,
-            read_en     =>  eem_rx_fifo_rreq
-        );
+    -- Note: the EEM RX (FPGA->host) FIFO is intentionally absent. The current
+    -- bring-up uses a ROM-style test injector (see eem_rx_inject below) that
+    -- drives eem_rx_fifo_rdata / eem_rx_fifo_empty directly. Adding a real
+    -- producer means re-introducing a FIFO here -- with the caveats called
+    -- out on the eem_rx_fifo_* signal declarations above.
 
     -- EEM TX: fx3_gpif writes here via TX2 DMA channel; EEM RX logic reads.
     -- Read side (eem_tx_fifo_rreq / eem_tx_fifo_rdata) connects to EEM RX logic.
@@ -433,71 +430,144 @@ begin
         );
 
     -- ========================================================================
-    -- EEM debug loopback
+    -- Host->FPGA EEM RX path
     -- ------------------------------------------------------------------------
-    -- Splices eem_tx_fifo (host->FPGA, TX2) straight back into eem_rx_fifo
-    -- (FPGA->host, RX1), exercising the whole FX3<->FPGA EEM datapath in both
-    -- directions. Stands in for the not-yet-implemented eem_tx_framer / EEM-RX
-    -- logic and drives the same three signals -- remove it, or set
-    -- EEM_LOOPBACK false, once that logic exists.
-    --
-    -- sync_fifo's data_out is registered: only valid one cycle after 'empty'
-    -- deasserts, and stale for a cycle after a read. The free-running phase plus
-    -- the tx_not_empty_d guard keep a full idle window around every read, so one
-    -- word moves every 4 pclk cycles -- far above EEM's actual bandwidth need.
+    -- Parses the EEM header on every packet delivered via fx3_gpif's TX2 DMA,
+    -- counts packets, and discards the payload (TX-direction bringup only;
+    -- payload routing comes later). Drains eem_tx_fifo at one read per two
+    -- pclk cycles, well above EEM bandwidth need and keeping eem_tx_fifo_full
+    -- low so GPIF TX2 acks stay open.
     -- ========================================================================
-    eem_loopback_gen : if EEM_LOOPBACK generate
-        eem_loopback : process(sys_reset_pclk, fx3_pclk_pll)
-            variable phase          : unsigned(1 downto 0) := (others => '0');
-            variable tx_not_empty_d : std_logic := '0';
+    U_eem_rx_consumer : entity work.eem_rx_consumer
+        port map (
+            clock           => fx3_pclk_pll,
+            reset           => sys_reset_pclk,
+
+            fifo_empty      => eem_tx_fifo_empty,
+            fifo_rdata      => eem_tx_fifo_rdata,
+            fifo_rreq       => eem_tx_fifo_rreq,
+
+            pkt_done_pulse  => eem_pkt_done_pulse,
+            pkt_count       => eem_pkt_count,
+            last_eth_length => eem_last_eth_length,
+            last_bmtype     => eem_last_bmtype
+        );
+
+    -- ========================================================================
+    -- FPGA->host EEM RX test injector (ROM-style, bypasses sync_fifo)
+    -- ------------------------------------------------------------------------
+    -- Once per ~1 s, drives a fixed 16-word / 64-byte CDC EEM frame onto the
+    -- eem_rx_fifo_* signals that fx3_gpif consumes via the RX1 DMA path.
+    -- Exercises the WRAPUP_RX1 / COMMIT(Thread1) plumbing in fx3_gpif.vhd's
+    -- SAMPLE_READ. Combined with the matching GPIF II Designer FSM change in
+    -- cyfxgpif_RFlink.h, this is the smallest end-to-end test that lands a
+    -- valid Ethernet frame on usb0.
+    --
+    -- Why ROM-style and not a real sync_fifo: two traps in the current
+    -- nuand sync_fifo (see comment on eem_rx_fifo_* signal declarations)
+    -- duplicate the first word of every burst and limit URB content. The
+    -- ROM here is intrinsically show-ahead: eem_rx_fifo_rdata is combinatorial
+    -- from FRAME(addr), and eem_rx_fifo_rreq advances addr on the next edge,
+    -- so each pclk cycle that fx3_gpif reads, the bus already carries the
+    -- next FRAME word. Combined with gpif_mux's one register stage, FX3
+    -- sees a clean FRAME(0), FRAME(1), ..., FRAME(15) sequence.
+    --
+    -- URB sizing: empirically the FX3 GPIF II FSM drops the LAST word of every
+    -- burst -- with FRAME = N words the host receives an URB of exactly N-1
+    -- words. Observed via tcpdump -XX -i usbmon0:
+    --   FRAME = 16 words -> URB = 15 words (FRAME(15) lost)
+    --   FRAME = 15 words -> URB = 14 words (FRAME(14) lost)
+    -- Without GPIF II Designer to inspect the FSM, the exact mechanism doesn't
+    -- matter; the pattern is reliable. We work around it by placing the FCS
+    -- sentinel one position from the end and a dummy filler at the very end.
+    -- The dummy gets dropped, the FCS makes it through.
+    --
+    -- Frame contents (56 URB bytes):
+    --   dst MAC   02:00:00:0B:1A:DE  (locally-administered unicast)
+    --   src MAC   02:00:00:0B:1A:DF
+    --   ethertype 0x88B5             (IEEE 802 Local Experimental EtherType 1)
+    --   payload   36 bytes of 0x55   (alternating bits, easy to spot)
+    --   FCS       0xDEADBEEF         (sentinel; bmCRC=0 in EEM header)
+    --
+    -- URB layout on the wire (56 bytes = 14 captured words):
+    --   off  0..1 : EEM hdr   36 00              (bmType=0 bmCRC=0 len=54)
+    --   off  2..7 : dst MAC   02 00 00 0B 1A DE
+    --   off  8..13: src MAC   02 00 00 0B 1A DF
+    --   off 14..15: ethertype 88 B5
+    --   off 16..51: payload   55 ... (36 bytes)
+    --   off 52..55: sentinel  DE AD BE EF
+    --
+    -- 32-bit FIFO words pack URB bytes [b0,b1,b2,b3] as rdata(7..0)=b0 ...
+    -- rdata(31..24)=b3, i.e. each table entry below reads x"B3B2B1B0".
+    --
+    -- INJECT_PERIOD = 100_000_000 -> ~1 s @ 100 MHz pclk. Crank up to silence,
+    -- or remove this whole block once a real FPGA-side EEM producer exists.
+    -- ========================================================================
+    eem_rx_inject : block
+        constant INJECT_PERIOD : natural := 100_000_000;
+
+        type word_arr_t is array(natural range <>) of std_logic_vector(31 downto 0);
+        constant FRAME : word_arr_t := (
+             0 => x"00020036",  -- EEM hdr (36 00, len=54), dst MAC[0..1] (02 00)
+             1 => x"DE1A0B00",  -- dst MAC[2..5] (00 0B 1A DE)
+             2 => x"0B000002",  -- src MAC[0..3] (02 00 00 0B)
+             3 => x"B588DF1A",  -- src MAC[4..5] (1A DF), ethertype (88 B5)
+             4 => x"55555555",
+             5 => x"55555555",
+             6 => x"55555555",
+             7 => x"55555555",
+             8 => x"55555555",
+             9 => x"55555555",
+            10 => x"55555555",
+            11 => x"55555555",
+            12 => x"55555555",
+            13 => x"EFBEADDE",  -- FCS sentinel (DE AD BE EF, big-endian per cdc_eem)
+            14 => x"DEADCAFE"   -- dummy: FX3 drops the last word, anything goes here
+        );
+
+        signal addr   : natural range 0 to FRAME'length-1 := 0;
+        signal active : std_logic                          := '0';
+        signal count  : natural range 0 to INJECT_PERIOD   := INJECT_PERIOD;
+    begin
+        -- Combinatorial show-ahead: when active, the current FRAME entry is
+        -- already on the bus; when inactive, the FIFO looks empty so the
+        -- fx3_gpif FSM never enters IF_RX_1 between bursts.
+        eem_rx_fifo_rdata <= FRAME(addr);
+        eem_rx_fifo_empty <= not active;
+
+        inject_proc : process(sys_reset_pclk, fx3_pclk_pll)
         begin
             if (sys_reset_pclk = '1') then
-                phase             := (others => '0');
-                tx_not_empty_d    := '0';
-                eem_tx_fifo_rreq  <= '0';
-                eem_rx_fifo_wreq  <= '0';
-                eem_rx_fifo_wdata <= (others => '0');
+                addr   <= 0;
+                active <= '0';
+                count  <= INJECT_PERIOD;
             elsif (rising_edge(fx3_pclk_pll)) then
-                eem_tx_fifo_rreq <= '0';
-                eem_rx_fifo_wreq <= '0';
-
-                if (phase = 0) then
-                    -- tx_not_empty_d => eem_tx_fifo_rdata has had a cycle to
-                    -- settle to the head word
-                    if (tx_not_empty_d = '1' and eem_rx_fifo_full = '0') then
-                        eem_rx_fifo_wdata <= eem_tx_fifo_rdata;  -- settled head word
-                        eem_tx_fifo_rreq  <= '1';                -- pop it
-                        eem_rx_fifo_wreq  <= '1';                -- echo it back
-                        phase := phase + 1;
+                if (active = '0') then
+                    -- Idle gap between bursts. Countdown to next injection.
+                    if (count = 0) then
+                        active <= '1';
+                        addr   <= 0;
+                        count  <= INJECT_PERIOD;
+                    else
+                        count <= count - 1;
                     end if;
                 else
-                    phase := phase + 1;   -- 1 -> 2 -> 3 -> 0 recovery window
+                    -- Burst in progress. Each fx3_gpif read pulse consumes one
+                    -- word: advance addr to the next, or, on the last word,
+                    -- drop active so fx3_gpif sees empty and finishes the
+                    -- burst (RX_1 -> WRAPUP_RX1 -> COMMIT(Thread1)).
+                    if (eem_rx_fifo_rreq = '1') then
+                        if (addr = FRAME'length - 1) then
+                            active <= '0';
+                            addr   <= 0;
+                        else
+                            addr <= addr + 1;
+                        end if;
+                    end if;
                 end if;
-
-                tx_not_empty_d := not eem_tx_fifo_empty;
             end if;
-        end process eem_loopback;
-    else generate
-        -- Real host->FPGA EEM RX path: parse the EEM header on every packet
-        -- to count packets and discard the payload (TX-direction bringup
-        -- only; payload routing comes later). Drains eem_tx_fifo at one
-        -- read per two pclk cycles, which is well above EEM bandwidth need
-        -- and keeps eem_tx_fifo_full low so GPIF TX2 acks stay open.
-        U_eem_rx_consumer : entity work.eem_rx_consumer
-            port map (
-                clock           => fx3_pclk_pll,
-                reset           => sys_reset_pclk,
-
-                fifo_empty      => eem_tx_fifo_empty,
-                fifo_rdata      => eem_tx_fifo_rdata,
-                fifo_rreq       => eem_tx_fifo_rreq,
-
-                pkt_done_pulse  => eem_pkt_done_pulse,
-                pkt_count       => eem_pkt_count,
-                last_eth_length => eem_last_eth_length,
-                last_bmtype     => eem_last_bmtype
-            );
-    end generate eem_loopback_gen;
+        end process inject_proc;
+    end block eem_rx_inject;
 
     -- Light led(3) for 250 ms whenever the FX3 asserts dma2_tx_reqx (ctl_in(10) low):
     -- data is ready on PIB socket 2, i.e. EEM data has arrived from the USB host.

@@ -557,9 +557,22 @@ begin
                 future.finishing_rx     <= '1';
 
                 if (current.rx_current_dma = RX1) then
-                    -- EEM: read if data available, else zero-pad with EPD (0x00000000)
+                    -- EEM RX (mirror of the TX2 pattern in SAMPLE_WRITE):
+                    --   gate    = not eem_rx_fifo_empty (analogue of dma_req.tx2)
+                    --   end-of  = eem_rx_fifo_empty     (analogue of dma_req.tx2 = '0')
+                    -- Plus the RX1-specific bit that TX2 doesn't need: hold
+                    -- dma_acks.rx1 high so ctl_out(1) (= RX_1) stays asserted
+                    -- across the burst. When the FIFO empties we stop driving
+                    -- dma_acks, the top-of-process default takes it back to
+                    -- '0', RX_1 drops, and the GPIF II FSM transitions
+                    -- IF_RX_1 -> WRAPUP_RX1 -> COMMIT (Thread1).
+                    -- The dma_downcount-based exit below still fires as a
+                    -- safety cap (GPIF_EEM_BUF_SIZE - 1).
                     if (eem_rx_fifo_empty = '0') then
                         future.eem_rx_fifo_rd   <= '1';
+                        future.dma_acks         <= acknowledge(RX1);
+                    else
+                        future.state            <= FINISHED;
                     end if;
                 else
                     -- RF: normal sample read with underrun clear
@@ -574,6 +587,8 @@ begin
                 end if;
 
                 -- Once the DMA countdown is done, conclude this transaction
+                -- (safety cap; for RX1 the FIFO-empty branch above is the
+                -- normal exit).
                 if (current.dma_downcount = 0) then
                     future.state        <= FINISHED;
                 end if;
