@@ -84,14 +84,6 @@ architecture hosted_bladerf of bladerf is
     signal eem_rx_fifo_rdata : std_logic_vector(31 downto 0);
     signal eem_rx_fifo_empty : std_logic;
 
-    -- Byte-stream between the test frame source and eem_tx_framer.
-    signal eem_tx_src_data   : std_logic_vector(7 downto 0);
-    signal eem_tx_src_valid  : std_logic;
-    signal eem_tx_src_sop    : std_logic;
-    signal eem_tx_src_eop    : std_logic;
-    signal eem_tx_src_len    : unsigned(13 downto 0);
-    signal eem_tx_src_ready  : std_logic;
-
     -- eem_tx_framer observability (FPGA -> host EEM packet transmission)
     signal eem_tx_pkt_done   : std_logic;
     signal eem_tx_pkt_count  : std_logic_vector(15 downto 0);
@@ -104,11 +96,45 @@ architecture hosted_bladerf of bladerf is
     signal eem_tx_fifo_rdata      : std_logic_vector(31 downto 0);
     signal eem_tx_fifo_empty      : std_logic;
 
-    -- eem_rx_consumer observability (host->FPGA EEM packet reception)
+    -- eem_rx_consumer observability + Ethernet byte stream output
     signal eem_pkt_done_pulse     : std_logic := '0';
     signal eem_pkt_count          : std_logic_vector(15 downto 0) := (others => '0');
     signal eem_last_eth_length    : std_logic_vector(13 downto 0) := (others => '0');
     signal eem_last_bmtype        : std_logic := '0';
+
+    signal eth_rx_data            : std_logic_vector(7 downto 0);
+    signal eth_rx_valid           : std_logic;
+    signal eth_rx_sop             : std_logic;
+    signal eth_rx_eop             : std_logic;
+    signal eth_rx_length          : std_logic_vector(13 downto 0);
+
+    -- Local MAC from chip_id_mac (Cyclone V chip ID + fold).
+    signal local_mac              : std_logic_vector(47 downto 0);
+
+    -- eth_rx_demux output channels + sidebands
+    signal arp_rx_data            : std_logic_vector(7 downto 0);
+    signal arp_rx_valid           : std_logic;
+    signal arp_rx_sop             : std_logic;
+    signal arp_rx_eop             : std_logic;
+    signal arp_rx_length          : std_logic_vector(13 downto 0);
+
+    signal ip_rx_data             : std_logic_vector(7 downto 0);
+    signal ip_rx_valid            : std_logic;
+    signal ip_rx_sop              : std_logic;
+    signal ip_rx_eop              : std_logic;
+    signal ip_rx_length           : std_logic_vector(13 downto 0);
+
+    signal eth_rx_src_mac         : std_logic_vector(47 downto 0);
+    signal eth_rx_ethertype       : std_logic_vector(15 downto 0);
+
+    -- ARP responder -> framer byte stream (replaces the old test source).
+    signal arp_tx_data            : std_logic_vector(7 downto 0);
+    signal arp_tx_valid           : std_logic;
+    signal arp_tx_sop             : std_logic;
+    signal arp_tx_eop             : std_logic;
+    signal arp_tx_length          : unsigned(13 downto 0);
+    signal arp_tx_ready           : std_logic;
+    signal arp_reply_pulse        : std_logic;
 
     signal eem_rx_led             : std_logic := '1';
     signal eem_dma_req_led        : std_logic := '1';
@@ -447,6 +473,12 @@ begin
             fifo_rdata      => eem_tx_fifo_rdata,
             fifo_rreq       => eem_tx_fifo_rreq,
 
+            eth_data        => eth_rx_data,
+            eth_valid       => eth_rx_valid,
+            eth_sop         => eth_rx_sop,
+            eth_eop         => eth_rx_eop,
+            eth_length      => eth_rx_length,
+
             pkt_done_pulse  => eem_pkt_done_pulse,
             pkt_count       => eem_pkt_count,
             last_eth_length => eem_last_eth_length,
@@ -454,31 +486,96 @@ begin
         );
 
     -- ========================================================================
-    -- FPGA -> host EEM TX path
+    -- Local MAC source
     -- ------------------------------------------------------------------------
-    -- eem_test_frame_src emits the 50-byte 0x88B5 test frame once per second
-    -- through a byte-stream interface; eem_tx_framer wraps it in a CDC EEM
-    -- data packet (2-byte hdr + 4-byte 0xDEADBEEF FCS sentinel) and presents
-    -- it word-by-word to fx3_gpif's RX1 SAMPLE_READ via a show-ahead FIFO
-    -- interface backed by a small register-array.  fx3_gpif handles the
-    -- WRAPUP_RX1 / COMMIT(Thread1) handshake to the FX3 GPIF II FSM.
+    -- chip_id_mac wraps cv_chip_id_reader (direct Cyclone V chipidblock
+    -- primitive instantiation) and folds the 64-bit chip ID to a 40-bit MAC
+    -- tail with the IEEE-802 locally-administered unicast prefix 0x02.  Its
+    -- reset value is a well-formed fallback MAC, so any ARP reply emitted
+    -- in the ~65 clocks before the chip-ID shift completes still has a
+    -- valid source MAC; the host's ARP cache just updates when the real
+    -- per-board value appears.
     -- ========================================================================
-    U_eem_test_frame_src : entity work.eem_test_frame_src
-        generic map (
-            PERIOD_TICKS => 100_000_000   -- 1 Hz at fx3_pclk_pll = 100 MHz
-        )
+    U_chip_id_mac : entity work.chip_id_mac
         port map (
-            clock            => fx3_pclk_pll,
-            reset            => sys_reset_pclk,
-
-            frame_out_data   => eem_tx_src_data,
-            frame_out_valid  => eem_tx_src_valid,
-            frame_out_sop    => eem_tx_src_sop,
-            frame_out_eop    => eem_tx_src_eop,
-            frame_out_length => eem_tx_src_len,
-            frame_out_ready  => eem_tx_src_ready
+            clock     => fx3_pclk_pll,
+            reset     => sys_reset_pclk,
+            local_mac => local_mac
         );
 
+    -- ========================================================================
+    -- Inbound Ethernet demux: routes by ethertype.
+    --   0x0806 -> arp_responder
+    --   0x0800 -> (future ip_rx_handler; channel currently unconnected)
+    -- Frames with dst MAC != broadcast and != local_mac are silently dropped.
+    -- ========================================================================
+    U_eth_rx_demux : entity work.eth_rx_demux
+        port map (
+            clock      => fx3_pclk_pll,
+            reset      => sys_reset_pclk,
+
+            our_mac    => local_mac,
+
+            in_data    => eth_rx_data,
+            in_valid   => eth_rx_valid,
+            in_sop     => eth_rx_sop,
+            in_eop     => eth_rx_eop,
+            in_length  => eth_rx_length,
+
+            arp_data   => arp_rx_data,
+            arp_valid  => arp_rx_valid,
+            arp_sop    => arp_rx_sop,
+            arp_eop    => arp_rx_eop,
+            arp_length => arp_rx_length,
+
+            ip_data    => ip_rx_data,
+            ip_valid   => ip_rx_valid,
+            ip_sop     => ip_rx_sop,
+            ip_eop     => ip_rx_eop,
+            ip_length  => ip_rx_length,
+
+            src_mac    => eth_rx_src_mac,
+            ethertype  => eth_rx_ethertype
+        );
+
+    -- ========================================================================
+    -- ARP responder for OUR_IP (EEM_OUR_IP from bladerf_p = 192.168.1.2).
+    -- Replies with local_mac to every ARP Request whose TPA matches us.
+    -- Drives the framer directly; the old test frame source is gone.
+    -- ========================================================================
+    U_arp_responder : entity work.arp_responder
+        port map (
+            clock       => fx3_pclk_pll,
+            reset       => sys_reset_pclk,
+
+            our_mac     => local_mac,
+
+            rx_data     => arp_rx_data,
+            rx_valid    => arp_rx_valid,
+            rx_sop      => arp_rx_sop,
+            rx_eop      => arp_rx_eop,
+
+            tx_data     => arp_tx_data,
+            tx_valid    => arp_tx_valid,
+            tx_sop      => arp_tx_sop,
+            tx_eop      => arp_tx_eop,
+            tx_length   => arp_tx_length,
+            tx_ready    => arp_tx_ready,
+
+            reply_pulse => arp_reply_pulse
+        );
+
+    -- ========================================================================
+    -- FPGA -> host EEM TX path
+    -- ------------------------------------------------------------------------
+    -- eem_tx_framer wraps whatever byte stream is presented on its
+    -- frame_in_* port in a CDC EEM data packet (2-byte hdr + 4-byte
+    -- 0xDEADBEEF FCS sentinel + 4-byte dummy word) and presents it
+    -- word-by-word to fx3_gpif's RX1 SAMPLE_READ via a show-ahead FIFO
+    -- interface backed by a small register-array.  Currently driven by
+    -- arp_responder; future producers (IP/UDP/DHCP/HPSDR) will need an
+    -- arbiter in front of frame_in_*.
+    -- ========================================================================
     U_eem_tx_framer : entity work.eem_tx_framer
         generic map (
             BUF_DEPTH => 64
@@ -487,12 +584,12 @@ begin
             clock           => fx3_pclk_pll,
             reset           => sys_reset_pclk,
 
-            frame_in_data   => eem_tx_src_data,
-            frame_in_valid  => eem_tx_src_valid,
-            frame_in_sop    => eem_tx_src_sop,
-            frame_in_eop    => eem_tx_src_eop,
-            frame_in_length => eem_tx_src_len,
-            frame_in_ready  => eem_tx_src_ready,
+            frame_in_data   => arp_tx_data,
+            frame_in_valid  => arp_tx_valid,
+            frame_in_sop    => arp_tx_sop,
+            frame_in_eop    => arp_tx_eop,
+            frame_in_length => arp_tx_length,
+            frame_in_ready  => arp_tx_ready,
 
             fifo_empty      => eem_rx_fifo_empty,
             fifo_rdata      => eem_rx_fifo_rdata,
@@ -502,16 +599,18 @@ begin
             pkt_count       => eem_tx_pkt_count
         );
 
-    -- Light led(3) for 250 ms whenever the FX3 asserts dma2_tx_reqx (ctl_in(10) low):
-    -- data is ready on PIB socket 2, i.e. EEM data has arrived from the USB host.
-    eem_dma_req_activity : process(sys_reset_pclk, fx3_pclk_pll)
+    -- Light led(3) for 250 ms on every ARP reply emitted (arp_responder
+    -- has just finished streaming a 42-byte ARP Reply into eem_tx_framer).
+    -- Replaces the previous dma2_tx_reqx indicator now that the EEM RX
+    -- path is proven; gives a direct "FPGA replied to a host ARP" beacon.
+    arp_reply_activity : process(sys_reset_pclk, fx3_pclk_pll)
         variable count : natural range 0 to 25_000_000 := 0;
     begin
         if (sys_reset_pclk = '1') then
             eem_dma_req_led <= '1';
             count := 0;
         elsif (rising_edge(fx3_pclk_pll)) then
-            if (fx3_ctl_in(6) = '0') then   -- dma2_tx_reqx active low
+            if (arp_reply_pulse = '1') then
                 eem_dma_req_led <= '0';
                 count := 25_000_000;
             elsif (count > 0) then
@@ -521,10 +620,10 @@ begin
                 end if;
             end if;
         end if;
-    end process eem_dma_req_activity;
+    end process arp_reply_activity;
 
     -- Light led(2) for 250 ms on every fully-parsed EEM packet (header + payload
-    -- drained from eem_tx_fifo by eem_rx_consumer). One pulse per real host
+    -- drained from eem_tx_fifo by eem_rx_consumer).  One pulse per host
     -- packet received, so idle traffic blinks at ARP/RS cadence.
     eem_rx_activity : process(sys_reset_pclk, fx3_pclk_pll)
         variable count : natural range 0 to 25_000_000 := 0;
@@ -545,6 +644,9 @@ begin
         end if;
     end process eem_rx_activity;
 
+    -- Heartbeat on led(1): toggles every 10 M pclks (~ 100 ms at 100 MHz,
+    -- giving a 5 Hz blink) so the user can see the FPGA is alive even
+    -- when no EEM/ARP traffic is flowing.
     toggle_led1 : process(fx3_pclk_pll)
         variable count : natural range 0 to 10_000_000 := 10_000_000;
     begin

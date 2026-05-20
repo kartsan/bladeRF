@@ -41,7 +41,10 @@ set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/tx.v
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/rx.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/eem_rx_consumer.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/eem_tx_framer.vhd]]
-set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/eem_test_frame_src.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/cv_chip_id_reader.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/chip_id_mac.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/eth_rx_demux.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/arp_responder.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/bladerf-hosted.vhd]]
 set_global_assignment -name QIP_FILE  [file normalize                  nios_system/synthesis/nios_system.qip]
 

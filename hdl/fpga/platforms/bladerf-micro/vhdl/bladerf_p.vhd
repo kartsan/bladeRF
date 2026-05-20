@@ -29,6 +29,19 @@ library work;
 package bladerf_p is
 
     -- ========================================================================
+    -- EEM stack network configuration
+    -- ------------------------------------------------------------------------
+    -- Placeholder static IPv4 address used by the FPGA-side ARP responder
+    -- (and by any other EEM-stack entity that needs to know "our" IP, e.g.
+    -- an upcoming DHCP client / UDP layer).  When DHCP lands this constant
+    -- becomes the DHCPDISCOVER source-zero default, and the runtime IP is
+    -- carried by a signal driven by the DHCP module instead of this
+    -- constant.  Until then, the host side must bring up usb0 on the same
+    -- /24:  ip addr add 192.168.1.1/24 dev usb0.
+    -- ========================================================================
+    constant EEM_OUR_IP : std_logic_vector(31 downto 0) := x"C0_A8_01_02"; -- 192.168.1.2
+
+    -- ========================================================================
     -- Component declarations for Verilog files
     -- ========================================================================
 
