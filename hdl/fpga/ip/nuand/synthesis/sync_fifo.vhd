@@ -71,24 +71,29 @@ begin
             write_address <= 0 ;
             read_address <= 0 ;
         elsif( rising_edge(clock) ) then
-            if( write_en = '1' ) then
-                if( read_en = '0' ) then
-                    if( used < DEPTH ) then
-                        write_address <= (write_address + 1) mod DEPTH ;
-                        used <= used + 1 ;
-                    else
-                        report "Trying to write a full FIFO!" severity error ;
-                    end if ;
-                end if ;
-            else
-                if( read_en = '1' ) then
-                    if( used > 0 ) then
-                        read_address <= (read_address + 1) mod DEPTH ;
-                        used <= used - 1 ;
-                    else
-                        report "Trying to read an empty FIFO!" severity error ;
-                    end if ;
-                end if ;
+            -- Simultaneous read+write must advance BOTH pointers independently.
+            -- The original implementation skipped both pointer updates on
+            -- write_en='1' AND read_en='1', which silently lost the write
+            -- (overwritten next time) and stalled the read (returned stale
+            -- data the next cycle).  See project_eem_gpif_link_bringup.md.
+            if( write_en = '1' and used < DEPTH ) then
+                write_address <= (write_address + 1) mod DEPTH ;
+            elsif( write_en = '1' ) then
+                report "Trying to write a full FIFO!" severity error ;
+            end if ;
+
+            if( read_en = '1' and used > 0 ) then
+                read_address <= (read_address + 1) mod DEPTH ;
+            elsif( read_en = '1' ) then
+                report "Trying to read an empty FIFO!" severity error ;
+            end if ;
+
+            -- used count: +1 on write-only, -1 on read-only, unchanged on R+W
+            -- (the new word goes straight through), unchanged on idle.
+            if( write_en = '1' and read_en = '0' and used < DEPTH ) then
+                used <= used + 1 ;
+            elsif( read_en = '1' and write_en = '0' and used > 0 ) then
+                used <= used - 1 ;
             end if ;
         end if ;
     end process ;
