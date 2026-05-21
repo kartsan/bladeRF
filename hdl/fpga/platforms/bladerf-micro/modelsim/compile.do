@@ -17,6 +17,11 @@ vcom -work nuand -2008 ../vhdl/eem/cv_chip_id_reader.vhd
 vcom -work nuand -2008 ../vhdl/eem/chip_id_mac.vhd
 vcom -work nuand -2008 ../vhdl/eem/eth_rx_demux.vhd
 vcom -work nuand -2008 ../vhdl/eem/arp_responder.vhd
+vcom -work nuand -2008 ../vhdl/eem/ip_rx_handler.vhd
+vcom -work nuand -2008 ../vhdl/eem/icmp_responder.vhd
+vcom -work nuand -2008 ../vhdl/eem/udp_rx_handler.vhd
+vcom -work nuand -2008 ../vhdl/eem/dhcp_client.vhd
+vcom -work nuand -2008 ../vhdl/eem/tx_arbiter.vhd
 vcom -work nuand -2008 ../vhdl/bladerf-hosted.vhd
 
 vcom -work nuand -2008 ../vhdl/tb/fx3_pll.vhd

@@ -39,7 +39,15 @@ package bladerf_p is
     -- constant.  Until then, the host side must bring up usb0 on the same
     -- /24:  ip addr add 192.168.1.1/24 dev usb0.
     -- ========================================================================
-    constant EEM_OUR_IP : std_logic_vector(31 downto 0) := x"C0_A8_01_02"; -- 192.168.1.2
+    constant EEM_OUR_IP  : std_logic_vector(31 downto 0) := x"C0_A8_01_02"; -- 192.168.1.2
+
+    -- Default host IP, retained as a documentation constant for any
+    -- FPGA-originated packet source that wants to address the host
+    -- before DHCP (or in lieu of snooping the peer IP from an incoming
+    -- HPSDR discovery probe).  Currently unreferenced -- the previous
+    -- consumer (udp_tx_injector test scaffolding) has been removed,
+    -- and dhcp_client uses the limited broadcast 255.255.255.255.
+    constant EEM_HOST_IP : std_logic_vector(31 downto 0) := x"C0_A8_01_01"; -- 192.168.1.1
 
     -- ========================================================================
     -- Component declarations for Verilog files

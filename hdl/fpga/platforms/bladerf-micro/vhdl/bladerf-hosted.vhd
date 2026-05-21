@@ -136,6 +136,96 @@ architecture hosted_bladerf of bladerf is
     signal arp_tx_ready           : std_logic;
     signal arp_reply_pulse        : std_logic;
 
+    -- udp_rx_handler -> dhcp_client byte stream (dst_port=68 classified)
+    signal dhcp_rx_data           : std_logic_vector(7 downto 0);
+    signal dhcp_rx_valid          : std_logic;
+    signal dhcp_rx_sop            : std_logic;
+    signal dhcp_rx_eop            : std_logic;
+    signal dhcp_rx_length         : std_logic_vector(13 downto 0);
+    signal dhcp_rx_pulse          : std_logic;
+
+    -- dhcp_client -> tx_arbiter (port D) byte stream
+    signal dhcp_tx_data           : std_logic_vector(7 downto 0);
+    signal dhcp_tx_valid          : std_logic;
+    signal dhcp_tx_sop            : std_logic;
+    signal dhcp_tx_eop            : std_logic;
+    signal dhcp_tx_length         : unsigned(13 downto 0);
+    signal dhcp_tx_ready          : std_logic;
+    signal dhcp_send_pulse        : std_logic;
+    signal dhcp_bound_pulse       : std_logic;
+
+    -- Leased L3 surface from dhcp_client + the effective_ip mux that
+    -- the downstream IP-stack modules actually consume.  Pre-lease (and
+    -- whenever leased_ip_valid='0') effective_ip falls back to the
+    -- static EEM_OUR_IP from bladerf_p, so ARP / ICMP / UDP injection
+    -- still work during the DHCP acquisition window and as a safe
+    -- default if DHCP never completes.
+    signal leased_ip              : std_logic_vector(31 downto 0);
+    signal leased_ip_valid        : std_logic;
+    signal dhcp_server_ip         : std_logic_vector(31 downto 0);
+    signal effective_ip           : std_logic_vector(31 downto 0);
+
+    -- dhcp_server_ip isn't consumed downstream yet (kept for future
+    -- unicast renewal); the others are now real consumers and don't
+    -- need the keep pragma anymore.
+    attribute keep of dhcp_server_ip : signal is true;
+
+    -- ip_rx_handler outputs.  UDP side feeds udp_rx_handler; ICMP side
+    -- feeds icmp_responder.
+    signal udp_rx_data            : std_logic_vector(7 downto 0);
+    signal udp_rx_valid           : std_logic;
+    signal udp_rx_sop             : std_logic;
+    signal udp_rx_eop             : std_logic;
+    signal udp_rx_length          : std_logic_vector(13 downto 0);
+
+    signal icmp_rx_data           : std_logic_vector(7 downto 0);
+    signal icmp_rx_valid          : std_logic;
+    signal icmp_rx_sop            : std_logic;
+    signal icmp_rx_eop            : std_logic;
+    signal icmp_rx_length         : std_logic_vector(13 downto 0);
+
+    signal ip_rx_src_ip           : std_logic_vector(31 downto 0);
+    signal ip_rx_dst_ip           : std_logic_vector(31 downto 0);
+    signal ip_rx_pulse            : std_logic;
+
+    -- udp_rx_handler -> HPSDR consumer.  No consumer yet; "keep" prevents
+    -- Quartus from optimising the path away while we wire HPSDR up.
+    signal hpsdr_rx_data          : std_logic_vector(7 downto 0);
+    signal hpsdr_rx_valid         : std_logic;
+    signal hpsdr_rx_sop           : std_logic;
+    signal hpsdr_rx_eop           : std_logic;
+    signal hpsdr_rx_length        : std_logic_vector(13 downto 0);
+    signal udp_src_port           : std_logic_vector(15 downto 0);
+    signal udp_dst_port           : std_logic_vector(15 downto 0);
+    signal hpsdr_pulse            : std_logic;
+
+    attribute keep of hpsdr_rx_data   : signal is true;
+    attribute keep of hpsdr_rx_valid  : signal is true;
+    attribute keep of hpsdr_rx_sop    : signal is true;
+    attribute keep of hpsdr_rx_eop    : signal is true;
+    attribute keep of hpsdr_rx_length : signal is true;
+    attribute keep of udp_src_port    : signal is true;
+    attribute keep of udp_dst_port    : signal is true;
+    attribute keep of ip_rx_dst_ip    : signal is true;
+    attribute keep of ip_rx_pulse     : signal is true;
+
+    -- icmp_responder -> tx_arbiter byte stream
+    signal icmp_tx_data           : std_logic_vector(7 downto 0);
+    signal icmp_tx_valid          : std_logic;
+    signal icmp_tx_sop            : std_logic;
+    signal icmp_tx_eop            : std_logic;
+    signal icmp_tx_length         : unsigned(13 downto 0);
+    signal icmp_tx_ready          : std_logic;
+    signal icmp_reply_pulse       : std_logic;
+
+    -- tx_arbiter -> eem_tx_framer byte stream
+    signal mux_tx_data            : std_logic_vector(7 downto 0);
+    signal mux_tx_valid           : std_logic;
+    signal mux_tx_sop             : std_logic;
+    signal mux_tx_eop             : std_logic;
+    signal mux_tx_length          : unsigned(13 downto 0);
+    signal mux_tx_ready           : std_logic;
+
     signal eem_rx_led             : std_logic := '1';
     signal eem_dma_req_led        : std_logic := '1';
 
@@ -510,6 +600,18 @@ begin
         );
 
     -- ========================================================================
+    -- effective_ip: the IPv4 address that the IP stack (arp_responder,
+    -- icmp_responder, ip_rx_handler, and future FPGA-originated senders
+    -- such as HPSDR) actually answers / sources on.  Tracks the
+    -- DHCP-leased value when valid; otherwise falls back to the static
+    -- EEM_OUR_IP (=192.168.1.2) so pre-DHCP traffic and DHCP-failure
+    -- cases stay reachable on the bring-up IP.  Pure combinational mux
+    -- -- the transition happens in the same cycle that dhcp_client
+    -- raises our_ip_valid (= S_BOUND entry).
+    -- ========================================================================
+    effective_ip <= leased_ip when leased_ip_valid = '1' else EEM_OUR_IP;
+
+    -- ========================================================================
     -- Inbound Ethernet demux: routes by ethertype.
     --   0x0806 -> arp_responder
     --   0x0800 -> (future ip_rx_handler; channel currently unconnected)
@@ -545,15 +647,16 @@ begin
         );
 
     -- ========================================================================
-    -- ARP responder for OUR_IP (EEM_OUR_IP from bladerf_p = 192.168.1.2).
-    -- Replies with local_mac to every ARP Request whose TPA matches us.
-    -- Drives the framer directly; the old test frame source is gone.
+    -- ARP responder for effective_ip (leased post-DHCP, EEM_OUR_IP
+    -- fallback pre-DHCP).  Replies with local_mac to every ARP Request
+    -- whose TPA matches us.  Drives tx_arbiter port A.
     -- ========================================================================
     U_arp_responder : entity work.arp_responder
         port map (
             clock       => fx3_pclk_pll,
             reset       => sys_reset_pclk,
 
+            our_ip      => effective_ip,
             our_mac     => local_mac,
 
             rx_data     => arp_rx_data,
@@ -561,14 +664,213 @@ begin
             rx_sop      => arp_rx_sop,
             rx_eop      => arp_rx_eop,
 
-            tx_data     => arp_tx_data,
-            tx_valid    => arp_tx_valid,
-            tx_sop      => arp_tx_sop,
-            tx_eop      => arp_tx_eop,
-            tx_length   => arp_tx_length,
-            tx_ready    => arp_tx_ready,
+            tx_data        => arp_tx_data,
+            tx_valid       => arp_tx_valid,
+            tx_sop         => arp_tx_sop,
+            tx_eop         => arp_tx_eop,
+            tx_length      => arp_tx_length,
+            tx_ready       => arp_tx_ready,
 
-            reply_pulse => arp_reply_pulse
+            -- Snooped host MAC outputs left unconnected.  They drove
+            -- the (now-removed) udp_tx_injector; left in the responder
+            -- entity as a cheap debug surface (SignalTap, future use).
+            peer_mac       => open,
+            peer_mac_valid => open,
+
+            reply_pulse    => arp_reply_pulse
+        );
+
+    -- ========================================================================
+    -- IPv4 RX handler.  Walks the 20-byte IP header, filters dst-IP for
+    -- {EEM_OUR_IP, 255.255.255.255}, drops fragmented / non-strict-IHL /
+    -- non-IPv4 / non-{UDP,ICMP} packets, and routes payloads to the
+    -- udp_rx_* and icmp_rx_* channels respectively.  src_ip / dst_ip /
+    -- rx_pulse are latched at classify time for downstream use.
+    -- ========================================================================
+    U_ip_rx_handler : entity work.ip_rx_handler
+        port map (
+            clock       => fx3_pclk_pll,
+            reset       => sys_reset_pclk,
+
+            our_ip      => effective_ip,
+
+            rx_data     => ip_rx_data,
+            rx_valid    => ip_rx_valid,
+            rx_sop      => ip_rx_sop,
+            rx_eop      => ip_rx_eop,
+            rx_length   => ip_rx_length,
+
+            udp_data    => udp_rx_data,
+            udp_valid   => udp_rx_valid,
+            udp_sop     => udp_rx_sop,
+            udp_eop     => udp_rx_eop,
+            udp_length  => udp_rx_length,
+
+            icmp_data   => icmp_rx_data,
+            icmp_valid  => icmp_rx_valid,
+            icmp_sop    => icmp_rx_sop,
+            icmp_eop    => icmp_rx_eop,
+            icmp_length => icmp_rx_length,
+
+            src_ip      => ip_rx_src_ip,
+            dst_ip      => ip_rx_dst_ip,
+
+            rx_pulse    => ip_rx_pulse
+        );
+
+    -- ========================================================================
+    -- UDP RX handler.  Walks the 8-byte UDP header on every IP-handler
+    -- udp_* packet, classifies by dst_port, and routes the payload to the
+    -- matching application channel.  Two recognised ports:
+    --   dst_port = 1024 -> hpsdr_* (still no consumer; "keep"-pinned)
+    --   dst_port = 68   -> dhcp_*  (consumed by dhcp_client)
+    -- hpsdr_pulse blinks led(3) on detection so we can verify port-1024
+    -- filtering live on the host.
+    -- ========================================================================
+    U_udp_rx_handler : entity work.udp_rx_handler
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            rx_data      => udp_rx_data,
+            rx_valid     => udp_rx_valid,
+            rx_sop       => udp_rx_sop,
+            rx_eop       => udp_rx_eop,
+            rx_length    => udp_rx_length,
+
+            hpsdr_data   => hpsdr_rx_data,
+            hpsdr_valid  => hpsdr_rx_valid,
+            hpsdr_sop    => hpsdr_rx_sop,
+            hpsdr_eop    => hpsdr_rx_eop,
+            hpsdr_length => hpsdr_rx_length,
+
+            dhcp_data    => dhcp_rx_data,
+            dhcp_valid   => dhcp_rx_valid,
+            dhcp_sop     => dhcp_rx_sop,
+            dhcp_eop     => dhcp_rx_eop,
+            dhcp_length  => dhcp_rx_length,
+
+            src_port     => udp_src_port,
+            dst_port     => udp_dst_port,
+
+            hpsdr_pulse  => hpsdr_pulse,
+            dhcp_pulse   => dhcp_rx_pulse
+        );
+
+    -- ========================================================================
+    -- ICMP Echo (ping) responder.  Sits on ip_rx_handler's icmp_* channel,
+    -- mirrors Type-8/Code-0 Echo Requests back as Type-0 Echo Replies with
+    -- updated checksums.  Drives the tx_arbiter's B port.
+    -- ========================================================================
+    U_icmp_responder : entity work.icmp_responder
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            our_ip       => effective_ip,
+            our_mac      => local_mac,
+            peer_mac     => eth_rx_src_mac,
+            peer_ip      => ip_rx_src_ip,
+
+            rx_data      => icmp_rx_data,
+            rx_valid     => icmp_rx_valid,
+            rx_sop       => icmp_rx_sop,
+            rx_eop       => icmp_rx_eop,
+            rx_length    => icmp_rx_length,
+
+            tx_data      => icmp_tx_data,
+            tx_valid     => icmp_tx_valid,
+            tx_sop       => icmp_tx_sop,
+            tx_eop       => icmp_tx_eop,
+            tx_length    => icmp_tx_length,
+            tx_ready     => icmp_tx_ready,
+
+            reply_pulse  => icmp_reply_pulse
+        );
+
+    -- ========================================================================
+    -- DHCP client.  Walks DISCOVER -> OFFER -> REQUEST -> ACK against
+    -- the host's DHCP server (e.g. the dedicated dnsmasq instance on
+    -- usb0 with `--port=0 --interface=usb0 --bind-interfaces --dhcp-range
+    -- =192.168.1.10,192.168.1.20`).  On success, exposes the leased IPv4
+    -- via `leased_ip` + `leased_ip_valid`; nothing consumes these yet --
+    -- they're "keep"-pinned signals visible to SignalTap / journalctl
+    -- correlation during bring-up.  Drives tx_arbiter port D (lowest
+    -- priority).  RX comes off udp_rx_handler's dhcp_* channel
+    -- (dst_port=68).  2 s boot delay before first DISCOVER; 4 s OFFER /
+    -- ACK timeouts with restart-from-DISCOVER on failure.
+    -- ========================================================================
+    U_dhcp_client : entity work.dhcp_client
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            our_mac      => local_mac,
+
+            rx_data      => dhcp_rx_data,
+            rx_valid     => dhcp_rx_valid,
+            rx_sop       => dhcp_rx_sop,
+            rx_eop       => dhcp_rx_eop,
+            rx_length    => dhcp_rx_length,
+
+            tx_data      => dhcp_tx_data,
+            tx_valid     => dhcp_tx_valid,
+            tx_sop       => dhcp_tx_sop,
+            tx_eop       => dhcp_tx_eop,
+            tx_length    => dhcp_tx_length,
+            tx_ready     => dhcp_tx_ready,
+
+            our_ip       => leased_ip,
+            our_ip_valid => leased_ip_valid,
+            server_ip    => dhcp_server_ip,
+
+            send_pulse   => dhcp_send_pulse,
+            bound_pulse  => dhcp_bound_pulse
+        );
+
+    -- ========================================================================
+    -- TX arbiter: multiplexes arp_responder (port A, highest priority),
+    -- icmp_responder (port B), and dhcp_client (port C, lowest priority)
+    -- onto the single eem_tx_framer input.  Holds the active producer
+    -- until the framer's pkt_done_pulse fires, then releases for the
+    -- next.  When the HPSDR transmit path lands, it'll add port D (or
+    -- replace this arbiter entirely with a high-rate scheduler -- see
+    -- tx_arbiter.vhd's header for the design note).
+    -- ========================================================================
+    U_tx_arbiter : entity work.tx_arbiter
+        port map (
+            clock     => fx3_pclk_pll,
+            reset     => sys_reset_pclk,
+
+            a_data    => arp_tx_data,
+            a_valid   => arp_tx_valid,
+            a_sop     => arp_tx_sop,
+            a_eop     => arp_tx_eop,
+            a_length  => arp_tx_length,
+            a_ready   => arp_tx_ready,
+
+            b_data    => icmp_tx_data,
+            b_valid   => icmp_tx_valid,
+            b_sop     => icmp_tx_sop,
+            b_eop     => icmp_tx_eop,
+            b_length  => icmp_tx_length,
+            b_ready   => icmp_tx_ready,
+
+            c_data    => dhcp_tx_data,
+            c_valid   => dhcp_tx_valid,
+            c_sop     => dhcp_tx_sop,
+            c_eop     => dhcp_tx_eop,
+            c_length  => dhcp_tx_length,
+            c_ready   => dhcp_tx_ready,
+
+            tx_data   => mux_tx_data,
+            tx_valid  => mux_tx_valid,
+            tx_sop    => mux_tx_sop,
+            tx_eop    => mux_tx_eop,
+            tx_length => mux_tx_length,
+            tx_ready  => mux_tx_ready,
+
+            pkt_done  => eem_tx_pkt_done
         );
 
     -- ========================================================================
@@ -578,24 +880,29 @@ begin
     -- frame_in_* port in a CDC EEM data packet (2-byte hdr + 4-byte
     -- 0xDEADBEEF FCS sentinel + 4-byte dummy word) and presents it
     -- word-by-word to fx3_gpif's RX1 SAMPLE_READ via a show-ahead FIFO
-    -- interface backed by a small register-array.  Currently driven by
-    -- arp_responder; future producers (IP/UDP/DHCP/HPSDR) will need an
-    -- arbiter in front of frame_in_*.
+    -- interface backed by a small register-array.  Driven by tx_arbiter
+    -- (port A = arp_responder, port B = icmp_responder).  Future
+    -- producers (UDP/DHCP/HPSDR) extend the arbiter's port list.
+    --
+    -- ICMP packets can be up to a few hundred bytes (default Linux ping
+    -- is 98 bytes on the wire; oversize pings up to BUF_BYTES+headers
+    -- in icmp_responder = ~298 bytes).  BUF_DEPTH=128 (= 512 B) gives
+    -- ~1.7x headroom over the worst-case ICMP frame.
     -- ========================================================================
     U_eem_tx_framer : entity work.eem_tx_framer
         generic map (
-            BUF_DEPTH => 64
+            BUF_DEPTH => 128
         )
         port map (
             clock           => fx3_pclk_pll,
             reset           => sys_reset_pclk,
 
-            frame_in_data   => arp_tx_data,
-            frame_in_valid  => arp_tx_valid,
-            frame_in_sop    => arp_tx_sop,
-            frame_in_eop    => arp_tx_eop,
-            frame_in_length => arp_tx_length,
-            frame_in_ready  => arp_tx_ready,
+            frame_in_data   => mux_tx_data,
+            frame_in_valid  => mux_tx_valid,
+            frame_in_sop    => mux_tx_sop,
+            frame_in_eop    => mux_tx_eop,
+            frame_in_length => mux_tx_length,
+            frame_in_ready  => mux_tx_ready,
 
             fifo_empty      => eem_rx_fifo_empty,
             fifo_rdata      => eem_rx_fifo_rdata,
@@ -605,18 +912,24 @@ begin
             pkt_count       => eem_tx_pkt_count
         );
 
-    -- Light led(3) for 250 ms on every ARP reply emitted (arp_responder
-    -- has just finished streaming a 42-byte ARP Reply into eem_tx_framer).
-    -- Replaces the previous dma2_tx_reqx indicator now that the EEM RX
-    -- path is proven; gives a direct "FPGA replied to a host ARP" beacon.
-    arp_reply_activity : process(sys_reset_pclk, fx3_pclk_pll)
+    -- Light led(3) for 250 ms on every reply emitted by ARP or ICMP
+    -- responder, or whenever udp_rx_handler classifies an HPSDR-port
+    -- (1024) or DHCP-port (68) UDP packet.  Generic "FPGA saw / replied
+    -- to host traffic" beacon -- the exact protocol can be distinguished
+    -- by watching the host with tcpdump.  Order-of-magnitude blink
+    -- cadence during DHCP bring-up: 1 blip per OFFER + 1 per ACK = ~2
+    -- blips per acquisition.
+    reply_activity : process(sys_reset_pclk, fx3_pclk_pll)
         variable count : natural range 0 to 25_000_000 := 0;
     begin
         if (sys_reset_pclk = '1') then
             eem_dma_req_led <= '1';
             count := 0;
         elsif (rising_edge(fx3_pclk_pll)) then
-            if (arp_reply_pulse = '1') then
+            if (arp_reply_pulse  = '1' or
+                icmp_reply_pulse = '1' or
+                hpsdr_pulse      = '1' or
+                dhcp_rx_pulse    = '1') then
                 eem_dma_req_led <= '0';
                 count := 25_000_000;
             elsif (count > 0) then
@@ -626,7 +939,7 @@ begin
                 end if;
             end if;
         end if;
-    end process arp_reply_activity;
+    end process reply_activity;
 
     -- Light led(2) for 250 ms on every fully-parsed EEM packet (header + payload
     -- drained from eem_tx_fifo by eem_rx_consumer).  One pulse per host

@@ -72,15 +72,15 @@ library work;
     use work.bladerf_p.all;
 
 entity arp_responder is
-    generic (
-        -- IPv4 address we respond to ARP Requests for.  Default is the
-        -- package constant; override per-instance if multiple responders
-        -- ever coexist on the same fabric.
-        OUR_IP : std_logic_vector(31 downto 0) := EEM_OUR_IP
-    );
     port (
         clock       : in  std_logic;
         reset       : in  std_logic;
+
+        -- IPv4 address we respond to ARP Requests for.  Driven at runtime
+        -- so that a DHCP-leased address can be substituted post-ACK; the
+        -- bladerf-hosted wrapper muxes this between leased_ip (when valid)
+        -- and the static EEM_OUR_IP fallback.
+        our_ip      : in  std_logic_vector(31 downto 0);
 
         -- Local MAC (from chip_id_mac)
         our_mac     : in  std_logic_vector(47 downto 0);
@@ -98,6 +98,13 @@ entity arp_responder is
         tx_eop      : out std_logic;
         tx_length   : out unsigned(13 downto 0);
         tx_ready    : in  std_logic;
+
+        -- Snooped peer MAC: latched at the moment we classify a valid
+        -- ARP Request for OUR_IP, held until reset.  Drives the
+        -- destination MAC of FPGA-originated packets (udp_tx_injector,
+        -- etc.) once the host has ARP'd us at least once.
+        peer_mac        : out std_logic_vector(47 downto 0);
+        peer_mac_valid  : out std_logic;
 
         -- Observability: pulse on every reply emitted
         reply_pulse : out std_logic
@@ -138,6 +145,12 @@ architecture arch of arp_responder is
     signal bad_field    : std_logic := '0';
 
     signal reply_pulse_r : std_logic := '0';
+
+    -- Snooped peer MAC: latched only when we transition S_RX -> S_TX
+    -- (= confirmed valid ARP Request for OUR_IP), so we never expose a
+    -- partial / corrupted mid-parse value.
+    signal peer_mac_r       : std_logic_vector(47 downto 0) := (others => '0');
+    signal peer_mac_valid_r : std_logic                     := '0';
 
     -- Build a single reply byte by index 0..41 from captured/constant data.
     function arp_reply_byte (
@@ -213,14 +226,16 @@ begin
     -- 2-cycle backpressure at sop).
     tx_data  <= arp_reply_byte(to_integer(tx_byte_idx),
                                sender_mac_r, sender_ip_r,
-                               our_mac, OUR_IP)
+                               our_mac, our_ip)
                   when state = S_TX else (others => '0');
     tx_valid <= '1' when state = S_TX else '0';
     tx_sop   <= '1' when (state = S_TX and tx_byte_idx = 0) else '0';
     tx_eop   <= '1' when (state = S_TX and tx_byte_idx = to_unsigned(ARP_REPLY_BYTES-1, tx_byte_idx'length))
                        else '0';
-    tx_length    <= to_unsigned(ARP_REPLY_BYTES, tx_length'length);
-    reply_pulse  <= reply_pulse_r;
+    tx_length      <= to_unsigned(ARP_REPLY_BYTES, tx_length'length);
+    reply_pulse    <= reply_pulse_r;
+    peer_mac       <= peer_mac_r;
+    peer_mac_valid <= peer_mac_valid_r;
 
     fsm : process (clock, reset)
         variable n_byte_idx     : unsigned(4 downto 0);
@@ -232,15 +247,17 @@ begin
         variable will_process   : boolean;
     begin
         if reset = '1' then
-            state          <= S_RX;
-            rx_byte_idx    <= (others => '0');
-            tx_byte_idx    <= (others => '0');
-            sender_mac_r   <= (others => '0');
-            sender_ip_r    <= (others => '0');
-            target_ip_r    <= (others => '0');
-            parsing        <= '0';
-            bad_field      <= '0';
-            reply_pulse_r  <= '0';
+            state            <= S_RX;
+            rx_byte_idx      <= (others => '0');
+            tx_byte_idx      <= (others => '0');
+            sender_mac_r     <= (others => '0');
+            sender_ip_r      <= (others => '0');
+            target_ip_r      <= (others => '0');
+            parsing          <= '0';
+            bad_field        <= '0';
+            reply_pulse_r    <= '0';
+            peer_mac_r       <= (others => '0');
+            peer_mac_valid_r <= '0';
         elsif rising_edge(clock) then
             reply_pulse_r <= '0';
 
@@ -313,11 +330,15 @@ begin
                         if will_process
                            and n_bad = '0'
                            and n_byte_idx = to_unsigned(ARP_BODY_BYTES, n_byte_idx'length)
-                           and n_target_ip = OUR_IP
+                           and n_target_ip = our_ip
                         then
-                            -- Valid Request for us -- prep TX.
-                            tx_byte_idx <= (others => '0');
-                            state       <= S_TX;
+                            -- Valid Request for us -- prep TX, snapshot
+                            -- the requester's MAC for FPGA-originated
+                            -- packet sources.
+                            tx_byte_idx      <= (others => '0');
+                            state            <= S_TX;
+                            peer_mac_r       <= n_sender_mac;
+                            peer_mac_valid_r <= '1';
                         end if;
                     end if;
                 end if;
