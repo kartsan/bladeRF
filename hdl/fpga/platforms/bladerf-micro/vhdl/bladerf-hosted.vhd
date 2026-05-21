@@ -437,7 +437,13 @@ begin
 
     -- EEM TX: fx3_gpif writes here via TX2 DMA channel; EEM RX logic reads.
     -- Read side (eem_tx_fifo_rreq / eem_tx_fifo_rdata) connects to EEM RX logic.
-    U_eem_tx_fifo : entity work.sync_fifo
+    --
+    -- Uses work.eem_sync_fifo (EEM-local fork) instead of the shared
+    -- nuand.sync_fifo, because the shared version silently corrupts state
+    -- on simultaneous read+write -- a collision pattern that's normal for
+    -- the EEM TX FIFO (100 MHz fx3_gpif writer + 100 MHz consumer reader
+    -- in the same clock domain).  See feedback_sync_fifo_rw_collision.md.
+    U_eem_tx_fifo : entity work.eem_sync_fifo
         generic map (
             DEPTH       =>  1024,
             WIDTH       =>  32,
