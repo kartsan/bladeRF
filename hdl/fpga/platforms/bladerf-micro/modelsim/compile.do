@@ -10,6 +10,7 @@ vcom -work nuand -2008 ../vhdl/bladerf_p.vhd
 vcom -work nuand -2008 ../vhdl/bladerf.vhd
 vcom -work nuand -2008 ../vhdl/rx.vhd
 vcom -work nuand -2008 ../vhdl/tx.vhd
+vcom -work nuand -2008 ../vhdl/eem/eem_sync_fifo.vhd
 vcom -work nuand -2008 ../vhdl/eem/eem_rx_consumer.vhd
 vcom -work nuand -2008 ../vhdl/eem/eem_tx_framer.vhd
 vcom -work nuand -2008 ../vhdl/eem/cv_chip_id_reader.vhd
