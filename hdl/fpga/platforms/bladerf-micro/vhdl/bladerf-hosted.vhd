@@ -880,19 +880,20 @@ begin
     -- frame_in_* port in a CDC EEM data packet (2-byte hdr + 4-byte
     -- 0xDEADBEEF FCS sentinel + 4-byte dummy word) and presents it
     -- word-by-word to fx3_gpif's RX1 SAMPLE_READ via a show-ahead FIFO
-    -- interface backed by a small register-array.  Driven by tx_arbiter
-    -- (port A = arp_responder, port B = icmp_responder).  Future
-    -- producers (UDP/DHCP/HPSDR) extend the arbiter's port list.
+    -- interface backed by a sync-write / async-read array (Quartus
+    -- auto-infers MLAB / LAB-resident LUT-RAM for the storage, no M10K
+    -- and no wide fabric read mux).  Driven by tx_arbiter (port A =
+    -- arp_responder, port B = icmp_responder, port C = dhcp_client).
+    -- Future HPSDR producers (discovery responder, DDC IQ packetizers,
+    -- status, mic/DUC consumers) extend the arbiter's port list.
     --
-    -- ICMP packets can be up to a few hundred bytes (default Linux ping
-    -- is 98 bytes on the wire; oversize pings up to BUF_BYTES+headers
-    -- in icmp_responder = ~298 bytes).  BUF_DEPTH=128 (= 512 B) gives
-    -- ~1.7x headroom over the worst-case ICMP frame.
+    -- BUF_DEPTH defaults to 512 (= 2 KB) inside the framer entity --
+    -- sized for HPSDR Protocol 2 DDC IQ frames (Eth+IP+UDP+1444 = 1486 B
+    -- per packet = 372 words) with ~38% headroom.  Comfortably absorbs
+    -- everything smaller (ARP 14 B, ICMP 98-298 B, DHCP 342 B, HPSDR
+    -- control < 100 B).  MLAB cost ~32 blocks out of ~1000+ on Cyclone V GX.
     -- ========================================================================
     U_eem_tx_framer : entity work.eem_tx_framer
-        generic map (
-            BUF_DEPTH => 128
-        )
         port map (
             clock           => fx3_pclk_pll,
             reset           => sys_reset_pclk,

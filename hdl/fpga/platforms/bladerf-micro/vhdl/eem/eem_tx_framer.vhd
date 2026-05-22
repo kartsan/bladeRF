@@ -39,15 +39,37 @@
 -- the first word's low half holds the EEM header and its high half holds
 -- the first two Ethernet bytes.
 --
--- Internal storage is a small register-array (BUF_DEPTH entries) read
--- combinatorially; this matches the FWFT semantics fx3_gpif's RX1 SAMPLE_READ
--- requires (the two-cycle pipeline through nuand sync_fifo + gpif_mux caused
--- the first-word-duplication trap observed during bringup).  BUF_DEPTH of 64
--- comfortably covers ARP / DHCP / ICMP / small UDP frames used during
--- bringup; for full Ethernet support raise BUF_DEPTH to >=384 and replace
--- the combinatorial read with a proper FWFT BRAM adapter (Cyclone V BRAMs
--- always have a registered output, so the head and the next word must be
--- pre-fetched into a 1-deep show-ahead register).
+-- Internal storage is a sync-write / async-read array read combinatorially
+-- via `fifo_rdata <= buf(to_integer(word_rp))`.  Quartus auto-infers this
+-- as Cyclone V MLAB (LAB-resident LUT-RAM) rather than M10K -- MLAB is the
+-- only block on Cyclone V that supports async read, and its address
+-- decode is internal so there's no wide fabric mux on the read path.
+-- This matches the FWFT semantics fx3_gpif's RX1 SAMPLE_READ requires
+-- (the two-cycle pipeline through nuand sync_fifo + gpif_mux caused the
+-- first-word-duplication trap observed during bringup).
+--
+-- A BRAM-backed FWFT variant with a 1-deep prefetch register was tried
+-- 2026-05-22 (ramstyle="M10K" with explicit head_r + S_PRIME bridge) and
+-- WORKED for DHCP DISCOVER as far as Linux's promisc-mode capture was
+-- concerned, but the resulting URB stream had the second 32-bit word
+-- silently replaced by the third (= every frame's bytes 2..5 carried
+-- bytes 6..9's content, clobbering the requester MAC in ARP replies and
+-- the broadcast bytes in DHCP DISCOVER).  Paper traces of the prefetch
+-- formula bram_raddr <= word_rp+3 give the correct sequence buf[0],
+-- buf[1], buf[2]... so the bug is somewhere in Quartus's M10K inference
+-- behaviour (likely an extra register stage we didn't model), not in
+-- the abstract pipeline math.  M10K isn't actually needed for HPSDR-1/2
+-- frames either: at BUF_DEPTH=512 (= 2 KB) the MLAB inference burns
+-- ~32 MLABs out of the part's ~1000+, no Fmax cost.  Captured in
+-- [[feedback_bram_prefetch_offbyone]].
+--
+-- BUF_DEPTH default 512 (= 2 KB) sized for HPSDR Protocol 2 DDC IQ frames
+-- (Eth+IP+UDP+1444 = 1486 B per packet = 372 32-bit words) with headroom.
+-- MLAB storage cost: ~32 MLABs (BUF_DEPTH * 32 bits / 640 bits per
+-- MLAB = 25.6 -> 32 rounding up for width).  Forcing `ramstyle="logic"`
+-- would push storage into raw FFs (BUF_DEPTH * 32 = 16 k FFs at depth
+-- 512) AND introduce a BUF_DEPTH-way combinational read mux -- that's
+-- where the Fmax cliff lives, *not* in the MLAB-backed default.
 --
 -- Byte-stream input interface:
 --   frame_in_sop      : first byte of frame; frame_in_length is sampled in
@@ -77,7 +99,12 @@ library ieee;
 entity eem_tx_framer is
     generic (
         -- Word depth of the internal frame buffer (each word is 32 bits).
-        BUF_DEPTH : natural := 64
+        -- Default 512 (= 2 KB) fits HPSDR Protocol 2 DDC IQ frames with
+        -- headroom and Quartus auto-infers as MLAB (~32 MLABs) so there's
+        -- no Fmax cost on the combinational read side.  Bumping further
+        -- is cheap until MLAB count starts mattering to the rest of the
+        -- design.
+        BUF_DEPTH : natural := 512
     );
     port (
         clock           : in  std_logic;
@@ -128,9 +155,9 @@ architecture arch of eem_tx_framer is
     -- One byte per cycle flows through a single packing accumulator from
     -- four sources in turn: HDR (2 bytes), ETH (N bytes), FCS (4 bytes),
     -- DUMMY (4 bytes).  When the accumulator fills (byte_bp wraps 3->0)
-    -- the current word commits to buf[word_wp] and word_wp advances.  After
-    -- the dummy bytes, S_FLUSH commits any partial word and the FSM enters
-    -- S_DRIVE which exposes the buffer combinatorially to fx3_gpif.
+    -- the current word commits to buf[word_wp] and word_wp advances.
+    -- After the dummy bytes the FSM enters S_DRIVE which exposes the
+    -- buffer combinatorially to fx3_gpif.
     type state_t is (S_IDLE, S_HDR0, S_HDR1, S_ETH, S_FCS, S_DUMMY, S_DRIVE);
     signal state : state_t := S_IDLE;
 
