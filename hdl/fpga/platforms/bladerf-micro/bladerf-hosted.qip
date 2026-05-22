@@ -50,6 +50,7 @@ set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/icmp_responder.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/udp_rx_handler.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/dhcp_client.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/hpsdr_discovery_responder.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/tx_arbiter.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/bladerf-hosted.vhd]]
 set_global_assignment -name QIP_FILE  [file normalize                  nios_system/synthesis/nios_system.qip]
