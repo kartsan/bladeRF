@@ -207,8 +207,8 @@ architecture hosted_bladerf of bladerf is
     signal hpsdr_pulse            : std_logic;
 
     -- udp_src_port / udp_dst_port aren't consumed yet downstream (the
-    -- discovery responder doesn't need src_port since the reply goes to
-    -- broadcast on the fixed HPSDR port).  Kept as SignalTap surfaces and
+    -- discovery responder always answers on UDP/1024 -> 1024, regardless
+    -- of which port the probe came from).  Kept as SignalTap surfaces and
     -- for the next HPSDR command consumers.  Same for ip_rx_dst_ip /
     -- ip_rx_pulse which are still observability-only.
     attribute keep of udp_src_port    : signal is true;
@@ -224,6 +224,21 @@ architecture hosted_bladerf of bladerf is
     signal hpsdr_tx_length        : unsigned(13 downto 0);
     signal hpsdr_tx_ready         : std_logic;
     signal hpsdr_disc_reply_pulse : std_logic;
+
+    -- Committed HPSDR client identity, captured by
+    -- hpsdr_discovery_responder at the moment it accepts a discovery
+    -- probe.  These are the contract for future HPSDR producers
+    -- (high-priority status sender, DDC IQ streamers) to address their
+    -- unsolicited transmissions to the discovered host.  Currently
+    -- unconnected -- still useful as SignalTap observables to confirm
+    -- the right host got selected; keep-pinned so Quartus doesn't
+    -- optimise the snapshot away while we wait for the first consumer.
+    signal hpsdr_host_mac         : std_logic_vector(47 downto 0);
+    signal hpsdr_host_ip          : std_logic_vector(31 downto 0);
+    signal hpsdr_host_valid       : std_logic;
+    attribute keep of hpsdr_host_mac   : signal is true;
+    attribute keep of hpsdr_host_ip    : signal is true;
+    attribute keep of hpsdr_host_valid : signal is true;
 
     -- icmp_responder -> tx_arbiter byte stream
     signal icmp_tx_data           : std_logic_vector(7 downto 0);
@@ -867,11 +882,22 @@ begin
     -- hpsdr_* channel (UDP/1024 payload, Eth/IP/UDP stripped); recognises
     -- the General-Packet "discovery request" by payload byte 4 == 0x02
     -- and replies with a 102-byte Ethernet frame advertising this device
-    -- as a Hermes-class HPSDR P2 radio (board type 0x06).  Reply is sent
-    -- L2/L3 broadcast (eliminates the need for peer_mac/peer_ip sidebands;
-    -- safe on point-to-point CDC-EEM).  IP src = effective_ip (DHCP-leased
-    -- post-lease, static EEM_OUR_IP pre-lease).  Drives tx_arbiter port D
-    -- (lowest priority -- piHPSDR retries every ~2-3 s).
+    -- as a Hermes-class HPSDR P2 radio (board type 0x06).  Reply is
+    -- unicast back to the probing host: Eth dst = eth_rx_demux's src_mac
+    -- sideband, IP dst = ip_rx_handler's src_ip sideband.  Both sidebands
+    -- are held stable through the inbound payload duration, so a snapshot
+    -- on rx_sop captures the right pair.  IP src = effective_ip
+    -- (DHCP-leased post-lease, static EEM_OUR_IP pre-lease).
+    --
+    -- host_mac / host_ip / host_valid expose the committed client
+    -- identity for downstream HPSDR producers (high-priority status,
+    -- DDC IQ streamers) so they can target the discovered host without
+    -- re-snooping the inbound path.  Unconnected for now -- the
+    -- "keep"-pinned signals are visible to SignalTap / journalctl
+    -- correlation as bring-up of those producers begins.
+    --
+    -- Drives tx_arbiter port D (lowest priority -- piHPSDR retries
+    -- every ~2-3 s).
     -- ========================================================================
     U_hpsdr_discovery_responder : entity work.hpsdr_discovery_responder
         port map (
@@ -880,6 +906,8 @@ begin
 
             our_mac      => local_mac,
             our_ip       => effective_ip,
+            peer_mac     => eth_rx_src_mac,
+            peer_ip      => ip_rx_src_ip,
 
             rx_data      => hpsdr_rx_data,
             rx_valid     => hpsdr_rx_valid,
@@ -893,6 +921,10 @@ begin
             tx_eop       => hpsdr_tx_eop,
             tx_length    => hpsdr_tx_length,
             tx_ready     => hpsdr_tx_ready,
+
+            host_mac     => hpsdr_host_mac,
+            host_ip      => hpsdr_host_ip,
+            host_valid   => hpsdr_host_valid,
 
             reply_pulse  => hpsdr_disc_reply_pulse
         );

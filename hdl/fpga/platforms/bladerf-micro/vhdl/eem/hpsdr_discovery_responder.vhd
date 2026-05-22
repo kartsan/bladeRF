@@ -42,27 +42,42 @@
 --   byte 14..59: zero pad (device-specific fields ignored by piHPSDR for
 --               minimal "device present" advertisement)
 --
--- Broadcast reply
--- ---------------
--- This first cut sends the reply to L2/L3 broadcast (Eth dst =
--- ff:ff:ff:ff:ff:ff, IP dst = 255.255.255.255).  Spec says unicast, but
--- piHPSDR/Thetis accept broadcast, and the CDC-EEM link is point-to-point
--- so there's only ever one host to reach.  This eliminates the need to
--- plumb peer_mac/peer_ip sidebands from eth_rx_demux/ip_rx_handler all the
--- way through udp_rx_handler.  When a non-discovery P2 command that
--- requires unicast reply lands, we add the sideband path then.
+-- Unicast reply
+-- -------------
+-- The reply is unicast back to the host that sent the probe: Eth dst =
+-- inbound src MAC, IP dst = inbound src IP.  Most reference HPSDR
+-- servers (Hermes-Lite 2 firmware, openHPSDR FPGA) do this; some clients
+-- (notably one piHPSDR variant) outright reject broadcast replies, and
+-- the L2 dst on a unicast reply is correct anyway since the inbound
+-- frame told us the exact L2/L3 binding (src MAC <-> src IP) of a
+-- known-reachable neighbor -- no ARP lookup needed.
+--
+-- peer_mac comes from eth_rx_demux's src_mac sideband; peer_ip from
+-- ip_rx_handler's src_ip sideband.  Both are latched at classify time
+-- by their respective stages and held stable for the full duration of
+-- the payload emission through udp_rx_handler's hpsdr_* forward.  We
+-- snapshot them locally on rx_sop and hold for the entire reply burst.
+--
+-- The same snapshot is exposed as host_mac / host_ip / host_valid so
+-- subsequent HPSDR producers (high-priority status, IQ streamers) can
+-- target the same client without re-snooping the inbound side.
 --
 -- IP checksum strategy
 -- --------------------
--- Every IPv4-header field is a compile-time constant *except* the IP src
--- (= our_ip, runtime-driven via the effective_ip mux: DHCP-leased post-lease,
--- static EEM_OUR_IP pre-lease).  We follow icmp_responder's split pattern:
---   IP_CONST_PART = constant 16-bit sum of {V/IHL/DSCP, total_length, flags,
---                   TTL/proto, broadcast dst halves}
--- registered once per `our_ip` value as
---   ip_chk_r = ~(IP_CONST_PART + our_ip_hi + our_ip_lo)
--- so the per-byte TX mux at idx 24..25 just reads from ip_chk_r -- no
--- per-packet arithmetic, no shallow combinational chain depth concern.
+-- IPv4-header fields split into three classes:
+--   * truly constant         {V/IHL/DSCP, total_length, flags, TTL/proto}
+--                            -> compile-time `IP_CONST_PART`
+--   * varies with our_ip     {src halves}
+--                            -> registered `ip_fixed_part_r` =
+--                               IP_CONST_PART + our_ip_hi + our_ip_lo
+--   * varies with peer_ip    {dst halves}
+--                            -> registered `ip_chk_r` =
+--                               ~(ip_fixed_part_r + peer_ip_hi + peer_ip_lo)
+-- Two register stages keep each oc_add chain shallow (3 levels).  The
+-- per-byte TX mux at idx 24..25 just reads ip_chk_r -- no per-packet
+-- arithmetic on the emission path.  peer_ip_r changes only at rx_sop,
+-- so by the ~60-cycle rx_eop->S_TX transition ip_chk_r has settled
+-- well before the first reply byte.
 --
 -- UDP checksum = 0 (legal "no checksum" in IPv4) -- avoids pseudo-header
 -- math across a 60-byte payload.  dhcp_client uses the same trick.
@@ -118,6 +133,14 @@ entity hpsdr_discovery_responder is
         our_mac       : in  std_logic_vector(47 downto 0);
         our_ip        : in  std_logic_vector(31 downto 0);
 
+        -- Probing host's L2/L3 addresses, snooped at the Eth/IP layers
+        -- and held stable across the full payload duration.  Latched
+        -- locally on rx_sop into peer_mac_r / peer_ip_r so subsequent
+        -- bytes of the probe (or a fresh probe arriving during S_TX)
+        -- can't disturb the in-flight reply.
+        peer_mac      : in  std_logic_vector(47 downto 0);
+        peer_ip       : in  std_logic_vector(31 downto 0);
+
         -- HPSDR byte stream input (from udp_rx_handler hpsdr_* channel,
         -- Eth/IP/UDP headers already stripped; byte 0 of rx_* is byte 0
         -- of the 60-byte General Packet).
@@ -134,6 +157,19 @@ entity hpsdr_discovery_responder is
         tx_eop        : out std_logic;
         tx_length     : out unsigned(13 downto 0);
         tx_ready      : in  std_logic;
+
+        -- Known HPSDR client identity, committed at the moment we
+        -- accept a discovery probe and begin emitting its reply.  Future
+        -- HPSDR producers (high-priority status, DDC IQ streamers, ...)
+        -- read these to address their unsolicited transmissions to the
+        -- last discovered host without re-snooping eth_rx_demux /
+        -- ip_rx_handler.  host_valid latches '1' on first successful
+        -- discovery and stays high; host_mac / host_ip track the most
+        -- recent successful discoverer (in case another client probes
+        -- after the first selection).
+        host_mac      : out std_logic_vector(47 downto 0);
+        host_ip       : out std_logic_vector(31 downto 0);
+        host_valid    : out std_logic;
 
         -- Observability: one cycle when the final reply byte is emitted.
         reply_pulse   : out std_logic
@@ -181,29 +217,31 @@ architecture arch of hpsdr_discovery_responder is
         end if;
     end function;
 
-    -- Precomputed contribution to the IPv4-header checksum from all
-    -- compile-time-constant fields of the reply:
-    --   0x4500 (V/IHL/DSCP), IP_TOTAL_LEN, 0x4000 (DF), 0x4011 (TTL=64/UDP),
-    --   0xFFFF + 0xFFFF (dst = 255.255.255.255).
+    -- Precomputed contribution to the IPv4-header checksum from the
+    -- truly compile-time-constant fields of the reply:
+    --   0x4500 (V/IHL/DSCP), IP_TOTAL_LEN, 0x4000 (DF), 0x4011 (TTL=64/UDP).
     -- ID (0) and the placeholder checksum word contribute 0 and are omitted.
+    -- Both src (our_ip) and dst (peer_ip) are added at register stages
+    -- below; neither is folded in here.
     function calc_ip_const_part return unsigned is
         variable s : unsigned(15 downto 0);
     begin
         s := oc_add(to_unsigned(16#4500#, 16), to_unsigned(IP_TOTAL_LEN, 16));
         s := oc_add(s, to_unsigned(16#4000#, 16));
         s := oc_add(s, to_unsigned(16#4011#, 16));
-        s := oc_add(s, to_unsigned(16#FFFF#, 16));
-        s := oc_add(s, to_unsigned(16#FFFF#, 16));
         return s;
     end function;
 
     constant IP_CONST_PART : unsigned(15 downto 0) := calc_ip_const_part;
 
-    -- Registered IP checksum: ~(IP_CONST_PART + our_ip_hi + our_ip_lo).
-    -- Updated combinationally one cycle after `our_ip` changes (typically
-    -- once, on the DHCP-ACK transition), held stable thereafter; the per-
-    -- byte TX mux reads it directly at idx 24..25.
-    signal ip_chk_r : std_logic_vector(15 downto 0) := (others => '0');
+    -- Stage-1 register: IP_CONST_PART + our_ip halves.  Updated one
+    -- cycle after `our_ip` changes (typically once, at DHCP-ACK).
+    signal ip_fixed_part_r : unsigned(15 downto 0)         := (others => '0');
+
+    -- Stage-2 register: ~(ip_fixed_part_r + peer_ip_r halves).  Updated
+    -- one cycle after peer_ip_r changes (latched on each rx_sop).  The
+    -- per-byte TX mux reads it directly at idx 24..25.
+    signal ip_chk_r        : std_logic_vector(15 downto 0) := (others => '0');
 
     -- ------------------------------------------------------------------
     -- State
@@ -214,6 +252,19 @@ architecture arch of hpsdr_discovery_responder is
     -- RX-side tracking
     signal rx_byte_idx     : unsigned(13 downto 0) := (others => '0');
     signal is_discovery_r  : std_logic             := '0';
+
+    -- Snapshot of the probing host's addresses at rx_sop.  Held stable
+    -- across the entire reply emission (S_TX consumes no RX bytes, so
+    -- a fresh probe arriving during S_TX can't disturb in-flight data).
+    signal peer_mac_r      : std_logic_vector(47 downto 0) := (others => '0');
+    signal peer_ip_r       : std_logic_vector(31 downto 0) := (others => '0');
+
+    -- Committed host identity, exported via host_* ports.  Latched at
+    -- the S_RX -> S_TX transition (where is_discovery has already been
+    -- proven '1' and peer_*_r are guaranteed populated).
+    signal host_mac_r      : std_logic_vector(47 downto 0) := (others => '0');
+    signal host_ip_r       : std_logic_vector(31 downto 0) := (others => '0');
+    signal host_valid_r    : std_logic                     := '0';
 
     -- TX-side counter (walks 0..FRAME_BYTES-1)
     signal tx_byte_idx     : unsigned(13 downto 0) := (others => '0');
@@ -226,15 +277,22 @@ architecture arch of hpsdr_discovery_responder is
     -- ------------------------------------------------------------------
     function disc_byte_at(
         idx       : natural;
+        peer_mac  : std_logic_vector(47 downto 0);
         our_mac   : std_logic_vector(47 downto 0);
         our_ip    : std_logic_vector(31 downto 0);
+        peer_ip   : std_logic_vector(31 downto 0);
         ip_chk    : std_logic_vector(15 downto 0)
     ) return std_logic_vector is
     begin
         case idx is
             -- ---- Ethernet header ----
-            -- Eth dst MAC = broadcast
-            when  0 | 1 | 2 | 3 | 4 | 5 => return x"FF";
+            -- Eth dst MAC = the probing host
+            when  0 => return peer_mac(47 downto 40);
+            when  1 => return peer_mac(39 downto 32);
+            when  2 => return peer_mac(31 downto 24);
+            when  3 => return peer_mac(23 downto 16);
+            when  4 => return peer_mac(15 downto  8);
+            when  5 => return peer_mac( 7 downto  0);
             -- Eth src MAC = us
             when  6 => return our_mac(47 downto 40);
             when  7 => return our_mac(39 downto 32);
@@ -261,7 +319,8 @@ architecture arch of hpsdr_discovery_responder is
             -- IP TTL=64, protocol=UDP (0x11)
             when 22 => return x"40";
             when 23 => return x"11";
-            -- IP header checksum (split-precomputed; registered with our_ip)
+            -- IP header checksum (two-stage register cascade, folds in
+            -- our_ip at stage 1 and peer_ip at stage 2; see ip_chk_proc)
             when 24 => return ip_chk(15 downto 8);
             when 25 => return ip_chk( 7 downto 0);
             -- IP src = our_ip
@@ -269,8 +328,11 @@ architecture arch of hpsdr_discovery_responder is
             when 27 => return our_ip(23 downto 16);
             when 28 => return our_ip(15 downto  8);
             when 29 => return our_ip( 7 downto  0);
-            -- IP dst = 255.255.255.255
-            when 30 | 31 | 32 | 33 => return x"FF";
+            -- IP dst = the probing host
+            when 30 => return peer_ip(31 downto 24);
+            when 31 => return peer_ip(23 downto 16);
+            when 32 => return peer_ip(15 downto  8);
+            when 33 => return peer_ip( 7 downto  0);
 
             -- ---- UDP header ----
             -- UDP src port = 1024 (HPSDR control plane)
@@ -315,11 +377,13 @@ begin
     -- ----------------------------------------------------------------------
     -- Output drivers
     -- ----------------------------------------------------------------------
-    tx_data_mux : process(state, tx_byte_idx, our_mac, our_ip, ip_chk_r)
+    tx_data_mux : process(state, tx_byte_idx, peer_mac_r, our_mac,
+                          our_ip, peer_ip_r, ip_chk_r)
     begin
         if state = S_TX then
             tx_data <= disc_byte_at(to_integer(tx_byte_idx),
-                                    our_mac, our_ip, ip_chk_r);
+                                    peer_mac_r, our_mac,
+                                    our_ip, peer_ip_r, ip_chk_r);
         else
             tx_data <= (others => '0');
         end if;
@@ -334,20 +398,48 @@ begin
     tx_length   <= to_unsigned(FRAME_BYTES, tx_length'length);
     reply_pulse <= reply_pulse_r;
 
+    host_mac    <= host_mac_r;
+    host_ip     <= host_ip_r;
+    host_valid  <= host_valid_r;
+
     -- ----------------------------------------------------------------------
-    -- Registered IP checksum.  Recomputed every cycle as a pure function
-    -- of our_ip; converges within one clock of any our_ip change.  Cheap
-    -- (3-deep oc_add chain, 16-bit values) and avoids per-packet work.
+    -- Registered IP checksum -- two-stage cascade.
+    --
+    -- Stage 1 (`ip_fixed_part_r`) folds in our_ip.  Recomputed every
+    -- cycle as a pure function of our_ip; converges within one clock
+    -- of any our_ip change (typically once, at DHCP-ACK).
+    --
+    -- Stage 2 (`ip_chk_r`) folds in peer_ip_r.  Recomputed every cycle
+    -- as a pure function of ip_fixed_part_r and peer_ip_r; converges
+    -- within one clock of any peer_ip_r change.  peer_ip_r only changes
+    -- on rx_sop, which fires ~60 cycles before S_RX -> S_TX, so by the
+    -- time the first reply byte goes out ip_chk_r is well-settled.
+    --
+    -- Splitting into two register stages keeps each oc_add chain at
+    -- 3 levels (16-bit values) -- no Fmax pressure.
     -- ----------------------------------------------------------------------
+    ip_fixed_part_proc : process(clock, reset)
+        variable s : unsigned(15 downto 0);
+    begin
+        if reset = '1' then
+            ip_fixed_part_r <= (others => '0');
+        elsif rising_edge(clock) then
+            s := IP_CONST_PART;
+            s := oc_add(s, unsigned(our_ip(31 downto 16)));
+            s := oc_add(s, unsigned(our_ip(15 downto  0)));
+            ip_fixed_part_r <= s;
+        end if;
+    end process ip_fixed_part_proc;
+
     ip_chk_proc : process(clock, reset)
         variable s : unsigned(15 downto 0);
     begin
         if reset = '1' then
             ip_chk_r <= (others => '0');
         elsif rising_edge(clock) then
-            s := IP_CONST_PART;
-            s := oc_add(s, unsigned(our_ip(31 downto 16)));
-            s := oc_add(s, unsigned(our_ip(15 downto  0)));
+            s := ip_fixed_part_r;
+            s := oc_add(s, unsigned(peer_ip_r(31 downto 16)));
+            s := oc_add(s, unsigned(peer_ip_r(15 downto  0)));
             ip_chk_r <= std_logic_vector(not s);
         end if;
     end process ip_chk_proc;
@@ -363,6 +455,11 @@ begin
             state         <= S_RX;
             rx_byte_idx   <= (others => '0');
             is_discovery_r <= '0';
+            peer_mac_r    <= (others => '0');
+            peer_ip_r     <= (others => '0');
+            host_mac_r    <= (others => '0');
+            host_ip_r     <= (others => '0');
+            host_valid_r  <= '0';
             tx_byte_idx   <= (others => '0');
             reply_pulse_r <= '0';
         elsif rising_edge(clock) then
@@ -386,6 +483,12 @@ begin
                     if rx_sop = '1' then
                         n_byte_idx := (others => '0');
                         n_is_disc  := '0';
+                        -- Latch the probing host's addresses.  The
+                        -- eth_rx_demux src_mac and ip_rx_handler src_ip
+                        -- sidebands are held stable for the full frame
+                        -- duration, so capturing on sop is safe.
+                        peer_mac_r <= peer_mac;
+                        peer_ip_r  <= peer_ip;
                     end if;
 
                     if n_byte_idx = to_unsigned(4, n_byte_idx'length) then
@@ -402,6 +505,14 @@ begin
                            n_byte_idx >= to_unsigned(4, n_byte_idx'length) then
                             tx_byte_idx <= (others => '0');
                             state       <= S_TX;
+                            -- Publish committed host identity for any
+                            -- downstream HPSDR producer (high-priority
+                            -- status, IQ streamers, ...).  peer_*_r are
+                            -- guaranteed populated by the rx_sop latch
+                            -- earlier in this same packet.
+                            host_mac_r   <= peer_mac_r;
+                            host_ip_r    <= peer_ip_r;
+                            host_valid_r <= '1';
                         end if;
                         n_byte_idx := (others => '0');
                         n_is_disc  := '0';
