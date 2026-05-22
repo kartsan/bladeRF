@@ -41,6 +41,14 @@ package bladerf_p is
     -- ========================================================================
     constant EEM_OUR_IP  : std_logic_vector(31 downto 0) := x"C0_A8_01_02"; -- 192.168.1.2
 
+    -- Default subnet mask paired with EEM_OUR_IP.  Used pre-DHCP (and on
+    -- DHCP failure) to compute the subnet-directed broadcast that
+    -- ip_rx_handler also accepts -- e.g. 192.168.1.255 on this /24.
+    -- Post-lease the leased Option 1 value takes over via the effective_*
+    -- mux in bladerf-hosted.vhd.  Picked to match the dnsmasq bring-up
+    -- range 192.168.1.10..20 / device static .2.
+    constant EEM_OUR_SUBNET_MASK : std_logic_vector(31 downto 0) := x"FF_FF_FF_00"; -- /24
+
     -- Default host IP, retained as a documentation constant for any
     -- FPGA-originated packet source that wants to address the host
     -- before DHCP (or in lieu of snooping the peer IP from an incoming

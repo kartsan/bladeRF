@@ -154,16 +154,23 @@ architecture hosted_bladerf of bladerf is
     signal dhcp_send_pulse        : std_logic;
     signal dhcp_bound_pulse       : std_logic;
 
-    -- Leased L3 surface from dhcp_client + the effective_ip mux that
+    -- Leased L3 surface from dhcp_client + the effective_* muxes that
     -- the downstream IP-stack modules actually consume.  Pre-lease (and
     -- whenever leased_ip_valid='0') effective_ip falls back to the
-    -- static EEM_OUR_IP from bladerf_p, so ARP / ICMP / UDP injection
-    -- still work during the DHCP acquisition window and as a safe
-    -- default if DHCP never completes.
+    -- static EEM_OUR_IP from bladerf_p, and effective_subnet_mask falls
+    -- back to EEM_OUR_SUBNET_MASK (a /24 paired with EEM_OUR_IP), so
+    -- ARP / ICMP / UDP / subnet-directed broadcast all keep working
+    -- during the DHCP acquisition window and as a safe default if DHCP
+    -- never completes.  effective_subnet_bcast is the runtime subnet-
+    -- directed broadcast (effective_ip OR ~effective_subnet_mask) that
+    -- ip_rx_handler accepts in addition to our_ip and 255.255.255.255.
     signal leased_ip              : std_logic_vector(31 downto 0);
     signal leased_ip_valid        : std_logic;
+    signal leased_subnet_mask     : std_logic_vector(31 downto 0);
     signal dhcp_server_ip         : std_logic_vector(31 downto 0);
     signal effective_ip           : std_logic_vector(31 downto 0);
+    signal effective_subnet_mask  : std_logic_vector(31 downto 0);
+    signal effective_subnet_bcast : std_logic_vector(31 downto 0);
 
     -- dhcp_server_ip isn't consumed downstream yet (kept for future
     -- unicast renewal); the others are now real consumers and don't
@@ -188,8 +195,8 @@ architecture hosted_bladerf of bladerf is
     signal ip_rx_dst_ip           : std_logic_vector(31 downto 0);
     signal ip_rx_pulse            : std_logic;
 
-    -- udp_rx_handler -> HPSDR consumer.  No consumer yet; "keep" prevents
-    -- Quartus from optimising the path away while we wire HPSDR up.
+    -- udp_rx_handler -> hpsdr_discovery_responder byte stream
+    -- (dst_port=1024 classified, Eth/IP/UDP stripped).
     signal hpsdr_rx_data          : std_logic_vector(7 downto 0);
     signal hpsdr_rx_valid         : std_logic;
     signal hpsdr_rx_sop           : std_logic;
@@ -199,15 +206,24 @@ architecture hosted_bladerf of bladerf is
     signal udp_dst_port           : std_logic_vector(15 downto 0);
     signal hpsdr_pulse            : std_logic;
 
-    attribute keep of hpsdr_rx_data   : signal is true;
-    attribute keep of hpsdr_rx_valid  : signal is true;
-    attribute keep of hpsdr_rx_sop    : signal is true;
-    attribute keep of hpsdr_rx_eop    : signal is true;
-    attribute keep of hpsdr_rx_length : signal is true;
+    -- udp_src_port / udp_dst_port aren't consumed yet downstream (the
+    -- discovery responder doesn't need src_port since the reply goes to
+    -- broadcast on the fixed HPSDR port).  Kept as SignalTap surfaces and
+    -- for the next HPSDR command consumers.  Same for ip_rx_dst_ip /
+    -- ip_rx_pulse which are still observability-only.
     attribute keep of udp_src_port    : signal is true;
     attribute keep of udp_dst_port    : signal is true;
     attribute keep of ip_rx_dst_ip    : signal is true;
     attribute keep of ip_rx_pulse     : signal is true;
+
+    -- hpsdr_discovery_responder -> tx_arbiter (port D) byte stream
+    signal hpsdr_tx_data          : std_logic_vector(7 downto 0);
+    signal hpsdr_tx_valid         : std_logic;
+    signal hpsdr_tx_sop           : std_logic;
+    signal hpsdr_tx_eop           : std_logic;
+    signal hpsdr_tx_length        : unsigned(13 downto 0);
+    signal hpsdr_tx_ready         : std_logic;
+    signal hpsdr_disc_reply_pulse : std_logic;
 
     -- icmp_responder -> tx_arbiter byte stream
     signal icmp_tx_data           : std_logic_vector(7 downto 0);
@@ -600,16 +616,28 @@ begin
         );
 
     -- ========================================================================
-    -- effective_ip: the IPv4 address that the IP stack (arp_responder,
-    -- icmp_responder, ip_rx_handler, and future FPGA-originated senders
-    -- such as HPSDR) actually answers / sources on.  Tracks the
-    -- DHCP-leased value when valid; otherwise falls back to the static
-    -- EEM_OUR_IP (=192.168.1.2) so pre-DHCP traffic and DHCP-failure
-    -- cases stay reachable on the bring-up IP.  Pure combinational mux
-    -- -- the transition happens in the same cycle that dhcp_client
-    -- raises our_ip_valid (= S_BOUND entry).
+    -- effective_ip / effective_subnet_mask / effective_subnet_bcast: the
+    -- L3 identity that the IP stack (arp_responder, icmp_responder,
+    -- ip_rx_handler, and future FPGA-originated senders such as HPSDR)
+    -- actually answers / sources on.  Track the DHCP-leased values when
+    -- valid; otherwise fall back to the static EEM_OUR_IP
+    -- (= 192.168.1.2 / 24) so pre-DHCP traffic and DHCP-failure cases
+    -- stay reachable on the bring-up IP.  Pure combinational muxes --
+    -- the transition happens in the same cycle that dhcp_client raises
+    -- our_ip_valid (= S_BOUND entry).
+    --
+    -- effective_subnet_bcast = effective_ip OR ~effective_subnet_mask.
+    -- For a /24 (mask 0xFFFFFF00) at IP 192.168.1.2 this is 192.168.1.255.
+    -- If the DHCP server didn't supply Option 1 then leased_subnet_mask
+    -- = 0x00000000, NOT-ing gives 0xFFFFFFFF, and effective_subnet_bcast
+    -- collapses to 0xFFFFFFFF (= limited broadcast, which ip_rx_handler
+    -- already accepts via BROADCAST_IP -- safe degenerate behaviour).
     -- ========================================================================
-    effective_ip <= leased_ip when leased_ip_valid = '1' else EEM_OUR_IP;
+    effective_ip          <= leased_ip          when leased_ip_valid = '1'
+                                                else EEM_OUR_IP;
+    effective_subnet_mask <= leased_subnet_mask when leased_ip_valid = '1'
+                                                else EEM_OUR_SUBNET_MASK;
+    effective_subnet_bcast <= effective_ip or (not effective_subnet_mask);
 
     -- ========================================================================
     -- Inbound Ethernet demux: routes by ethertype.
@@ -682,17 +710,22 @@ begin
 
     -- ========================================================================
     -- IPv4 RX handler.  Walks the 20-byte IP header, filters dst-IP for
-    -- {EEM_OUR_IP, 255.255.255.255}, drops fragmented / non-strict-IHL /
-    -- non-IPv4 / non-{UDP,ICMP} packets, and routes payloads to the
-    -- udp_rx_* and icmp_rx_* channels respectively.  src_ip / dst_ip /
-    -- rx_pulse are latched at classify time for downstream use.
+    -- {effective_ip, 255.255.255.255, effective_subnet_bcast}, drops
+    -- fragmented / non-strict-IHL / non-IPv4 / non-{UDP,ICMP} packets,
+    -- and routes payloads to the udp_rx_* and icmp_rx_* channels
+    -- respectively.  src_ip / dst_ip / rx_pulse are latched at classify
+    -- time for downstream use.  The subnet-directed broadcast lets us
+    -- receive Thetis/piHPSDR-style discovery probes that target x.x.x.255
+    -- on our subnet (the dnsmasq / router-supplied netmask via DHCP
+    -- Option 1).
     -- ========================================================================
     U_ip_rx_handler : entity work.ip_rx_handler
         port map (
-            clock       => fx3_pclk_pll,
-            reset       => sys_reset_pclk,
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
 
-            our_ip      => effective_ip,
+            our_ip       => effective_ip,
+            subnet_bcast => effective_subnet_bcast,
 
             rx_data     => ip_rx_data,
             rx_valid    => ip_rx_valid,
@@ -722,10 +755,10 @@ begin
     -- UDP RX handler.  Walks the 8-byte UDP header on every IP-handler
     -- udp_* packet, classifies by dst_port, and routes the payload to the
     -- matching application channel.  Two recognised ports:
-    --   dst_port = 1024 -> hpsdr_* (still no consumer; "keep"-pinned)
+    --   dst_port = 1024 -> hpsdr_* (consumed by hpsdr_discovery_responder)
     --   dst_port = 68   -> dhcp_*  (consumed by dhcp_client)
-    -- hpsdr_pulse blinks led(3) on detection so we can verify port-1024
-    -- filtering live on the host.
+    -- hpsdr_pulse blinks led(3) on every classified port-1024 packet (the
+    -- reply itself separately blinks via hpsdr_disc_reply_pulse).
     -- ========================================================================
     U_udp_rx_handler : entity work.udp_rx_handler
         port map (
@@ -823,19 +856,55 @@ begin
             our_ip       => leased_ip,
             our_ip_valid => leased_ip_valid,
             server_ip    => dhcp_server_ip,
+            subnet_mask  => leased_subnet_mask,
 
             send_pulse   => dhcp_send_pulse,
             bound_pulse  => dhcp_bound_pulse
         );
 
     -- ========================================================================
+    -- HPSDR Protocol 2 discovery responder.  Sits on udp_rx_handler's
+    -- hpsdr_* channel (UDP/1024 payload, Eth/IP/UDP stripped); recognises
+    -- the General-Packet "discovery request" by payload byte 4 == 0x02
+    -- and replies with a 102-byte Ethernet frame advertising this device
+    -- as a Hermes-class HPSDR P2 radio (board type 0x06).  Reply is sent
+    -- L2/L3 broadcast (eliminates the need for peer_mac/peer_ip sidebands;
+    -- safe on point-to-point CDC-EEM).  IP src = effective_ip (DHCP-leased
+    -- post-lease, static EEM_OUR_IP pre-lease).  Drives tx_arbiter port D
+    -- (lowest priority -- piHPSDR retries every ~2-3 s).
+    -- ========================================================================
+    U_hpsdr_discovery_responder : entity work.hpsdr_discovery_responder
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            our_mac      => local_mac,
+            our_ip       => effective_ip,
+
+            rx_data      => hpsdr_rx_data,
+            rx_valid     => hpsdr_rx_valid,
+            rx_sop       => hpsdr_rx_sop,
+            rx_eop       => hpsdr_rx_eop,
+            rx_length    => hpsdr_rx_length,
+
+            tx_data      => hpsdr_tx_data,
+            tx_valid     => hpsdr_tx_valid,
+            tx_sop       => hpsdr_tx_sop,
+            tx_eop       => hpsdr_tx_eop,
+            tx_length    => hpsdr_tx_length,
+            tx_ready     => hpsdr_tx_ready,
+
+            reply_pulse  => hpsdr_disc_reply_pulse
+        );
+
+    -- ========================================================================
     -- TX arbiter: multiplexes arp_responder (port A, highest priority),
-    -- icmp_responder (port B), and dhcp_client (port C, lowest priority)
-    -- onto the single eem_tx_framer input.  Holds the active producer
-    -- until the framer's pkt_done_pulse fires, then releases for the
-    -- next.  When the HPSDR transmit path lands, it'll add port D (or
-    -- replace this arbiter entirely with a high-rate scheduler -- see
-    -- tx_arbiter.vhd's header for the design note).
+    -- icmp_responder (port B), dhcp_client (port C), and
+    -- hpsdr_discovery_responder (port D, lowest priority) onto the single
+    -- eem_tx_framer input.  Holds the active producer until the framer's
+    -- pkt_done_pulse fires, then releases for the next.  Future HPSDR IQ
+    -- streaming will likely replace this priority arbiter with a high-rate
+    -- scheduler (see tx_arbiter.vhd's header).
     -- ========================================================================
     U_tx_arbiter : entity work.tx_arbiter
         port map (
@@ -863,6 +932,13 @@ begin
             c_length  => dhcp_tx_length,
             c_ready   => dhcp_tx_ready,
 
+            d_data    => hpsdr_tx_data,
+            d_valid   => hpsdr_tx_valid,
+            d_sop     => hpsdr_tx_sop,
+            d_eop     => hpsdr_tx_eop,
+            d_length  => hpsdr_tx_length,
+            d_ready   => hpsdr_tx_ready,
+
             tx_data   => mux_tx_data,
             tx_valid  => mux_tx_valid,
             tx_sop    => mux_tx_sop,
@@ -883,9 +959,10 @@ begin
     -- interface backed by a sync-write / async-read array (Quartus
     -- auto-infers MLAB / LAB-resident LUT-RAM for the storage, no M10K
     -- and no wide fabric read mux).  Driven by tx_arbiter (port A =
-    -- arp_responder, port B = icmp_responder, port C = dhcp_client).
-    -- Future HPSDR producers (discovery responder, DDC IQ packetizers,
-    -- status, mic/DUC consumers) extend the arbiter's port list.
+    -- arp_responder, port B = icmp_responder, port C = dhcp_client,
+    -- port D = hpsdr_discovery_responder).  Future HPSDR producers (DDC
+    -- IQ packetizers, status, mic/DUC consumers) extend the arbiter's
+    -- port list further.
     --
     -- BUF_DEPTH defaults to 512 (= 2 KB) inside the framer entity --
     -- sized for HPSDR Protocol 2 DDC IQ frames (Eth+IP+UDP+1444 = 1486 B
@@ -927,10 +1004,11 @@ begin
             eem_dma_req_led <= '1';
             count := 0;
         elsif (rising_edge(fx3_pclk_pll)) then
-            if (arp_reply_pulse  = '1' or
-                icmp_reply_pulse = '1' or
-                hpsdr_pulse      = '1' or
-                dhcp_rx_pulse    = '1') then
+            if (arp_reply_pulse        = '1' or
+                icmp_reply_pulse       = '1' or
+                hpsdr_pulse            = '1' or
+                hpsdr_disc_reply_pulse = '1' or
+                dhcp_rx_pulse          = '1') then
                 eem_dma_req_led <= '0';
                 count := 25_000_000;
             elsif (count > 0) then

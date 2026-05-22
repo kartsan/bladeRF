@@ -30,9 +30,13 @@
 --   * version != 4                     (not IPv4)
 --   * IHL    != 5                      (options present; not supported)
 --   * MF=1 or FragmentOffset != 0      (fragmented packet)
---   * dst_ip != OUR_IP and != BROADCAST_IP (not for us; default broadcast
---                                          is the limited 255.255.255.255,
---                                          subnet broadcast NOT accepted)
+--   * dst_ip != our_ip and != BROADCAST_IP and != subnet_bcast
+--                                          (limited broadcast is the
+--                                          generic default 255.255.255.255;
+--                                          subnet_bcast is the runtime
+--                                          subnet-directed broadcast,
+--                                          driven by bladerf-hosted as
+--                                          our_ip OR ~effective_subnet_mask)
 --   * protocol not in {0x01, 0x11}     (not ICMP or UDP)
 --
 -- The IP header is stripped from the output -- handlers downstream see only
@@ -63,11 +67,9 @@ library work;
 
 entity ip_rx_handler is
     generic (
-        -- Broadcast destination accepted in addition to our_ip.  Default is
-        -- the limited broadcast 255.255.255.255 (DHCP-style).  Subnet
-        -- broadcast (e.g. 192.168.1.255) is intentionally NOT accepted --
-        -- pass the subnet broadcast value here if you want both, or extend
-        -- the handler with a netmask generic.
+        -- Limited broadcast accepted in addition to our_ip and the
+        -- runtime subnet-directed broadcast.  Default 255.255.255.255
+        -- (DHCP-style); generic kept for testing flexibility.
         BROADCAST_IP : std_logic_vector(31 downto 0) := x"FF_FF_FF_FF"
     );
     port (
@@ -79,6 +81,15 @@ entity ip_rx_handler is
         -- recompiling; bladerf-hosted muxes between leased_ip and the
         -- static EEM_OUR_IP fallback.
         our_ip     : in  std_logic_vector(31 downto 0);
+
+        -- Subnet-directed broadcast accepted in addition to our_ip and
+        -- BROADCAST_IP.  Driven by bladerf-hosted as
+        --   effective_ip OR (NOT effective_subnet_mask)
+        -- where effective_subnet_mask is the DHCP-leased Option 1 value
+        -- post-lease and the static EEM_OUR_SUBNET_MASK pre-lease.
+        -- Set to 0xFFFFFFFF to disable (which makes this comparison
+        -- alias the limited broadcast check).
+        subnet_bcast : in  std_logic_vector(31 downto 0);
 
         -- IPv4 byte stream input (from eth_rx_demux ip_* channel, header
         -- already stripped of the 14-byte Ethernet preamble).
@@ -296,7 +307,9 @@ begin
 
                     -- At byte 19 (last header byte), classify and transition.
                     if n_byte_idx = to_unsigned(19, n_byte_idx'length) then
-                        dst_match := (n_dst_ip = our_ip) or (n_dst_ip = BROADCAST_IP);
+                        dst_match := (n_dst_ip = our_ip)
+                                  or (n_dst_ip = BROADCAST_IP)
+                                  or (n_dst_ip = subnet_bcast);
                         if rx_eop = '1' then
                             -- Header was the whole frame; no payload to forward.
                             state      <= S_HDR;

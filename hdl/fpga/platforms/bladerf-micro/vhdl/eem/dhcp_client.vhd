@@ -25,20 +25,30 @@
 -- -------
 -- A single 342-byte Ethernet frame template covers both DHCPDISCOVER and
 -- DHCPREQUEST.  Most of it (Eth + IP + UDP + the 240-byte BOOTP fixed
--- header + the magic cookie) is byte-identical between the two messages;
--- only the options section (offsets 282..297) differs:
+-- header + the magic cookie + Opt 53 + Opt 55) is byte-identical between
+-- the two messages; only the trailing options section (offsets 288..300)
+-- differs:
 --
 --   DHCPDISCOVER options:
 --     282 .35 .01 .01     (Option 53: DHCP Message Type = DISCOVER)
---     285 .FF             (End)
---     286+                (zero padding to 300-byte payload)
+--     285 .37 .01 .01     (Option 55: Parameter Request List = subnet mask)
+--     288 .FF             (End)
+--     289+                (zero padding to 300-byte payload)
 --
 --   DHCPREQUEST options:
 --     282 .35 .01 .03     (Option 53: DHCP Message Type = REQUEST)
---     285 .32 .04 yyyy    (Option 50: Requested IP Address = offered yiaddr)
---     291 .36 .04 ssss    (Option 54: Server Identifier      = OFFER's source)
---     297 .FF             (End)
---     298+                (zero padding)
+--     285 .37 .01 .01     (Option 55: Parameter Request List = subnet mask)
+--     288 .32 .04 yyyy    (Option 50: Requested IP Address = offered yiaddr)
+--     294 .36 .04 ssss    (Option 54: Server Identifier      = OFFER's source)
+--     300 .FF             (End)
+--     301+                (zero padding)
+--
+-- Why Option 55: strictly RFC-2131-compliant DHCP servers return Option 1
+-- (subnet mask) only when the client requests it.  Many consumer routers
+-- (OpenWrt, OEM stock firmware) follow that rule; dnsmasq sends Option 1
+-- by default but isn't universal.  Without a leased subnet mask we can't
+-- compute the subnet-directed broadcast that ip_rx_handler accepts, which
+-- kills HPSDR discovery from Thetis / piHPSDR (they target x.x.x.255).
 --
 -- IP checksum precomputed at elaboration: every IP-header field is a
 -- compile-time constant (src=0.0.0.0, dst=255.255.255.255, total_length=328
@@ -58,9 +68,9 @@
 -- UDP (8B), so byte 0 of rx_* is the BOOTP `op` byte.  A two-phase parser
 -- walks the 240-byte BOOTP fixed header (validating op/htype/hlen, xid,
 -- chaddr, and the magic cookie; capturing yiaddr) and then a TLV
--- sub-parser walks the options.  We capture Option 53 (message type) and
--- Option 54 (server identifier); other options are skipped by their
--- declared length.
+-- sub-parser walks the options.  We capture Option 53 (message type),
+-- Option 54 (server identifier), and Option 1 (subnet mask); other
+-- options are skipped by their declared length.
 --
 -- On rx_eop, if the message type is OFFER and we're in S_WAIT_OFFER, the
 -- FSM advances to S_TX_REQUEST.  If it's ACK and we're in S_WAIT_ACK, we
@@ -125,9 +135,13 @@ entity dhcp_client is
         -- Leased L3 outputs.  our_ip_valid rises when DHCPACK arrives and
         -- stays high until reset.  server_ip is the DHCP server's IP
         -- (Option 54), needed for unicast renewal once implemented.
+        -- subnet_mask is the leased Option 1 value (0.0.0.0 if the
+        -- server didn't supply one); downstream code combines it with
+        -- our_ip to compute the subnet-directed broadcast address.
         our_ip        : out std_logic_vector(31 downto 0);
         our_ip_valid  : out std_logic;
         server_ip     : out std_logic_vector(31 downto 0);
+        subnet_mask   : out std_logic_vector(31 downto 0);
 
         -- Observability
         send_pulse    : out std_logic;   -- one cycle per emitted TX packet
@@ -297,36 +311,48 @@ architecture arch of dhcp_client is
             when 282 => return x"35";
             when 283 => return x"01";
             when 284 => return msg_type;
-            -- 285..297: REQUEST-only options (DISCOVER puts End at 285 and
+            -- Option 55: Parameter Request List.  Common in both
+            -- DISCOVER and REQUEST.  Strictly RFC-compliant DHCP
+            -- servers (OpenWrt, most OEM router stock firmware,
+            -- some ISC dhcpd configurations) only return Option 1
+            -- (subnet mask) when the client explicitly asks for it;
+            -- dnsmasq sends it by default but isn't universal.
+            -- Without subnet mask we can't compute the subnet-directed
+            -- broadcast accept list, which kills HPSDR discovery from
+            -- Thetis / piHPSDR.
+            when 285 => return x"37";  -- Opt 55 code
+            when 286 => return x"01";  -- len = 1 parameter
+            when 287 => return x"01";  -- request Option 1 (subnet mask)
+            -- 288..300: REQUEST-only options (DISCOVER puts End at 288 and
             -- zero-pads the rest).
-            when 285 =>
-                if is_request then return x"32"; else return x"FF"; end if;
-            when 286 =>
-                if is_request then return x"04"; else return x"00"; end if;
-            when 287 =>
-                if is_request then return yiaddr(31 downto 24); else return x"00"; end if;
             when 288 =>
-                if is_request then return yiaddr(23 downto 16); else return x"00"; end if;
+                if is_request then return x"32"; else return x"FF"; end if;
             when 289 =>
-                if is_request then return yiaddr(15 downto  8); else return x"00"; end if;
-            when 290 =>
-                if is_request then return yiaddr( 7 downto  0); else return x"00"; end if;
-            when 291 =>
-                if is_request then return x"36"; else return x"00"; end if;
-            when 292 =>
                 if is_request then return x"04"; else return x"00"; end if;
+            when 290 =>
+                if is_request then return yiaddr(31 downto 24); else return x"00"; end if;
+            when 291 =>
+                if is_request then return yiaddr(23 downto 16); else return x"00"; end if;
+            when 292 =>
+                if is_request then return yiaddr(15 downto  8); else return x"00"; end if;
             when 293 =>
-                if is_request then return server_id(31 downto 24); else return x"00"; end if;
+                if is_request then return yiaddr( 7 downto  0); else return x"00"; end if;
             when 294 =>
-                if is_request then return server_id(23 downto 16); else return x"00"; end if;
+                if is_request then return x"36"; else return x"00"; end if;
             when 295 =>
-                if is_request then return server_id(15 downto  8); else return x"00"; end if;
+                if is_request then return x"04"; else return x"00"; end if;
             when 296 =>
-                if is_request then return server_id( 7 downto  0); else return x"00"; end if;
+                if is_request then return server_id(31 downto 24); else return x"00"; end if;
             when 297 =>
+                if is_request then return server_id(23 downto 16); else return x"00"; end if;
+            when 298 =>
+                if is_request then return server_id(15 downto  8); else return x"00"; end if;
+            when 299 =>
+                if is_request then return server_id( 7 downto  0); else return x"00"; end if;
+            when 300 =>
                 if is_request then return x"FF"; else return x"00"; end if;
             -- Everything else (chaddr padding 76..85, sname 86..149,
-            -- file 150..277, option padding 298..341) = zero.
+            -- file 150..277, option padding 301..341) = zero.
             when others => return x"00";
         end case;
     end function;
@@ -350,6 +376,7 @@ architecture arch of dhcp_client is
     signal server_id_r    : std_logic_vector(31 downto 0) := (others => '0');
     signal our_ip_r       : std_logic_vector(31 downto 0) := (others => '0');
     signal our_ip_valid_r : std_logic                     := '0';
+    signal subnet_mask_r  : std_logic_vector(31 downto 0) := (others => '0');
     signal tx_msg_type_r  : std_logic_vector(7 downto 0)  := DHCPDISCOVER;
 
     signal send_pulse_r   : std_logic := '0';
@@ -368,12 +395,14 @@ architecture arch of dhcp_client is
     signal rx_msg_type_r    : std_logic_vector(7 downto 0)  := (others => '0');
     signal rx_has_msg_type  : std_logic := '0';
     signal rx_server_id_r   : std_logic_vector(31 downto 0) := (others => '0');
+    signal rx_mask_r        : std_logic_vector(31 downto 0) := (others => '0');
 
     -- Per-eop validated capture, consumed by main FSM.
     signal rx_done_pulse    : std_logic                     := '0';
     signal rx_done_msg_type : std_logic_vector(7 downto 0)  := (others => '0');
     signal rx_done_yiaddr   : std_logic_vector(31 downto 0) := (others => '0');
     signal rx_done_srvid    : std_logic_vector(31 downto 0) := (others => '0');
+    signal rx_done_mask     : std_logic_vector(31 downto 0) := (others => '0');
 
 begin
 
@@ -400,6 +429,7 @@ begin
     our_ip       <= our_ip_r;
     our_ip_valid <= our_ip_valid_r;
     server_ip    <= server_id_r;
+    subnet_mask  <= subnet_mask_r;
     send_pulse   <= send_pulse_r;
     bound_pulse  <= bound_pulse_r;
 
@@ -421,6 +451,7 @@ begin
         variable n_msg_type : std_logic_vector(7 downto 0);
         variable n_has_msg  : std_logic;
         variable n_srvid    : std_logic_vector(31 downto 0);
+        variable n_mask     : std_logic_vector(31 downto 0);
     begin
         if reset = '1' then
             rx_state         <= RX_FIXED;
@@ -432,10 +463,12 @@ begin
             rx_msg_type_r    <= (others => '0');
             rx_has_msg_type  <= '0';
             rx_server_id_r   <= (others => '0');
+            rx_mask_r        <= (others => '0');
             rx_done_pulse    <= '0';
             rx_done_msg_type <= (others => '0');
             rx_done_yiaddr   <= (others => '0');
             rx_done_srvid    <= (others => '0');
+            rx_done_mask     <= (others => '0');
         elsif rising_edge(clock) then
             rx_done_pulse <= '0';
 
@@ -448,6 +481,7 @@ begin
             n_msg_type := rx_msg_type_r;
             n_has_msg  := rx_has_msg_type;
             n_srvid    := rx_server_id_r;
+            n_mask     := rx_mask_r;
 
             if rx_valid = '1' then
                 if rx_sop = '1' then
@@ -460,6 +494,7 @@ begin
                     n_msg_type := (others => '0');
                     n_has_msg  := '0';
                     n_srvid    := (others => '0');
+                    n_mask     := (others => '0');
                 end if;
 
                 case n_state is
@@ -513,11 +548,15 @@ begin
                         -- Zero-length option (uncommon); back to code.
                         n_state := RX_OPT_CODE;
                     else
-                        -- Reset 4-byte shift register if this is the server-ID
-                        -- option, so a malformed prior option can't leak into
-                        -- our capture.
+                        -- Reset the matching 4-byte shift register so a
+                        -- malformed prior option can't leak in.  Subnet
+                        -- mask (opt 1) and server identifier (opt 54)
+                        -- both arrive as 4-byte MSB-first values.
                         if rx_data = x"04" and n_opt_code = x"36" then
                             n_srvid := (others => '0');
+                        end if;
+                        if rx_data = x"04" and n_opt_code = x"01" then
+                            n_mask := (others => '0');
                         end if;
                         n_state := RX_OPT_VAL;
                     end if;
@@ -531,6 +570,12 @@ begin
                         -- Option 54: Server Identifier (4 bytes expected).
                         -- Shift in MSB-first.
                         n_srvid := n_srvid(23 downto 0) & rx_data;
+                    elsif n_opt_code = x"01" then
+                        -- Option 1: Subnet Mask (4 bytes expected).
+                        -- Shift in MSB-first.  Used downstream (combined
+                        -- with our_ip) to compute the subnet-directed
+                        -- broadcast that ip_rx_handler also accepts.
+                        n_mask := n_mask(23 downto 0) & rx_data;
                     end if;
                     -- Other options are read for length but their bytes
                     -- discarded.
@@ -549,6 +594,7 @@ begin
                         rx_done_msg_type <= n_msg_type;
                         rx_done_yiaddr   <= n_yiaddr;
                         rx_done_srvid    <= n_srvid;
+                        rx_done_mask     <= n_mask;
                     end if;
                     -- Reset parser state for the next frame.
                     n_state    := RX_FIXED;
@@ -560,6 +606,7 @@ begin
                     n_msg_type := (others => '0');
                     n_has_msg  := '0';
                     n_srvid    := (others => '0');
+                    n_mask     := (others => '0');
                 end if;
             end if;
 
@@ -572,6 +619,7 @@ begin
             rx_msg_type_r    <= n_msg_type;
             rx_has_msg_type  <= n_has_msg;
             rx_server_id_r   <= n_srvid;
+            rx_mask_r        <= n_mask;
         end if;
     end process rx_parser;
 
@@ -590,6 +638,7 @@ begin
             server_id_r    <= (others => '0');
             our_ip_r       <= (others => '0');
             our_ip_valid_r <= '0';
+            subnet_mask_r  <= (others => '0');
             tx_msg_type_r  <= DHCPDISCOVER;
             send_pulse_r   <= '0';
             bound_pulse_r  <= '0';
@@ -655,6 +704,12 @@ begin
                     -- server_id was already captured at OFFER; refresh just
                     -- in case the ACK comes from a different relay.
                     server_id_r    <= rx_done_srvid;
+                    -- Latch Option 1 subnet mask if the server supplied it.
+                    -- Stays at 0.0.0.0 if absent -- downstream code treats
+                    -- a zero mask as "no subnet broadcast known", which
+                    -- degenerates to accepting only the limited broadcast
+                    -- 255.255.255.255 (current behaviour, no regression).
+                    subnet_mask_r  <= rx_done_mask;
                     bound_pulse_r  <= '1';
                     state          <= S_BOUND;
                 elsif delay_count = to_unsigned(0, delay_count'length) then
