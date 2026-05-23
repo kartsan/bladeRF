@@ -35,12 +35,18 @@
 --               ignores)
 --   byte 4    : status        (0x02 = idle, 0x03 = sending IQ)
 --   byte 5..10: our MAC (6 bytes, big-endian / network order)
---   byte 11   : board type ID (BOARD_TYPE generic; default 0x06 = Hermes)
---   byte 12   : gateware major version (GW_MAJOR generic; default 0x01)
---   byte 13   : gateware minor / protocol revision tag (GW_MINOR generic;
---               default 0x02 = "P2")
---   byte 14..59: zero pad (device-specific fields ignored by piHPSDR for
---               minimal "device present" advertisement)
+--   byte 11   : board type ID (BOARD_TYPE generic; default 0x05 mirrors
+--               hpsdr_sim -- earlier 0x06 was rejected by Thetis)
+--   byte 12   : code version (CODE_VERSION generic; default 0x26 mirrors
+--               hpsdr_sim -- Thetis reads this for compatibility)
+--   byte 13   : P2 protocol sub-revision (P2_PROTO_REV generic; default
+--               0x13 mirrors hpsdr_sim)
+--   byte 14..18: reserved, zero
+--   byte 19..21: supported-protocol version triple (DISC_BYTE19..21
+--               generics; defaults 0x02, 0x01, 0x03 mirror hpsdr_sim --
+--               required for Thetis's power-on button to enable)
+--   byte 22..59: zero pad (device-specific fields ignored by piHPSDR
+--               and Thetis for a minimal "device present" advertisement)
 --
 -- Unicast reply
 -- -------------
@@ -107,23 +113,43 @@ library work;
 
 entity hpsdr_discovery_responder is
     generic (
-        -- Advertised board type (byte 11 of the reply payload).  0x06 =
-        -- Hermes; piHPSDR will display the radio as a Hermes-class
-        -- single-RX device.  Switch to 0x07 (Angelia) once the dual-DDC
-        -- IQ packetizers are in place and piHPSDR's "dual receiver"
-        -- features should be exposed.
-        BOARD_TYPE  : std_logic_vector(7 downto 0) := x"06";
+        -- Advertised board type (byte 11 of the reply payload).  Default
+        -- 0x05 mirrors hpsdr_sim ("Orion"-class single-RX device in
+        -- the OpenHPSDR P2 board-ID numbering).  Earlier 0x06 (Hermes)
+        -- was not accepted by Thetis: the "power on" button stayed
+        -- greyed-out because Thetis's UI-side compatibility check
+        -- read bytes 11..13 + bytes 19..21 of the discovery reply
+        -- before the user even clicked.  hpsdr_sim's combination
+        -- works -- mirror it.
+        BOARD_TYPE      : std_logic_vector(7 downto 0) := x"05";
 
-        -- Gateware version (byte 12) and protocol-revision tag (byte 13).
-        -- Both are advisory -- piHPSDR's discovery dialog displays them
-        -- but doesn't gate behaviour on them.
-        GW_MAJOR    : std_logic_vector(7 downto 0) := x"01";
-        GW_MINOR    : std_logic_vector(7 downto 0) := x"02";
+        -- Byte 12 of the reply.  Best-guess semantics: "Mercury code
+        -- version" (firmware version of the RX-board side).  hpsdr_sim
+        -- hardcodes 0x26 (= 38); Thetis appears to compare against a
+        -- minimum.  Was 0x01 ("v0.1") -- Thetis rejected.
+        CODE_VERSION    : std_logic_vector(7 downto 0) := x"26";
+
+        -- Byte 13 of the reply.  Best-guess semantics: "Protocol-2
+        -- sub-revision tag".  hpsdr_sim hardcodes 0x13 (= 19); Thetis
+        -- treats this together with byte 12 as a compatibility check.
+        -- Was 0x02 -- Thetis rejected.
+        P2_PROTO_REV    : std_logic_vector(7 downto 0) := x"13";
+
+        -- Bytes 19..21 of the reply.  Best-guess semantics:
+        -- "supported protocol version triple" (major.minor.patch).
+        -- hpsdr_sim hardcodes 0x02, 0x01, 0x03 = "P2 v1.3" or similar.
+        -- All zero (= "no protocol declared") makes Thetis refuse to
+        -- enable the power-on button.  Mirroring hpsdr_sim's bytes is
+        -- the bring-up fix; real values come from a real Mercury/Penny
+        -- firmware constant when those are wired up.
+        DISC_BYTE19     : std_logic_vector(7 downto 0) := x"02";
+        DISC_BYTE20     : std_logic_vector(7 downto 0) := x"01";
+        DISC_BYTE21     : std_logic_vector(7 downto 0) := x"03";
 
         -- Status byte (byte 4).  0x02 = idle (no IQ flowing), 0x03 = active.
         -- Hard-coded idle for now; will become a runtime input once the
         -- DDC packetizers exist.
-        STATUS_BYTE : std_logic_vector(7 downto 0) := x"02"
+        STATUS_BYTE     : std_logic_vector(7 downto 0) := x"02"
     );
     port (
         clock         : in  std_logic;
@@ -133,13 +159,20 @@ entity hpsdr_discovery_responder is
         our_mac       : in  std_logic_vector(47 downto 0);
         our_ip        : in  std_logic_vector(31 downto 0);
 
-        -- Probing host's L2/L3 addresses, snooped at the Eth/IP layers
-        -- and held stable across the full payload duration.  Latched
-        -- locally on rx_sop into peer_mac_r / peer_ip_r so subsequent
-        -- bytes of the probe (or a fresh probe arriving during S_TX)
-        -- can't disturb the in-flight reply.
+        -- Probing host's L2/L3/L4 addresses, snooped at the Eth/IP/UDP
+        -- layers and held stable across the full payload duration.
+        -- Latched locally on rx_sop into peer_mac_r / peer_ip_r /
+        -- peer_port_r so subsequent bytes of the probe (or a fresh
+        -- probe arriving during S_TX) can't disturb the in-flight
+        -- reply.  peer_port is the *source* UDP port of the inbound
+        -- probe (typically an ephemeral port like 63685 chosen by the
+        -- host's sendto()); the reply's UDP dst port must equal this
+        -- value, not the well-known HPSDR port 1024, because the host's
+        -- receive socket is bound to its source port.  Thetis and
+        -- piHPSDR strictly require this.
         peer_mac      : in  std_logic_vector(47 downto 0);
         peer_ip       : in  std_logic_vector(31 downto 0);
+        peer_port     : in  std_logic_vector(15 downto 0);
 
         -- HPSDR byte stream input (from udp_rx_handler hpsdr_* channel,
         -- Eth/IP/UDP headers already stripped; byte 0 of rx_* is byte 0
@@ -163,12 +196,16 @@ entity hpsdr_discovery_responder is
         -- HPSDR producers (high-priority status, DDC IQ streamers, ...)
         -- read these to address their unsolicited transmissions to the
         -- last discovered host without re-snooping eth_rx_demux /
-        -- ip_rx_handler.  host_valid latches '1' on first successful
-        -- discovery and stays high; host_mac / host_ip track the most
-        -- recent successful discoverer (in case another client probes
-        -- after the first selection).
+        -- ip_rx_handler / udp_rx_handler.  host_valid latches '1' on
+        -- first successful discovery and stays high; host_mac /
+        -- host_ip / host_port track the most recent successful
+        -- discoverer (in case another client probes after the first
+        -- selection).  host_port is the host's ephemeral UDP source
+        -- port -- the destination for all unsolicited UDP/1025 high-
+        -- priority status and UDP/1035+ IQ streams.
         host_mac      : out std_logic_vector(47 downto 0);
         host_ip       : out std_logic_vector(31 downto 0);
+        host_port     : out std_logic_vector(15 downto 0);
         host_valid    : out std_logic;
 
         -- Observability: one cycle when the final reply byte is emitted.
@@ -258,12 +295,14 @@ architecture arch of hpsdr_discovery_responder is
     -- a fresh probe arriving during S_TX can't disturb in-flight data).
     signal peer_mac_r      : std_logic_vector(47 downto 0) := (others => '0');
     signal peer_ip_r       : std_logic_vector(31 downto 0) := (others => '0');
+    signal peer_port_r     : std_logic_vector(15 downto 0) := (others => '0');
 
     -- Committed host identity, exported via host_* ports.  Latched at
     -- the S_RX -> S_TX transition (where is_discovery has already been
     -- proven '1' and peer_*_r are guaranteed populated).
     signal host_mac_r      : std_logic_vector(47 downto 0) := (others => '0');
     signal host_ip_r       : std_logic_vector(31 downto 0) := (others => '0');
+    signal host_port_r     : std_logic_vector(15 downto 0) := (others => '0');
     signal host_valid_r    : std_logic                     := '0';
 
     -- TX-side counter (walks 0..FRAME_BYTES-1)
@@ -281,6 +320,7 @@ architecture arch of hpsdr_discovery_responder is
         our_mac   : std_logic_vector(47 downto 0);
         our_ip    : std_logic_vector(31 downto 0);
         peer_ip   : std_logic_vector(31 downto 0);
+        peer_port : std_logic_vector(15 downto 0);
         ip_chk    : std_logic_vector(15 downto 0)
     ) return std_logic_vector is
     begin
@@ -335,12 +375,15 @@ architecture arch of hpsdr_discovery_responder is
             when 33 => return peer_ip( 7 downto  0);
 
             -- ---- UDP header ----
-            -- UDP src port = 1024 (HPSDR control plane)
+            -- UDP src port = 1024 (HPSDR control plane; we're the radio)
             when 34 => return HPSDR_PORT_HI;
             when 35 => return HPSDR_PORT_LO;
-            -- UDP dst port = 1024 (host's HPSDR listener)
-            when 36 => return HPSDR_PORT_HI;
-            when 37 => return HPSDR_PORT_LO;
+            -- UDP dst port = host's ephemeral source port from the probe
+            -- (NOT 1024 -- Thetis/piHPSDR's receive socket is bound to
+            -- its sendto() source port, which is what we captured into
+            -- peer_port_r at rx_sop).
+            when 36 => return peer_port(15 downto 8);
+            when 37 => return peer_port( 7 downto 0);
             -- UDP length = 68
             when 38 => return UDP_LEN_VEC(15 downto 8);
             when 39 => return UDP_LEN_VEC( 7 downto 0);
@@ -361,13 +404,24 @@ architecture arch of hpsdr_discovery_responder is
             when 52 => return our_mac( 7 downto  0);
             -- byte 11 of payload (idx 53): board type
             when 53 => return BOARD_TYPE;
-            -- byte 12 of payload (idx 54): gateware major version
-            when 54 => return GW_MAJOR;
-            -- byte 13 of payload (idx 55): gateware minor / P2 tag
-            when 55 => return GW_MINOR;
-            -- bytes 14..59 of payload (idx 56..101): zero pad
-            -- (device-specific fields; piHPSDR tolerates zeros for a
-            -- minimal "device present" advertisement)
+            -- byte 12 of payload (idx 54): code version (Mercury fw)
+            when 54 => return CODE_VERSION;
+            -- byte 13 of payload (idx 55): P2 protocol sub-revision
+            when 55 => return P2_PROTO_REV;
+            -- bytes 14..18 (idx 56..60): reserved, zero
+            -- byte 19 of payload (idx 61): hpsdr_sim mirror (likely
+            -- protocol version major)
+            when 61 => return DISC_BYTE19;
+            -- byte 20 of payload (idx 62): hpsdr_sim mirror (likely
+            -- protocol version minor)
+            when 62 => return DISC_BYTE20;
+            -- byte 21 of payload (idx 63): hpsdr_sim mirror (likely
+            -- protocol version patch)
+            when 63 => return DISC_BYTE21;
+            -- bytes 22..59 of payload (idx 64..101): zero pad
+            -- (device-specific fields; both piHPSDR and Thetis
+            -- tolerate zeros here as long as bytes 11..13 and
+            -- 19..21 advertise a recognised radio class).
             when others => return x"00";
         end case;
     end function;
@@ -378,12 +432,13 @@ begin
     -- Output drivers
     -- ----------------------------------------------------------------------
     tx_data_mux : process(state, tx_byte_idx, peer_mac_r, our_mac,
-                          our_ip, peer_ip_r, ip_chk_r)
+                          our_ip, peer_ip_r, peer_port_r, ip_chk_r)
     begin
         if state = S_TX then
             tx_data <= disc_byte_at(to_integer(tx_byte_idx),
                                     peer_mac_r, our_mac,
-                                    our_ip, peer_ip_r, ip_chk_r);
+                                    our_ip, peer_ip_r, peer_port_r,
+                                    ip_chk_r);
         else
             tx_data <= (others => '0');
         end if;
@@ -400,6 +455,7 @@ begin
 
     host_mac    <= host_mac_r;
     host_ip     <= host_ip_r;
+    host_port   <= host_port_r;
     host_valid  <= host_valid_r;
 
     -- ----------------------------------------------------------------------
@@ -457,8 +513,10 @@ begin
             is_discovery_r <= '0';
             peer_mac_r    <= (others => '0');
             peer_ip_r     <= (others => '0');
+            peer_port_r   <= (others => '0');
             host_mac_r    <= (others => '0');
             host_ip_r     <= (others => '0');
+            host_port_r   <= (others => '0');
             host_valid_r  <= '0';
             tx_byte_idx   <= (others => '0');
             reply_pulse_r <= '0';
@@ -484,11 +542,13 @@ begin
                         n_byte_idx := (others => '0');
                         n_is_disc  := '0';
                         -- Latch the probing host's addresses.  The
-                        -- eth_rx_demux src_mac and ip_rx_handler src_ip
-                        -- sidebands are held stable for the full frame
-                        -- duration, so capturing on sop is safe.
-                        peer_mac_r <= peer_mac;
-                        peer_ip_r  <= peer_ip;
+                        -- eth_rx_demux src_mac, ip_rx_handler src_ip,
+                        -- and udp_rx_handler src_port sidebands are all
+                        -- held stable for the full frame duration, so
+                        -- capturing on sop is safe.
+                        peer_mac_r  <= peer_mac;
+                        peer_ip_r   <= peer_ip;
+                        peer_port_r <= peer_port;
                     end if;
 
                     if n_byte_idx = to_unsigned(4, n_byte_idx'length) then
@@ -512,6 +572,7 @@ begin
                             -- earlier in this same packet.
                             host_mac_r   <= peer_mac_r;
                             host_ip_r    <= peer_ip_r;
+                            host_port_r  <= peer_port_r;
                             host_valid_r <= '1';
                         end if;
                         n_byte_idx := (others => '0');

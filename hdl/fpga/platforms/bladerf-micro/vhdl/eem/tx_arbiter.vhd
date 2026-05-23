@@ -17,24 +17,30 @@
 -- =============================================================================
 -- tx_arbiter
 --
--- Four-input mux + arbiter sitting in front of eem_tx_framer's byte-stream
+-- Five-input mux + arbiter sitting in front of eem_tx_framer's byte-stream
 -- input.  Producers compete for the framer; once a producer wins, it owns
 -- the framer until the framer's pkt_done_pulse fires (= the host has
 -- drained the last word over USB), then the arbiter returns to IDLE and
 -- the next producer can be selected.
 --
--- Priority: A > B > C > D.  In the typical wiring:
+-- Priority: A > B > C > D > E.  In the typical wiring:
 --   A = arp_responder              (NUD-timed; strictest deadline)
 --   B = icmp_responder             (ping reply; loose deadline but user-visible)
 --   C = dhcp_client                (4 s retransmit; very loose)
 --   D = hpsdr_discovery_responder  (piHPSDR retries ~2-3 s; very loose)
+--   E = hpsdr_hp_status_sender     (~30 Hz heartbeat; tolerant of jitter,
+--                                   the lowest-deadline producer in the
+--                                   control plane)
 --
 -- HPSDR IQ streaming, when it lands, will run at higher rates than any of
 -- the bring-up protocols here so it'll likely demand its own arbiter
 -- behaviour (round-robin against control plane / dedicated framer), at
 -- which point this priority arbiter becomes the "control plane" mux
--- feeding a higher-level scheduler.  Discovery stays here -- it's bursty
--- (one 102-byte frame per host probe) and well-served by strict priority.
+-- feeding a higher-level scheduler.  Discovery and HP status stay here
+-- -- the discovery responder is bursty (one 102-byte frame per host
+-- probe) and the HP status sender is sparse (one 102-byte frame at ~30
+-- Hz = 0.024% of port-time even before arbitration), both well-served
+-- by strict priority.
 --
 -- The unchosen producer sees its ready signal held low, so it just keeps
 -- holding its sop beat stable -- the same sop-hold contract that
@@ -75,7 +81,7 @@ entity tx_arbiter is
         c_length   : in  unsigned(13 downto 0);
         c_ready    : out std_logic;
 
-        -- Producer D (lowest priority).  Typical wiring:
+        -- Producer D (fourth priority).  Typical wiring:
         -- hpsdr_discovery_responder.
         d_data     : in  std_logic_vector(7 downto 0);
         d_valid    : in  std_logic;
@@ -83,6 +89,15 @@ entity tx_arbiter is
         d_eop      : in  std_logic;
         d_length   : in  unsigned(13 downto 0);
         d_ready    : out std_logic;
+
+        -- Producer E (lowest priority).  Typical wiring:
+        -- hpsdr_hp_status_sender.
+        e_data     : in  std_logic_vector(7 downto 0);
+        e_valid    : in  std_logic;
+        e_sop      : in  std_logic;
+        e_eop      : in  std_logic;
+        e_length   : in  unsigned(13 downto 0);
+        e_ready    : out std_logic;
 
         -- To framer's frame_in_* port
         tx_data    : out std_logic_vector(7 downto 0);
@@ -102,7 +117,8 @@ end entity;
 
 architecture arch of tx_arbiter is
 
-    type state_t is (S_IDLE, S_A_ACTIVE, S_B_ACTIVE, S_C_ACTIVE, S_D_ACTIVE);
+    type state_t is (S_IDLE, S_A_ACTIVE, S_B_ACTIVE, S_C_ACTIVE,
+                     S_D_ACTIVE, S_E_ACTIVE);
     signal state : state_t := S_IDLE;
 
 begin
@@ -113,32 +129,38 @@ begin
                  b_data   when state = S_B_ACTIVE else
                  c_data   when state = S_C_ACTIVE else
                  d_data   when state = S_D_ACTIVE else
+                 e_data   when state = S_E_ACTIVE else
                  (others => '0');
     tx_valid  <= a_valid  when state = S_A_ACTIVE else
                  b_valid  when state = S_B_ACTIVE else
                  c_valid  when state = S_C_ACTIVE else
                  d_valid  when state = S_D_ACTIVE else
+                 e_valid  when state = S_E_ACTIVE else
                  '0';
     tx_sop    <= a_sop    when state = S_A_ACTIVE else
                  b_sop    when state = S_B_ACTIVE else
                  c_sop    when state = S_C_ACTIVE else
                  d_sop    when state = S_D_ACTIVE else
+                 e_sop    when state = S_E_ACTIVE else
                  '0';
     tx_eop    <= a_eop    when state = S_A_ACTIVE else
                  b_eop    when state = S_B_ACTIVE else
                  c_eop    when state = S_C_ACTIVE else
                  d_eop    when state = S_D_ACTIVE else
+                 e_eop    when state = S_E_ACTIVE else
                  '0';
     tx_length <= a_length when state = S_A_ACTIVE else
                  b_length when state = S_B_ACTIVE else
                  c_length when state = S_C_ACTIVE else
                  d_length when state = S_D_ACTIVE else
+                 e_length when state = S_E_ACTIVE else
                  (others => '0');
 
     a_ready <= tx_ready when state = S_A_ACTIVE else '0';
     b_ready <= tx_ready when state = S_B_ACTIVE else '0';
     c_ready <= tx_ready when state = S_C_ACTIVE else '0';
     d_ready <= tx_ready when state = S_D_ACTIVE else '0';
+    e_ready <= tx_ready when state = S_E_ACTIVE else '0';
 
     fsm : process(clock, reset)
     begin
@@ -147,8 +169,8 @@ begin
         elsif rising_edge(clock) then
             case state is
             when S_IDLE =>
-                -- Priority A > B > C > D; pick whoever is presenting a
-                -- fresh frame.
+                -- Priority A > B > C > D > E; pick whoever is presenting
+                -- a fresh frame.
                 if a_valid = '1' and a_sop = '1' then
                     state <= S_A_ACTIVE;
                 elsif b_valid = '1' and b_sop = '1' then
@@ -157,6 +179,8 @@ begin
                     state <= S_C_ACTIVE;
                 elsif d_valid = '1' and d_sop = '1' then
                     state <= S_D_ACTIVE;
+                elsif e_valid = '1' and e_sop = '1' then
+                    state <= S_E_ACTIVE;
                 end if;
             when S_A_ACTIVE =>
                 -- Hold the producer through framer's full processing
@@ -175,6 +199,10 @@ begin
                     state <= S_IDLE;
                 end if;
             when S_D_ACTIVE =>
+                if pkt_done = '1' then
+                    state <= S_IDLE;
+                end if;
+            when S_E_ACTIVE =>
                 if pkt_done = '1' then
                     state <= S_IDLE;
                 end if;

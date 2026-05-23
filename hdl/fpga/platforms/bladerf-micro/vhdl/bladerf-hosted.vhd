@@ -206,11 +206,13 @@ architecture hosted_bladerf of bladerf is
     signal udp_dst_port           : std_logic_vector(15 downto 0);
     signal hpsdr_pulse            : std_logic;
 
-    -- udp_src_port / udp_dst_port aren't consumed yet downstream (the
-    -- discovery responder always answers on UDP/1024 -> 1024, regardless
-    -- of which port the probe came from).  Kept as SignalTap surfaces and
-    -- for the next HPSDR command consumers.  Same for ip_rx_dst_ip /
-    -- ip_rx_pulse which are still observability-only.
+    -- udp_src_port is consumed by hpsdr_discovery_responder (the
+    -- reply's UDP dst port must equal the probe's UDP src port -- Thetis
+    -- /piHPSDR strictly require it).  udp_dst_port isn't consumed yet
+    -- (the responder already knows it answered a port-1024 probe by
+    -- virtue of being on the hpsdr_* channel).  Both still keep-pinned
+    -- as SignalTap surfaces.  Same for ip_rx_dst_ip / ip_rx_pulse
+    -- which are still observability-only.
     attribute keep of udp_src_port    : signal is true;
     attribute keep of udp_dst_port    : signal is true;
     attribute keep of ip_rx_dst_ip    : signal is true;
@@ -227,18 +229,26 @@ architecture hosted_bladerf of bladerf is
 
     -- Committed HPSDR client identity, captured by
     -- hpsdr_discovery_responder at the moment it accepts a discovery
-    -- probe.  These are the contract for future HPSDR producers
-    -- (high-priority status sender, DDC IQ streamers) to address their
-    -- unsolicited transmissions to the discovered host.  Currently
-    -- unconnected -- still useful as SignalTap observables to confirm
-    -- the right host got selected; keep-pinned so Quartus doesn't
-    -- optimise the snapshot away while we wait for the first consumer.
+    -- probe.  Consumed by hpsdr_hp_status_sender to address its ~30 Hz
+    -- heartbeat back to the discovered host; will also feed future DDC
+    -- IQ streamers etc.  host_port is the host's ephemeral source port
+    -- from the probe, = destination for UDP/1025 high-priority status
+    -- and IQ streams (NOT 1025 / NOT 1035, regardless of HPSDR
+    -- convention -- Thetis/piHPSDR bind their receive socket to the
+    -- sendto() source port; see [[feedback_hpsdr_reply_udp_dst_port]]).
     signal hpsdr_host_mac         : std_logic_vector(47 downto 0);
     signal hpsdr_host_ip          : std_logic_vector(31 downto 0);
+    signal hpsdr_host_port        : std_logic_vector(15 downto 0);
     signal hpsdr_host_valid       : std_logic;
-    attribute keep of hpsdr_host_mac   : signal is true;
-    attribute keep of hpsdr_host_ip    : signal is true;
-    attribute keep of hpsdr_host_valid : signal is true;
+
+    -- hpsdr_hp_status_sender -> tx_arbiter (port E) byte stream
+    signal hpsdr_hp_tx_data       : std_logic_vector(7 downto 0);
+    signal hpsdr_hp_tx_valid      : std_logic;
+    signal hpsdr_hp_tx_sop        : std_logic;
+    signal hpsdr_hp_tx_eop        : std_logic;
+    signal hpsdr_hp_tx_length     : unsigned(13 downto 0);
+    signal hpsdr_hp_tx_ready      : std_logic;
+    signal hpsdr_hp_send_pulse    : std_logic;
 
     -- icmp_responder -> tx_arbiter byte stream
     signal icmp_tx_data           : std_logic_vector(7 downto 0);
@@ -884,17 +894,19 @@ begin
     -- and replies with a 102-byte Ethernet frame advertising this device
     -- as a Hermes-class HPSDR P2 radio (board type 0x06).  Reply is
     -- unicast back to the probing host: Eth dst = eth_rx_demux's src_mac
-    -- sideband, IP dst = ip_rx_handler's src_ip sideband.  Both sidebands
-    -- are held stable through the inbound payload duration, so a snapshot
-    -- on rx_sop captures the right pair.  IP src = effective_ip
+    -- sideband, IP dst = ip_rx_handler's src_ip sideband, UDP dst port
+    -- = udp_rx_handler's src_port sideband (= host's ephemeral port,
+    -- NOT 1024 -- Thetis/piHPSDR bind their receive socket to their
+    -- sendto() source port).  All three sidebands are held stable
+    -- through the inbound payload duration, so a single snapshot at
+    -- rx_sop captures the matching triple.  IP src = effective_ip
     -- (DHCP-leased post-lease, static EEM_OUR_IP pre-lease).
     --
-    -- host_mac / host_ip / host_valid expose the committed client
-    -- identity for downstream HPSDR producers (high-priority status,
-    -- DDC IQ streamers) so they can target the discovered host without
-    -- re-snooping the inbound path.  Unconnected for now -- the
-    -- "keep"-pinned signals are visible to SignalTap / journalctl
-    -- correlation as bring-up of those producers begins.
+    -- host_mac / host_ip / host_port / host_valid expose the committed
+    -- client identity for downstream HPSDR producers so they can target
+    -- the discovered host without re-snooping the inbound path.  First
+    -- consumer is hpsdr_hp_status_sender immediately below; future DDC
+    -- IQ streamers will use the same snapshot.
     --
     -- Drives tx_arbiter port D (lowest priority -- piHPSDR retries
     -- every ~2-3 s).
@@ -908,6 +920,7 @@ begin
             our_ip       => effective_ip,
             peer_mac     => eth_rx_src_mac,
             peer_ip      => ip_rx_src_ip,
+            peer_port    => udp_src_port,
 
             rx_data      => hpsdr_rx_data,
             rx_valid     => hpsdr_rx_valid,
@@ -924,19 +937,56 @@ begin
 
             host_mac     => hpsdr_host_mac,
             host_ip      => hpsdr_host_ip,
+            host_port    => hpsdr_host_port,
             host_valid   => hpsdr_host_valid,
 
             reply_pulse  => hpsdr_disc_reply_pulse
         );
 
     -- ========================================================================
+    -- HPSDR Protocol 2 High-Priority Status sender.  Periodic ~30 Hz
+    -- heartbeat on UDP/1025 (radio -> host) that Thetis/piHPSDR watch
+    -- for to declare the radio "alive"; without it, Thetis sends a few
+    -- 1444-byte High-Priority Commands then closes the connection after
+    -- ~3 s of silence.  Gated on hpsdr_host_valid='1' so nothing goes
+    -- out before discovery completes.  Addressed using the same
+    -- {host_mac, host_ip, host_port} snapshot the discovery responder
+    -- captured -- the contract that those three signals were exposed for.
+    -- Drives tx_arbiter port E (lowest priority; the heartbeat is the
+    -- most loss-tolerant traffic in the control plane).
+    -- ========================================================================
+    U_hpsdr_hp_status_sender : entity work.hpsdr_hp_status_sender
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            our_mac      => local_mac,
+            our_ip       => effective_ip,
+
+            host_mac     => hpsdr_host_mac,
+            host_ip      => hpsdr_host_ip,
+            host_port    => hpsdr_host_port,
+            host_valid   => hpsdr_host_valid,
+
+            tx_data      => hpsdr_hp_tx_data,
+            tx_valid     => hpsdr_hp_tx_valid,
+            tx_sop       => hpsdr_hp_tx_sop,
+            tx_eop       => hpsdr_hp_tx_eop,
+            tx_length    => hpsdr_hp_tx_length,
+            tx_ready     => hpsdr_hp_tx_ready,
+
+            send_pulse   => hpsdr_hp_send_pulse
+        );
+
+    -- ========================================================================
     -- TX arbiter: multiplexes arp_responder (port A, highest priority),
-    -- icmp_responder (port B), dhcp_client (port C), and
-    -- hpsdr_discovery_responder (port D, lowest priority) onto the single
-    -- eem_tx_framer input.  Holds the active producer until the framer's
-    -- pkt_done_pulse fires, then releases for the next.  Future HPSDR IQ
-    -- streaming will likely replace this priority arbiter with a high-rate
-    -- scheduler (see tx_arbiter.vhd's header).
+    -- icmp_responder (port B), dhcp_client (port C),
+    -- hpsdr_discovery_responder (port D), and hpsdr_hp_status_sender
+    -- (port E, lowest priority) onto the single eem_tx_framer input.
+    -- Holds the active producer until the framer's pkt_done_pulse fires,
+    -- then releases for the next.  Future HPSDR IQ streaming will likely
+    -- replace this priority arbiter with a high-rate scheduler (see
+    -- tx_arbiter.vhd's header).
     -- ========================================================================
     U_tx_arbiter : entity work.tx_arbiter
         port map (
@@ -971,6 +1021,13 @@ begin
             d_length  => hpsdr_tx_length,
             d_ready   => hpsdr_tx_ready,
 
+            e_data    => hpsdr_hp_tx_data,
+            e_valid   => hpsdr_hp_tx_valid,
+            e_sop     => hpsdr_hp_tx_sop,
+            e_eop     => hpsdr_hp_tx_eop,
+            e_length  => hpsdr_hp_tx_length,
+            e_ready   => hpsdr_hp_tx_ready,
+
             tx_data   => mux_tx_data,
             tx_valid  => mux_tx_valid,
             tx_sop    => mux_tx_sop,
@@ -992,9 +1049,9 @@ begin
     -- auto-infers MLAB / LAB-resident LUT-RAM for the storage, no M10K
     -- and no wide fabric read mux).  Driven by tx_arbiter (port A =
     -- arp_responder, port B = icmp_responder, port C = dhcp_client,
-    -- port D = hpsdr_discovery_responder).  Future HPSDR producers (DDC
-    -- IQ packetizers, status, mic/DUC consumers) extend the arbiter's
-    -- port list further.
+    -- port D = hpsdr_discovery_responder, port E = hpsdr_hp_status_sender).
+    -- Future HPSDR producers (DDC IQ packetizers, mic/DUC consumers)
+    -- extend the arbiter's port list further.
     --
     -- BUF_DEPTH defaults to 512 (= 2 KB) inside the framer entity --
     -- sized for HPSDR Protocol 2 DDC IQ frames (Eth+IP+UDP+1444 = 1486 B
