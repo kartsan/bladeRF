@@ -188,8 +188,7 @@ architecture hosted_bladerf of bladerf is
     signal ip_rx_dst_ip           : std_logic_vector(31 downto 0);
     signal ip_rx_pulse            : std_logic;
 
-    -- udp_rx_handler -> HPSDR consumer.  No consumer yet; "keep" prevents
-    -- Quartus from optimising the path away while we wire HPSDR up.
+    -- udp_rx_handler -> hpsdr_discovery_responder (UDP/1024 General Packet payload)
     signal hpsdr_rx_data          : std_logic_vector(7 downto 0);
     signal hpsdr_rx_valid         : std_logic;
     signal hpsdr_rx_sop           : std_logic;
@@ -199,15 +198,72 @@ architecture hosted_bladerf of bladerf is
     signal udp_dst_port           : std_logic_vector(15 downto 0);
     signal hpsdr_pulse            : std_logic;
 
-    attribute keep of hpsdr_rx_data   : signal is true;
-    attribute keep of hpsdr_rx_valid  : signal is true;
-    attribute keep of hpsdr_rx_sop    : signal is true;
-    attribute keep of hpsdr_rx_eop    : signal is true;
-    attribute keep of hpsdr_rx_length : signal is true;
-    attribute keep of udp_src_port    : signal is true;
-    attribute keep of udp_dst_port    : signal is true;
-    attribute keep of ip_rx_dst_ip    : signal is true;
-    attribute keep of ip_rx_pulse     : signal is true;
+    -- udp_rx_handler -> hpsdr_hp_cmd_handler (UDP/1027 HP Command payload)
+    --
+    -- Two distinct pulses live on this path:
+    --   hpsdr_hp_cmd_pulse        - from udp_rx_handler: fires at UDP
+    --                               header parse (~early, ~start of
+    --                               packet), used in the led(3) reply
+    --                               chain.
+    --   hpsdr_hp_cmd_decode_pulse - from hpsdr_hp_cmd_handler: fires at
+    --                               rx_eop after the full 1444-byte HP
+    --                               Command has been consumed and
+    --                               host_run/host_ptt0 latched.  Not
+    --                               wired to anything functional;
+    --                               "keep"-pinned for SignalTap.
+    signal hpsdr_hp_cmd_rx_data     : std_logic_vector(7 downto 0);
+    signal hpsdr_hp_cmd_rx_valid    : std_logic;
+    signal hpsdr_hp_cmd_rx_sop      : std_logic;
+    signal hpsdr_hp_cmd_rx_eop      : std_logic;
+    signal hpsdr_hp_cmd_rx_length   : std_logic_vector(13 downto 0);
+    signal hpsdr_hp_cmd_pulse       : std_logic;
+    signal hpsdr_hp_cmd_decode_pulse: std_logic;
+
+    -- hpsdr_hp_cmd_handler -> hpsdr_hp_status_sender (engagement state)
+    signal hpsdr_host_run         : std_logic;
+    signal hpsdr_host_ptt0        : std_logic;
+
+    -- udp_dst_port isn't consumed yet (the responder already knows it
+    -- handled a port-1024 probe by virtue of being on the hpsdr_*
+    -- channel).  ip_rx_dst_ip / ip_rx_pulse are still observability-only.
+    -- host_ptt0 isn't consumed yet either; once Thetis engages and a Tx
+    -- producer / PTT-output exists we'll wire it.
+    attribute keep of udp_src_port             : signal is true;
+    attribute keep of udp_dst_port             : signal is true;
+    attribute keep of ip_rx_dst_ip             : signal is true;
+    attribute keep of ip_rx_pulse              : signal is true;
+    attribute keep of hpsdr_host_ptt0          : signal is true;
+    attribute keep of hpsdr_hp_cmd_decode_pulse: signal is true;
+
+    -- hpsdr_discovery_responder -> tx_arbiter (port D) byte stream
+    signal hpsdr_tx_data          : std_logic_vector(7 downto 0);
+    signal hpsdr_tx_valid         : std_logic;
+    signal hpsdr_tx_sop           : std_logic;
+    signal hpsdr_tx_eop           : std_logic;
+    signal hpsdr_tx_length        : unsigned(13 downto 0);
+    signal hpsdr_tx_ready         : std_logic;
+    signal hpsdr_disc_reply_pulse : std_logic;
+
+    -- Committed HPSDR client identity, captured by
+    -- hpsdr_discovery_responder at S_RX->S_TX.  Consumed by
+    -- hpsdr_hp_status_sender to address its 5 Hz heartbeat back to the
+    -- discovered host; will also feed future DDC IQ streamers etc.
+    -- host_port is the host's ephemeral source port from the probe,
+    -- = destination for UDP/1025 high-priority status (NOT 1025;
+    -- see [[feedback_hpsdr_reply_udp_dst_port]]).
+    signal hpsdr_host_mac         : std_logic_vector(47 downto 0);
+    signal hpsdr_host_ip          : std_logic_vector(31 downto 0);
+    signal hpsdr_host_port        : std_logic_vector(15 downto 0);
+    signal hpsdr_host_valid       : std_logic;
+
+    -- hpsdr_hp_status_sender -> tx_arbiter (port E) byte stream
+    signal hpsdr_hp_tx_data       : std_logic_vector(7 downto 0);
+    signal hpsdr_hp_tx_valid      : std_logic;
+    signal hpsdr_hp_tx_sop        : std_logic;
+    signal hpsdr_hp_tx_eop        : std_logic;
+    signal hpsdr_hp_tx_length     : unsigned(13 downto 0);
+    signal hpsdr_hp_tx_ready      : std_logic;
+    signal hpsdr_hp_send_pulse    : std_logic;
 
     -- icmp_responder -> tx_arbiter byte stream
     signal icmp_tx_data           : std_logic_vector(7 downto 0);
@@ -721,40 +777,51 @@ begin
     -- ========================================================================
     -- UDP RX handler.  Walks the 8-byte UDP header on every IP-handler
     -- udp_* packet, classifies by dst_port, and routes the payload to the
-    -- matching application channel.  Two recognised ports:
-    --   dst_port = 1024 -> hpsdr_* (still no consumer; "keep"-pinned)
-    --   dst_port = 68   -> dhcp_*  (consumed by dhcp_client)
-    -- hpsdr_pulse blinks led(3) on detection so we can verify port-1024
-    -- filtering live on the host.
+    -- matching application channel.  Three recognised ports:
+    --   dst_port = 1024 -> hpsdr_*        (Discovery + General Packet;
+    --                                      consumed by
+    --                                      hpsdr_discovery_responder)
+    --   dst_port = 1027 -> hpsdr_hp_cmd_* (1444-byte HP Command;
+    --                                      consumed by hpsdr_hp_cmd_handler)
+    --   dst_port = 68   -> dhcp_*         (consumed by dhcp_client)
+    -- hpsdr_pulse / hpsdr_hp_cmd_pulse / dhcp_rx_pulse blink led(3) on
+    -- detection so we can verify per-port filtering live on the host.
     -- ========================================================================
     U_udp_rx_handler : entity work.udp_rx_handler
         port map (
-            clock        => fx3_pclk_pll,
-            reset        => sys_reset_pclk,
+            clock              => fx3_pclk_pll,
+            reset              => sys_reset_pclk,
 
-            rx_data      => udp_rx_data,
-            rx_valid     => udp_rx_valid,
-            rx_sop       => udp_rx_sop,
-            rx_eop       => udp_rx_eop,
-            rx_length    => udp_rx_length,
+            rx_data            => udp_rx_data,
+            rx_valid           => udp_rx_valid,
+            rx_sop             => udp_rx_sop,
+            rx_eop             => udp_rx_eop,
+            rx_length          => udp_rx_length,
 
-            hpsdr_data   => hpsdr_rx_data,
-            hpsdr_valid  => hpsdr_rx_valid,
-            hpsdr_sop    => hpsdr_rx_sop,
-            hpsdr_eop    => hpsdr_rx_eop,
-            hpsdr_length => hpsdr_rx_length,
+            hpsdr_data         => hpsdr_rx_data,
+            hpsdr_valid        => hpsdr_rx_valid,
+            hpsdr_sop          => hpsdr_rx_sop,
+            hpsdr_eop          => hpsdr_rx_eop,
+            hpsdr_length       => hpsdr_rx_length,
 
-            dhcp_data    => dhcp_rx_data,
-            dhcp_valid   => dhcp_rx_valid,
-            dhcp_sop     => dhcp_rx_sop,
-            dhcp_eop     => dhcp_rx_eop,
-            dhcp_length  => dhcp_rx_length,
+            hpsdr_hp_cmd_data  => hpsdr_hp_cmd_rx_data,
+            hpsdr_hp_cmd_valid => hpsdr_hp_cmd_rx_valid,
+            hpsdr_hp_cmd_sop   => hpsdr_hp_cmd_rx_sop,
+            hpsdr_hp_cmd_eop   => hpsdr_hp_cmd_rx_eop,
+            hpsdr_hp_cmd_length=> hpsdr_hp_cmd_rx_length,
 
-            src_port     => udp_src_port,
-            dst_port     => udp_dst_port,
+            dhcp_data          => dhcp_rx_data,
+            dhcp_valid         => dhcp_rx_valid,
+            dhcp_sop           => dhcp_rx_sop,
+            dhcp_eop           => dhcp_rx_eop,
+            dhcp_length        => dhcp_rx_length,
 
-            hpsdr_pulse  => hpsdr_pulse,
-            dhcp_pulse   => dhcp_rx_pulse
+            src_port           => udp_src_port,
+            dst_port           => udp_dst_port,
+
+            hpsdr_pulse        => hpsdr_pulse,
+            hpsdr_hp_cmd_pulse => hpsdr_hp_cmd_pulse,
+            dhcp_pulse         => dhcp_rx_pulse
         );
 
     -- ========================================================================
@@ -829,13 +896,129 @@ begin
         );
 
     -- ========================================================================
+    -- HPSDR Protocol 2 discovery responder.  Sits on udp_rx_handler's
+    -- hpsdr_* channel (UDP/1024 payload, Eth/IP/UDP stripped); recognises
+    -- the General-Packet "discovery request" by payload byte 4 == 0x02
+    -- and replies with a 102-byte Ethernet frame advertising this device
+    -- as an Orion MkII (board type 0x05, modelled on the upstream Orion2
+    -- reference firmware Y:\Ilkka\ham\bladerf\orion2).  Reply is unicast
+    -- back to the probing host: Eth dst = eth_rx_demux's src_mac sideband,
+    -- IP dst = ip_rx_handler's src_ip sideband, UDP dst port = udp_rx_
+    -- handler's src_port sideband (= host's ephemeral port).  IP src =
+    -- effective_ip (DHCP-leased post-lease, static EEM_OUR_IP pre-lease).
+    --
+    -- host_mac / host_ip / host_port / host_valid expose the committed
+    -- client identity for downstream HPSDR producers.  First consumer is
+    -- hpsdr_hp_status_sender immediately below.  Drives tx_arbiter port D.
+    -- ========================================================================
+    U_hpsdr_discovery_responder : entity work.hpsdr_discovery_responder
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            our_mac      => local_mac,
+            our_ip       => effective_ip,
+            peer_mac     => eth_rx_src_mac,
+            peer_ip      => ip_rx_src_ip,
+            peer_port    => udp_src_port,
+
+            rx_data      => hpsdr_rx_data,
+            rx_valid     => hpsdr_rx_valid,
+            rx_sop       => hpsdr_rx_sop,
+            rx_eop       => hpsdr_rx_eop,
+            rx_length    => hpsdr_rx_length,
+
+            tx_data      => hpsdr_tx_data,
+            tx_valid     => hpsdr_tx_valid,
+            tx_sop       => hpsdr_tx_sop,
+            tx_eop       => hpsdr_tx_eop,
+            tx_length    => hpsdr_tx_length,
+            tx_ready     => hpsdr_tx_ready,
+
+            host_mac     => hpsdr_host_mac,
+            host_ip      => hpsdr_host_ip,
+            host_port    => hpsdr_host_port,
+            host_valid   => hpsdr_host_valid,
+
+            reply_pulse  => hpsdr_disc_reply_pulse
+        );
+
+    -- ========================================================================
+    -- HPSDR P2 High-Priority Command receiver.  Consumes UDP/1027 stream
+    -- from udp_rx_handler.hpsdr_hp_cmd_* and latches host_run (byte 4
+    -- bit 0) -- the engagement gate for every radio->host TX producer
+    -- per Orion2 sdr_send.v line 195.  Also latches host_ptt0 (byte 4
+    -- bit 1) for future Tx-path gating.  Frequency / drive / Alex /
+    -- attenuators are not decoded in this iteration (no consumer yet).
+    -- ========================================================================
+    U_hpsdr_hp_cmd_handler : entity work.hpsdr_hp_cmd_handler
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            rx_data      => hpsdr_hp_cmd_rx_data,
+            rx_valid     => hpsdr_hp_cmd_rx_valid,
+            rx_sop       => hpsdr_hp_cmd_rx_sop,
+            rx_eop       => hpsdr_hp_cmd_rx_eop,
+            rx_length    => hpsdr_hp_cmd_rx_length,
+
+            host_run     => hpsdr_host_run,
+            host_ptt0    => hpsdr_host_ptt0,
+
+            hp_cmd_pulse => hpsdr_hp_cmd_decode_pulse
+        );
+
+    -- ========================================================================
+    -- HPSDR P2 High-Priority Status sender.  5 Hz heartbeat from UDP src
+    -- port 1025 to the discovered host on UDP dst 1025 (= the default
+    -- High_Priority_to_PC_port per Orion2 General_CC.v, and the value
+    -- Thetis configures in its General Packet -- see
+    -- [[project_hpsdr_thetis_engagement]]).  Payload all-zero in the
+    -- idle case (matching real Orion2 behaviour: no PTT, no overload,
+    -- no analogue sources connected).
+    --
+    -- Gated on (hpsdr_host_valid='1' AND host_run='1').  Orion2's
+    -- sdr_send.v line 195 only enters CC_SEND when `run` is asserted --
+    -- the radio is SILENT between discovery and the host sending HP
+    -- Command with run=1, which a live tcpdump of hpsdr_sim confirms.
+    -- host_run is now driven by hpsdr_hp_cmd_handler instead of the
+    -- earlier '0' tie-off.  Drives tx_arbiter port E (lowest priority).
+    -- ========================================================================
+    U_hpsdr_hp_status_sender : entity work.hpsdr_hp_status_sender
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            our_mac      => local_mac,
+            our_ip       => effective_ip,
+
+            host_mac     => hpsdr_host_mac,
+            host_ip      => hpsdr_host_ip,
+            host_port    => hpsdr_host_port,
+            host_valid   => hpsdr_host_valid,
+
+            -- Driven by hpsdr_hp_cmd_handler from byte 4 bit 0 of the
+            -- most recently received HP Command on UDP/1027.  Matches
+            -- Orion2's High_Priority_CC.v `run <= udp_rx_data[0]`.
+            host_run     => hpsdr_host_run,
+
+            tx_data      => hpsdr_hp_tx_data,
+            tx_valid     => hpsdr_hp_tx_valid,
+            tx_sop       => hpsdr_hp_tx_sop,
+            tx_eop       => hpsdr_hp_tx_eop,
+            tx_length    => hpsdr_hp_tx_length,
+            tx_ready     => hpsdr_hp_tx_ready,
+
+            send_pulse   => hpsdr_hp_send_pulse
+        );
+
+    -- ========================================================================
     -- TX arbiter: multiplexes arp_responder (port A, highest priority),
-    -- icmp_responder (port B), and dhcp_client (port C, lowest priority)
-    -- onto the single eem_tx_framer input.  Holds the active producer
-    -- until the framer's pkt_done_pulse fires, then releases for the
-    -- next.  When the HPSDR transmit path lands, it'll add port D (or
-    -- replace this arbiter entirely with a high-rate scheduler -- see
-    -- tx_arbiter.vhd's header for the design note).
+    -- icmp_responder (port B), dhcp_client (port C),
+    -- hpsdr_discovery_responder (port D), and hpsdr_hp_status_sender
+    -- (port E, lowest priority) onto the single eem_tx_framer input.
+    -- Holds the active producer until the framer's pkt_done_pulse fires,
+    -- then releases for the next.
     -- ========================================================================
     U_tx_arbiter : entity work.tx_arbiter
         port map (
@@ -862,6 +1045,20 @@ begin
             c_eop     => dhcp_tx_eop,
             c_length  => dhcp_tx_length,
             c_ready   => dhcp_tx_ready,
+
+            d_data    => hpsdr_tx_data,
+            d_valid   => hpsdr_tx_valid,
+            d_sop     => hpsdr_tx_sop,
+            d_eop     => hpsdr_tx_eop,
+            d_length  => hpsdr_tx_length,
+            d_ready   => hpsdr_tx_ready,
+
+            e_data    => hpsdr_hp_tx_data,
+            e_valid   => hpsdr_hp_tx_valid,
+            e_sop     => hpsdr_hp_tx_sop,
+            e_eop     => hpsdr_hp_tx_eop,
+            e_length  => hpsdr_hp_tx_length,
+            e_ready   => hpsdr_hp_tx_ready,
 
             tx_data   => mux_tx_data,
             tx_valid  => mux_tx_valid,
@@ -927,10 +1124,12 @@ begin
             eem_dma_req_led <= '1';
             count := 0;
         elsif (rising_edge(fx3_pclk_pll)) then
-            if (arp_reply_pulse  = '1' or
-                icmp_reply_pulse = '1' or
-                hpsdr_pulse      = '1' or
-                dhcp_rx_pulse    = '1') then
+            if (arp_reply_pulse        = '1' or
+                icmp_reply_pulse       = '1' or
+                hpsdr_pulse            = '1' or
+                hpsdr_hp_cmd_pulse     = '1' or
+                hpsdr_disc_reply_pulse = '1' or
+                dhcp_rx_pulse          = '1') then
                 eem_dma_req_led <= '0';
                 count := 25_000_000;
             elsif (count > 0) then

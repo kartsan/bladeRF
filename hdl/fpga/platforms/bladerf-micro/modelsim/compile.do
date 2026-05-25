@@ -21,6 +21,9 @@ vcom -work nuand -2008 ../vhdl/eem/ip_rx_handler.vhd
 vcom -work nuand -2008 ../vhdl/eem/icmp_responder.vhd
 vcom -work nuand -2008 ../vhdl/eem/udp_rx_handler.vhd
 vcom -work nuand -2008 ../vhdl/eem/dhcp_client.vhd
+vcom -work nuand -2008 ../vhdl/eem/hpsdr_discovery_responder.vhd
+vcom -work nuand -2008 ../vhdl/eem/hpsdr_hp_status_sender.vhd
+vcom -work nuand -2008 ../vhdl/eem/hpsdr_hp_cmd_handler.vhd
 vcom -work nuand -2008 ../vhdl/eem/tx_arbiter.vhd
 vcom -work nuand -2008 ../vhdl/bladerf-hosted.vhd
 
