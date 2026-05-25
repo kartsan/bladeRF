@@ -250,6 +250,37 @@ architecture hosted_bladerf of bladerf is
     signal hpsdr_hp_tx_ready      : std_logic;
     signal hpsdr_hp_send_pulse    : std_logic;
 
+    -- udp_rx_handler -> hpsdr_hp_command_receiver byte stream
+    -- (dst_port=1027 classified, Eth/IP/UDP stripped).  HP Command =
+    -- host's "run / PTT / freq" intent at ~30 Hz, V4.4 spec page 32.
+    signal hpcmd_rx_data          : std_logic_vector(7 downto 0);
+    signal hpcmd_rx_valid         : std_logic;
+    signal hpcmd_rx_sop           : std_logic;
+    signal hpcmd_rx_eop           : std_logic;
+    signal hpcmd_rx_length        : std_logic_vector(13 downto 0);
+    signal hpcmd_rx_pulse         : std_logic;
+
+    -- hpsdr_hp_command_receiver latched outputs.  host_run drives the
+    -- discovery responder's idle/active status byte; host_ptt(0) feeds
+    -- back into hpsdr_hp_status_sender's PTT echo.  host_freq_ddc0 is
+    -- the BE tuning word from HP Command bytes 9..12 -- not consumed
+    -- yet (the DDC packetizer doesn't exist) but kept-pinned as a
+    -- SignalTap surface so we can verify Thetis's tuning words land
+    -- correctly before wiring the DDC.  cmd_pulse / cmd_seen are
+    -- observability hooks; cmd_seen is also the planned gating signal
+    -- if we ever need hpsdr_sim's "no status until first command" rule.
+    signal hpsdr_host_run         : std_logic;
+    signal hpsdr_host_ptt         : std_logic_vector(3 downto 0);
+    signal hpsdr_host_freq_ddc0   : std_logic_vector(31 downto 0);
+    signal hpsdr_cmd_seen         : std_logic;
+    signal hpsdr_cmd_pulse        : std_logic;
+
+    attribute keep of hpsdr_host_run       : signal is true;
+    attribute keep of hpsdr_host_ptt       : signal is true;
+    attribute keep of hpsdr_host_freq_ddc0 : signal is true;
+    attribute keep of hpsdr_cmd_seen       : signal is true;
+    attribute keep of hpsdr_cmd_pulse      : signal is true;
+
     -- icmp_responder -> tx_arbiter byte stream
     signal icmp_tx_data           : std_logic_vector(7 downto 0);
     signal icmp_tx_valid          : std_logic;
@@ -779,11 +810,13 @@ begin
     -- ========================================================================
     -- UDP RX handler.  Walks the 8-byte UDP header on every IP-handler
     -- udp_* packet, classifies by dst_port, and routes the payload to the
-    -- matching application channel.  Two recognised ports:
+    -- matching application channel.  Three recognised ports:
     --   dst_port = 1024 -> hpsdr_* (consumed by hpsdr_discovery_responder)
+    --   dst_port = 1027 -> hpcmd_* (consumed by hpsdr_hp_command_receiver)
     --   dst_port = 68   -> dhcp_*  (consumed by dhcp_client)
-    -- hpsdr_pulse blinks led(3) on every classified port-1024 packet (the
-    -- reply itself separately blinks via hpsdr_disc_reply_pulse).
+    -- hpsdr_pulse / hpcmd_pulse / dhcp_rx_pulse all blink led(3) on
+    -- classify; the reply emissions themselves blink separately via
+    -- hpsdr_disc_reply_pulse / hpsdr_hp_send_pulse.
     -- ========================================================================
     U_udp_rx_handler : entity work.udp_rx_handler
         port map (
@@ -802,6 +835,12 @@ begin
             hpsdr_eop    => hpsdr_rx_eop,
             hpsdr_length => hpsdr_rx_length,
 
+            hpcmd_data   => hpcmd_rx_data,
+            hpcmd_valid  => hpcmd_rx_valid,
+            hpcmd_sop    => hpcmd_rx_sop,
+            hpcmd_eop    => hpcmd_rx_eop,
+            hpcmd_length => hpcmd_rx_length,
+
             dhcp_data    => dhcp_rx_data,
             dhcp_valid   => dhcp_rx_valid,
             dhcp_sop     => dhcp_rx_sop,
@@ -812,6 +851,7 @@ begin
             dst_port     => udp_dst_port,
 
             hpsdr_pulse  => hpsdr_pulse,
+            hpcmd_pulse  => hpcmd_rx_pulse,
             dhcp_pulse   => dhcp_rx_pulse
         );
 
@@ -921,6 +961,7 @@ begin
             peer_mac     => eth_rx_src_mac,
             peer_ip      => ip_rx_src_ip,
             peer_port    => udp_src_port,
+            host_run     => hpsdr_host_run,
 
             rx_data      => hpsdr_rx_data,
             rx_valid     => hpsdr_rx_valid,
@@ -967,6 +1008,7 @@ begin
             host_ip      => hpsdr_host_ip,
             host_port    => hpsdr_host_port,
             host_valid   => hpsdr_host_valid,
+            host_ptt0    => hpsdr_host_ptt(0),
 
             tx_data      => hpsdr_hp_tx_data,
             tx_valid     => hpsdr_hp_tx_valid,
@@ -976,6 +1018,35 @@ begin
             tx_ready     => hpsdr_hp_tx_ready,
 
             send_pulse   => hpsdr_hp_send_pulse
+        );
+
+    -- ========================================================================
+    -- HPSDR Protocol 2 High-Priority Command receiver.  RX-only consumer of
+    -- udp_rx_handler's hpcmd_* channel (UDP/1027 payload, Eth/IP/UDP
+    -- stripped).  Latches the host's run/PTT/freq intent from payload
+    -- byte 4 (run + 4xPTT) and bytes 9..12 (DDC0 frequency BE) so the
+    -- discovery responder can switch status 0x02->0x03 and the HP status
+    -- sender can echo PTT back.  host_freq_ddc0 is observed only -- the
+    -- DDC packetizer that consumes it doesn't exist yet.  cmd_seen is
+    -- kept-pinned for future gating of hpsdr_hp_status_sender (hpsdr_sim
+    -- only starts status after first HP command; we don't gate today).
+    -- ========================================================================
+    U_hpsdr_hp_command_receiver : entity work.hpsdr_hp_command_receiver
+        port map (
+            clock          => fx3_pclk_pll,
+            reset          => sys_reset_pclk,
+
+            rx_data        => hpcmd_rx_data,
+            rx_valid       => hpcmd_rx_valid,
+            rx_sop         => hpcmd_rx_sop,
+            rx_eop         => hpcmd_rx_eop,
+
+            host_run       => hpsdr_host_run,
+            host_ptt       => hpsdr_host_ptt,
+            host_freq_ddc0 => hpsdr_host_freq_ddc0,
+
+            cmd_pulse      => hpsdr_cmd_pulse,
+            cmd_seen       => hpsdr_cmd_seen
         );
 
     -- ========================================================================
@@ -1096,6 +1167,7 @@ begin
             if (arp_reply_pulse        = '1' or
                 icmp_reply_pulse       = '1' or
                 hpsdr_pulse            = '1' or
+                hpcmd_rx_pulse         = '1' or
                 hpsdr_disc_reply_pulse = '1' or
                 dhcp_rx_pulse          = '1') then
                 eem_dma_req_led <= '0';

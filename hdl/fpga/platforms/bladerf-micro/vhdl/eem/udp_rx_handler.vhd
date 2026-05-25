@@ -22,6 +22,13 @@
 -- Currently recognised applications:
 --
 --   dst_port = HPSDR_PORT (default 1024) -> hpsdr_* channel
+--                                           (OpenHPSDR P2 General Packet:
+--                                           discovery, erase, program, set-IP,
+--                                           configuration)
+--   dst_port = HPCMD_PORT (default 1027) -> hpcmd_* channel
+--                                           (OpenHPSDR P2 High Priority Data
+--                                           from PC to Hardware: run, PTT,
+--                                           per-DDC frequency, drive level)
 --   dst_port = DHCP_PORT  (default 68)   -> dhcp_*  channel
 --   anything else                        -> silently dropped
 --
@@ -39,11 +46,11 @@
 --
 -- Detection pulses
 -- ----------------
--- hpsdr_pulse / dhcp_pulse fire for one cycle at the moment we transition
--- from header-walk into the matching forward state (after dst_port matches
--- at byte 3 AND we reach byte 7 without rx_eop closing the packet
--- prematurely).  This signals "saw a syntactically valid header for the
--- given application" even if the payload itself is zero bytes long.
+-- hpsdr_pulse / hpcmd_pulse / dhcp_pulse fire for one cycle at the moment
+-- we transition from header-walk into the matching forward state (after
+-- dst_port matches at byte 3 AND we reach byte 7 without rx_eop closing
+-- the packet prematurely).  This signals "saw a syntactically valid header
+-- for the given application" even if the payload itself is zero bytes long.
 -- =============================================================================
 
 library ieee;
@@ -52,10 +59,16 @@ library ieee;
 
 entity udp_rx_handler is
     generic (
-        -- UDP destination port that selects the HPSDR channel.  Default
-        -- 1024 matches OpenHPSDR Protocol 1 (Metis).  Override for
-        -- testing or for future protocol revisions on different ports.
+        -- UDP destination port that selects the HPSDR General-Packet
+        -- channel (discovery, erase, program, set-IP, configuration).
+        -- Default 1024 matches OpenHPSDR Protocol 2 (V4.4 spec page 13).
         HPSDR_PORT : natural := 1024;
+
+        -- UDP destination port that selects the HPSDR High-Priority
+        -- Data channel (run, PTT, frequency, drive).  Default 1027
+        -- per the V4.4 spec page 32 ("Control Elements - PC to
+        -- Hardware Port (Default 1027)").
+        HPCMD_PORT : natural := 1027;
 
         -- UDP destination port that selects the DHCP-client channel.
         -- DHCP servers respond to clients on port 68 (BOOTP-client).
@@ -72,14 +85,21 @@ entity udp_rx_handler is
         rx_eop       : in  std_logic;
         rx_length    : in  std_logic_vector(13 downto 0);   -- IP payload length
 
-        -- HPSDR byte stream output (UDP payload only).
+        -- HPSDR General-Packet byte stream output (UDP/1024 payload).
         hpsdr_data   : out std_logic_vector(7 downto 0);
         hpsdr_valid  : out std_logic;
         hpsdr_sop    : out std_logic;
         hpsdr_eop    : out std_logic;
         hpsdr_length : out std_logic_vector(13 downto 0);   -- payload bytes
 
-        -- DHCP byte stream output (UDP payload only).
+        -- HPSDR High-Priority-Command byte stream output (UDP/1027 payload).
+        hpcmd_data   : out std_logic_vector(7 downto 0);
+        hpcmd_valid  : out std_logic;
+        hpcmd_sop    : out std_logic;
+        hpcmd_eop    : out std_logic;
+        hpcmd_length : out std_logic_vector(13 downto 0);   -- payload bytes
+
+        -- DHCP byte stream output (UDP/68 payload).
         dhcp_data    : out std_logic_vector(7 downto 0);
         dhcp_valid   : out std_logic;
         dhcp_sop     : out std_logic;
@@ -93,6 +113,7 @@ entity udp_rx_handler is
 
         -- Observability: one-cycle pulse on each accepted header.
         hpsdr_pulse  : out std_logic;
+        hpcmd_pulse  : out std_logic;
         dhcp_pulse   : out std_logic
     );
 end entity;
@@ -105,14 +126,16 @@ architecture arch of udp_rx_handler is
     -- the byte-3 classify is a plain vector compare.
     constant HPSDR_PORT_VEC  : std_logic_vector(15 downto 0)
         := std_logic_vector(to_unsigned(HPSDR_PORT, 16));
+    constant HPCMD_PORT_VEC  : std_logic_vector(15 downto 0)
+        := std_logic_vector(to_unsigned(HPCMD_PORT, 16));
     constant DHCP_PORT_VEC   : std_logic_vector(15 downto 0)
         := std_logic_vector(to_unsigned(DHCP_PORT,  16));
 
     -- Classified destination of the in-flight packet.
-    type kind_t is (K_NONE, K_HPSDR, K_DHCP);
+    type kind_t is (K_NONE, K_HPSDR, K_HPCMD, K_DHCP);
     signal kind        : kind_t := K_NONE;
 
-    type state_t is (S_HDR, S_FWD_HPSDR, S_FWD_DHCP, S_DISCARD);
+    type state_t is (S_HDR, S_FWD_HPSDR, S_FWD_HPCMD, S_FWD_DHCP, S_DISCARD);
     signal state : state_t := S_HDR;
 
     -- 4 bits cover hdr_byte_idx 0..7 plus margin.
@@ -129,12 +152,19 @@ architecture arch of udp_rx_handler is
 
     signal sop_pending  : std_logic := '0';
 
-    -- Registered outputs (HPSDR)
+    -- Registered outputs (HPSDR General-Packet)
     signal hpsdr_data_r  : std_logic_vector(7 downto 0)  := (others => '0');
     signal hpsdr_valid_r : std_logic                     := '0';
     signal hpsdr_sop_r   : std_logic                     := '0';
     signal hpsdr_eop_r   : std_logic                     := '0';
     signal hpsdr_pulse_r : std_logic                     := '0';
+
+    -- Registered outputs (HPSDR High-Priority Command)
+    signal hpcmd_data_r  : std_logic_vector(7 downto 0)  := (others => '0');
+    signal hpcmd_valid_r : std_logic                     := '0';
+    signal hpcmd_sop_r   : std_logic                     := '0';
+    signal hpcmd_eop_r   : std_logic                     := '0';
+    signal hpcmd_pulse_r : std_logic                     := '0';
 
     -- Registered outputs (DHCP)
     signal dhcp_data_r   : std_logic_vector(7 downto 0)  := (others => '0');
@@ -151,6 +181,13 @@ begin
     hpsdr_eop    <= hpsdr_eop_r;
     hpsdr_length <= pay_len_r;
     hpsdr_pulse  <= hpsdr_pulse_r;
+
+    hpcmd_data   <= hpcmd_data_r;
+    hpcmd_valid  <= hpcmd_valid_r;
+    hpcmd_sop    <= hpcmd_sop_r;
+    hpcmd_eop    <= hpcmd_eop_r;
+    hpcmd_length <= pay_len_r;
+    hpcmd_pulse  <= hpcmd_pulse_r;
 
     dhcp_data    <= dhcp_data_r;
     dhcp_valid   <= dhcp_valid_r;
@@ -182,6 +219,11 @@ begin
             hpsdr_sop_r    <= '0';
             hpsdr_eop_r    <= '0';
             hpsdr_pulse_r  <= '0';
+            hpcmd_data_r   <= (others => '0');
+            hpcmd_valid_r  <= '0';
+            hpcmd_sop_r    <= '0';
+            hpcmd_eop_r    <= '0';
+            hpcmd_pulse_r  <= '0';
             dhcp_data_r    <= (others => '0');
             dhcp_valid_r   <= '0';
             dhcp_sop_r     <= '0';
@@ -193,6 +235,10 @@ begin
             hpsdr_sop_r   <= '0';
             hpsdr_eop_r   <= '0';
             hpsdr_pulse_r <= '0';
+            hpcmd_valid_r <= '0';
+            hpcmd_sop_r   <= '0';
+            hpcmd_eop_r   <= '0';
+            hpcmd_pulse_r <= '0';
             dhcp_valid_r  <= '0';
             dhcp_sop_r    <= '0';
             dhcp_eop_r    <= '0';
@@ -235,6 +281,8 @@ begin
                             n_dst_port := n_dst_port(15 downto 8) & rx_data;
                             if n_dst_port = HPSDR_PORT_VEC then
                                 n_kind := K_HPSDR;
+                            elsif n_dst_port = HPCMD_PORT_VEC then
+                                n_kind := K_HPCMD;
                             elsif n_dst_port = DHCP_PORT_VEC then
                                 n_kind := K_DHCP;
                             else
@@ -254,12 +302,13 @@ begin
                             -- zero-payload probe.
                             case n_kind is
                                 when K_HPSDR => hpsdr_pulse_r <= '1';
+                                when K_HPCMD => hpcmd_pulse_r <= '1';
                                 when K_DHCP  => dhcp_pulse_r  <= '1';
                                 when others  => null;
                             end case;
                             state      <= S_HDR;
                             n_byte_idx := (others => '0');
-                        elsif n_kind = K_HPSDR or n_kind = K_DHCP then
+                        elsif n_kind = K_HPSDR or n_kind = K_HPCMD or n_kind = K_DHCP then
                             -- Compute payload length = IP payload bytes - 8.
                             if unsigned(rx_length) >= to_unsigned(UDP_HDR_BYTES, rx_length'length) then
                                 payload_len := unsigned(rx_length)
@@ -269,13 +318,19 @@ begin
                             end if;
                             pay_len_r   <= std_logic_vector(payload_len);
                             sop_pending <= '1';
-                            if n_kind = K_HPSDR then
-                                hpsdr_pulse_r <= '1';
-                                state         <= S_FWD_HPSDR;
-                            else
-                                dhcp_pulse_r  <= '1';
-                                state         <= S_FWD_DHCP;
-                            end if;
+                            case n_kind is
+                                when K_HPSDR =>
+                                    hpsdr_pulse_r <= '1';
+                                    state         <= S_FWD_HPSDR;
+                                when K_HPCMD =>
+                                    hpcmd_pulse_r <= '1';
+                                    state         <= S_FWD_HPCMD;
+                                when K_DHCP =>
+                                    dhcp_pulse_r  <= '1';
+                                    state         <= S_FWD_DHCP;
+                                when others =>
+                                    state         <= S_DISCARD;
+                            end case;
                             n_byte_idx := (others => '0');
                         else
                             state      <= S_DISCARD;
@@ -310,6 +365,24 @@ begin
                     end if;
                     if rx_eop = '1' then
                         hpsdr_eop_r <= '1';
+                        state       <= S_HDR;
+                    end if;
+                end if;
+
+            -- --------------------------------------------------------------
+            -- Forward bytes to HPSDR HP-Command channel.  Mirror of
+            -- S_FWD_HPSDR for the hpcmd_* port set.
+            -- --------------------------------------------------------------
+            when S_FWD_HPCMD =>
+                if rx_valid = '1' then
+                    hpcmd_data_r  <= rx_data;
+                    hpcmd_valid_r <= '1';
+                    if sop_pending = '1' then
+                        hpcmd_sop_r <= '1';
+                        sop_pending <= '0';
+                    end if;
+                    if rx_eop = '1' then
+                        hpcmd_eop_r <= '1';
                         state       <= S_HDR;
                     end if;
                 end if;

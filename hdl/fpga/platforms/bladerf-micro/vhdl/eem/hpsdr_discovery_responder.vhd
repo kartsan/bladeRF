@@ -146,9 +146,14 @@ entity hpsdr_discovery_responder is
         DISC_BYTE20     : std_logic_vector(7 downto 0) := x"01";
         DISC_BYTE21     : std_logic_vector(7 downto 0) := x"03";
 
-        -- Status byte (byte 4).  0x02 = idle (no IQ flowing), 0x03 = active.
-        -- Hard-coded idle for now; will become a runtime input once the
-        -- DDC packetizers exist.
+        -- Fallback status byte (byte 4) used when host_run='0'.  Spec
+        -- V4.4 page 44: 0x02 = idle (no host streaming yet), 0x03 =
+        -- "running and already connected to a different host".  When
+        -- host_run='1' (host has set the run bit in its last HP Command),
+        -- the runtime mux below substitutes 0x03 regardless of this
+        -- generic so a second host probing during a live session sees
+        -- the radio as taken.  Keep this generic at 0x02 for the normal
+        -- idle case.
         STATUS_BYTE     : std_logic_vector(7 downto 0) := x"02"
     );
     port (
@@ -173,6 +178,13 @@ entity hpsdr_discovery_responder is
         peer_mac      : in  std_logic_vector(47 downto 0);
         peer_ip       : in  std_logic_vector(31 downto 0);
         peer_port     : in  std_logic_vector(15 downto 0);
+
+        -- Host's last-seen run intent, from hpsdr_hp_command_receiver
+        -- (= bit 0 of HP Command payload byte 4).  Drives the discovery
+        -- status byte from 0x02 (idle) to 0x03 (active) so a second
+        -- host probing while we're already streaming sees the radio as
+        -- taken.  Tied to '0' if no HP-command receiver is wired up.
+        host_run      : in  std_logic := '0';
 
         -- HPSDR byte stream input (from udp_rx_handler hpsdr_* channel,
         -- Eth/IP/UDP headers already stripped; byte 0 of rx_* is byte 0
@@ -321,7 +333,8 @@ architecture arch of hpsdr_discovery_responder is
         our_ip    : std_logic_vector(31 downto 0);
         peer_ip   : std_logic_vector(31 downto 0);
         peer_port : std_logic_vector(15 downto 0);
-        ip_chk    : std_logic_vector(15 downto 0)
+        ip_chk    : std_logic_vector(15 downto 0);
+        host_run  : std_logic
     ) return std_logic_vector is
     begin
         case idx is
@@ -393,8 +406,17 @@ architecture arch of hpsdr_discovery_responder is
             -- ---- HPSDR P2 General Packet payload (60 bytes) ----
             -- bytes 0..3 of payload (idx 42..45): sequence number = 0
             when 42 | 43 | 44 | 45 => return x"00";
-            -- byte 4 of payload (idx 46): status (idle/active)
-            when 46 => return STATUS_BYTE;
+            -- byte 4 of payload (idx 46): status (0x02 idle / 0x03 active).
+            -- Spec V4.4 page 44: a second host probing while we're already
+            -- streaming should see 0x03 so its UI can advise the user the
+            -- radio is in use.  STATUS_BYTE generic supplies the idle
+            -- default (0x02); host_run overrides to 0x03.
+            when 46 =>
+                if host_run = '1' then
+                    return x"03";
+                else
+                    return STATUS_BYTE;
+                end if;
             -- bytes 5..10 of payload (idx 47..52): our MAC, network order
             when 47 => return our_mac(47 downto 40);
             when 48 => return our_mac(39 downto 32);
@@ -432,13 +454,14 @@ begin
     -- Output drivers
     -- ----------------------------------------------------------------------
     tx_data_mux : process(state, tx_byte_idx, peer_mac_r, our_mac,
-                          our_ip, peer_ip_r, peer_port_r, ip_chk_r)
+                          our_ip, peer_ip_r, peer_port_r, ip_chk_r,
+                          host_run)
     begin
         if state = S_TX then
             tx_data <= disc_byte_at(to_integer(tx_byte_idx),
                                     peer_mac_r, our_mac,
                                     our_ip, peer_ip_r, peer_port_r,
-                                    ip_chk_r);
+                                    ip_chk_r, host_run);
         else
             tx_data <= (others => '0');
         end if;

@@ -156,6 +156,14 @@ entity hpsdr_hp_status_sender is
         host_port     : in  std_logic_vector(15 downto 0);
         host_valid    : in  std_logic;
 
+        -- PTT0 echo: the host's last-seen PTT-channel-0 intent, from
+        -- hpsdr_hp_command_receiver (= bit 1 of HP Command payload
+        -- byte 4).  Mirrored into HP Status payload byte 4 bit 0 so
+        -- Thetis sees its PTT request confirmed.  Tied to '0' if no
+        -- HP-command receiver is wired up (the default), which produces
+        -- the same all-zero byte 4 as before this hook existed.
+        host_ptt0     : in  std_logic := '0';
+
         -- TX byte stream output (to tx_arbiter -> eem_tx_framer).
         tx_data       : out std_logic_vector(7 downto 0);
         tx_valid      : out std_logic;
@@ -264,7 +272,8 @@ architecture arch of hpsdr_hp_status_sender is
         host_ip   : std_logic_vector(31 downto 0);
         host_port : std_logic_vector(15 downto 0);
         ip_chk    : std_logic_vector(15 downto 0);
-        seq       : unsigned(31 downto 0)
+        seq       : unsigned(31 downto 0);
+        host_ptt0 : std_logic
     ) return std_logic_vector is
     begin
         case idx is
@@ -336,8 +345,11 @@ architecture arch of hpsdr_hp_status_sender is
             when 43 => return std_logic_vector(seq(23 downto 16));
             when 44 => return std_logic_vector(seq(15 downto  8));
             when 45 => return std_logic_vector(seq( 7 downto  0));
-            -- byte 4 of payload (idx 46): PTT/MOX/dot/dash (idle = 0)
-            when 46 => return x"00";
+            -- byte 4 of payload (idx 46): PTT/MOX/dot/dash status.
+            -- Bit 0 echoes host_ptt0 so Thetis sees its PTT request
+            -- confirmed.  Other bits (dot/dash, additional PTT channels)
+            -- stay zero until we have real sources for them.
+            when 46 => return "0000000" & host_ptt0;
             -- byte 5 of payload (idx 47): ADC1 overflow flags (none)
             when 47 => return x"00";
             -- byte 6 of payload (idx 48): ADC2 overflow flags (none)
@@ -365,13 +377,15 @@ begin
     -- Output drivers
     -- ----------------------------------------------------------------------
     tx_data_mux : process(state, tx_byte_idx, host_mac, our_mac,
-                          our_ip, host_ip, host_port, ip_chk_r, seq_r)
+                          our_ip, host_ip, host_port, ip_chk_r, seq_r,
+                          host_ptt0)
     begin
         if state = S_TX then
             tx_data <= status_byte_at(to_integer(tx_byte_idx),
                                       host_mac, our_mac,
                                       our_ip, host_ip, host_port,
-                                      ip_chk_r, seq_r);
+                                      ip_chk_r, seq_r,
+                                      host_ptt0);
         else
             tx_data <= (others => '0');
         end if;
