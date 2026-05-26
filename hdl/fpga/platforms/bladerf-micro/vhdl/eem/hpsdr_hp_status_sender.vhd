@@ -26,8 +26,8 @@
 -- discovery handshake completes Thetis would otherwise time the radio out
 -- after ~3 s of silence in the radio->host direction.
 --
--- Payload (60 bytes, all zero in the idle case)
--- ---------------------------------------------
+-- Payload (60 bytes, mostly zero plus a handful of "I'm alive" tells)
+-- ------------------------------------------------------------------
 -- Per Orion2's CC_encoder.v, when the radio is idle (no PTT, no ADC
 -- overload, no analogue sources connected) every byte of the 56-byte
 -- C&C payload (= bytes 4..59 of the UDP payload after the 4-byte
@@ -38,25 +38,30 @@
 --   byte 49: Supply Volts [15:8] = 0 (unless ADC sensor connected)
 --   ...etc, all-zero
 --
--- Previous iterations of this file sent byte 7 = 0x8b and byte 49 = 0x3f
--- mirroring hpsdr_sim's fake "running radio" pattern; investigation of
--- the real Orion2 firmware shows those are NOT spec values, they're
--- simulator artifacts.  We omit them here -- if a clean-disconnect
--- regression appears we'll re-add them as generics (with Orion2-faithful
--- 0x00 defaults).  See [[project_orion2_reference_analysis]] and
--- [[feedback_hpsdr_thetis_disconnect_bytes]] for the history.
+-- Empirically (hpsdr_sim engagement tcpdump 2026-05-25), Thetis stays
+-- engaged only if HP Status echoes the host's most recent Drive_Level in
+-- payload byte 7 and advertises Mercury sample-rate caps in payload
+-- byte 49 (= 0x3f = "all four rates supported").  Real Orion2 sets byte
+-- 7 from Exciter_power_0 which traces back to drive_level too -- so the
+-- "echo drive" behaviour IS spec-faithful, just not obvious until you
+-- watch it on the wire.  See [[feedback_hpsdr_thetis_disconnect_bytes]]
+-- and [[project_orion2_reference_analysis]].
 --
--- Rate (5 Hz idle, matching Orion2)
--- ---------------------------------
+-- The two values are driven via ports (drive_level, mercury_caps) so the
+-- top level wires drive_level from hpsdr_hp_cmd_handler.host_drive_level
+-- and mercury_caps to a constant 0x3f for now.  All other payload bytes
+-- remain zero in this idle implementation.
+--
+-- Rate (20 Hz idle, matching hpsdr_sim)
+-- -------------------------------------
 -- Orion2's CC_encoder.v ([CC_encoder.v:174](Y:/Ilkka/ham/bladerf/orion2/CC_encoder.v#L174))
 -- counts 25_000_000 cycles at 125 MHz tx_clock = 200 ms (= 5 Hz) when
--- idle, switching to 125_000 cycles (= 1 ms / 1 kHz) when transmitting
--- or on ADC overload.  Plus immediate "send now" on memory[0] (PTT/Dot/
--- Dash/keyout) or memory[55] (User_IO) changes.
---
--- We currently only implement the idle 5 Hz rate (TICK_CYCLES = 20_000_000
--- at 100 MHz fx3_pclk_pll = 200 ms).  Bumping to 1 kHz requires plumbing
--- a TX-active signal from an eventual HP Command receiver -- deferred.
+-- idle, switching to 125_000 cycles (= 1 ms / 1 kHz) when transmitting.
+-- However the hpsdr_sim engagement tcpdump shows it sending HP Status
+-- at ~50 ms intervals (= 20 Hz) throughout idle; Thetis is happy at
+-- that rate.  We follow hpsdr_sim here:
+-- TICK_CYCLES = 5_000_000 at 100 MHz fx3_pclk_pll = 50 ms.
+-- Bumping to 1 kHz during TX is deferred -- still a single rate today.
 --
 -- Gating on host_run (CRITICAL -- silence between discovery and engagement)
 -- ------------------------------------------------------------------------
@@ -81,18 +86,24 @@
 -- {Eth dst, IP dst} = the host snapshot the discovery responder captured
 -- at the last successful discovery (host_mac, host_ip).
 --
--- UDP dst port: **hardcoded 1025** (= the default `High_Priority_to_PC_port`
--- per Orion2 General_CC.v + V4.4 spec).  The "reply to ephemeral source"
--- rule from [[feedback_hpsdr_reply_udp_dst_port]] only applies to the
--- discovery reply -- post-engagement traffic goes to the host-declared
--- ports per General Packet, and Thetis sends the Orion2 defaults
--- (confirmed in [[project_hpsdr_thetis_engagement]] connect dump:
--- General Packet bytes 11..12 = `04 01` = 1025).
+-- UDP dst port = **HP Command's UDP source port** (the host's ephemeral
+-- it used for sendto() of the HP Command on /1027), latched by
+-- hpsdr_hp_cmd_handler at rx_sop and presented here as `host_port`.
+-- Earlier iterations hardcoded 1025 (the spec's default
+-- `High_Priority_to_PC_port`) but Thetis disengages within ~2 s when we
+-- send there: empirically Thetis binds its receive socket to its own HP
+-- Command sendto() source, not to 1025.  The hpsdr_sim engagement
+-- tcpdump (2026-05-25) shows exactly this: hpsdr_sim replies
+-- `pelto.1025 > kissa.50138` where 50138 is Thetis's HP Command source
+-- ephemeral (distinct from the discovery probe's source).  See
+-- [[feedback_hpsdr_reply_udp_dst_port]] -- the same rule applies on the
+-- post-engagement HP Status path, just with HP Command's source instead
+-- of the discovery probe's.
 --
--- The `host_port` input is kept on the entity for compatibility but is
--- unused in the byte mux -- synthesis will optimise the connection away.
--- When a General Packet receiver lands, we'll wire the
--- (potentially-reconfigured) `hp_to_pc_port` value here instead.
+-- The `host_port` input is therefore wired to
+-- hpsdr_hp_cmd_handler.host_port at the top level, NOT to the discovery
+-- responder's host_port (which carries the discovery probe's source --
+-- Thetis uses a different ephemeral for HP Command).
 --
 -- We gate everything on (host_valid='1' AND host_run='1') -- before
 -- discovery completes host_mac/ip/port are all zero, and before HP Command
@@ -125,11 +136,12 @@ library work;
 
 entity hpsdr_hp_status_sender is
     generic (
-        -- Inter-frame idle period in clock cycles.  Default 20_000_000 at
-        -- 100 MHz fx3_pclk_pll = 200 ms = 5 Hz, matching Orion2's idle
-        -- rate from CC_encoder.v.  Real Orion2 switches to 1 kHz during
-        -- TX/overload -- not implemented here pending HP Command receiver.
-        TICK_CYCLES         : natural := 20_000_000
+        -- Inter-frame idle period in clock cycles.  Default 5_000_000 at
+        -- 100 MHz fx3_pclk_pll = 50 ms = 20 Hz, matching the rate
+        -- hpsdr_sim sends HP Status at in the engagement tcpdump.  Real
+        -- Orion2 idle is 5 Hz / TX is 1 kHz; we run a single rate here
+        -- pending an eventual TX-active signal.
+        TICK_CYCLES         : natural := 5_000_000
     );
     port (
         clock         : in  std_logic;
@@ -139,9 +151,13 @@ entity hpsdr_hp_status_sender is
         our_mac       : in  std_logic_vector(47 downto 0);
         our_ip        : in  std_logic_vector(31 downto 0);
 
-        -- Discovered host's address triple, snapshotted by
-        -- hpsdr_discovery_responder.  host_valid='1' gates the whole
-        -- sender; the three address fields are stable while it's high.
+        -- Discovered host's address triple.  host_mac / host_ip come from
+        -- hpsdr_discovery_responder's snapshot; host_port is HP Command's
+        -- UDP source ephemeral, latched by hpsdr_hp_cmd_handler at rx_sop
+        -- (Thetis binds its receive socket to its HP Command sendto()
+        -- source, NOT to the discovery probe's source nor to 1025).
+        -- host_valid='1' gates the whole sender; the three address fields
+        -- are stable while it's high.
         host_mac      : in  std_logic_vector(47 downto 0);
         host_ip       : in  std_logic_vector(31 downto 0);
         host_port     : in  std_logic_vector(15 downto 0);
@@ -154,6 +170,21 @@ entity hpsdr_hp_status_sender is
         -- Command receiver lands and can latch the real bit.
         host_run      : in  std_logic;
 
+        -- Tx0 drive level (HP Command byte 345), echoed in HP Status
+        -- payload byte 7.  Thetis expects this to round-trip and will
+        -- disengage if byte 7 stays zero while it's commanding a non-zero
+        -- drive.  Sourced from hpsdr_hp_cmd_handler.host_drive_level at
+        -- the top level.
+        drive_level   : in  std_logic_vector(7 downto 0);
+
+        -- Mercury sample-rate capabilities, written into HP Status
+        -- payload byte 49.  0x3f = "all four rates supported" (the value
+        -- hpsdr_sim advertises and Thetis is happy with).  Wire to a
+        -- constant 0x3f at the top level for the bring-up phase; a real
+        -- Mercury source can drive it later.  See
+        -- [[feedback_hpsdr_thetis_disconnect_bytes]].
+        mercury_caps  : in  std_logic_vector(7 downto 0);
+
         -- TX byte stream output (to tx_arbiter -> eem_tx_framer).
         tx_data       : out std_logic_vector(7 downto 0);
         tx_valid      : out std_logic;
@@ -163,7 +194,7 @@ entity hpsdr_hp_status_sender is
         tx_ready      : in  std_logic;
 
         -- Observability: one cycle when the final byte of each status
-        -- packet is emitted (~5 Hz steady-state once host_valid='1').
+        -- packet is emitted (~20 Hz steady-state once engaged).
         send_pulse    : out std_logic
     );
 end entity;
@@ -225,8 +256,10 @@ architecture arch of hpsdr_hp_status_sender is
     type state_t is (S_IDLE, S_TX);
     signal state : state_t := S_IDLE;
 
-    -- 25-bit counter covers the default 20_000_000 ticks with headroom.
-    signal tick_counter    : unsigned(24 downto 0) := (others => '0');
+    -- 23-bit counter covers the default 5_000_000 ticks (2^23 = 8388608)
+    -- with headroom.  Anyone overriding TICK_CYCLES upwards should bump
+    -- this width to suit.
+    signal tick_counter    : unsigned(22 downto 0) := (others => '0');
 
     -- Sequence number (incremented per packet, wraps after 2^32-1).
     signal seq_r           : unsigned(31 downto 0) := (others => '0');
@@ -237,19 +270,22 @@ architecture arch of hpsdr_hp_status_sender is
 
     -- ------------------------------------------------------------------
     -- Combinational byte lookup for the 102-byte status frame.  Payload
-    -- bytes 4..59 (idx 46..101) are all zero in this Orion2-faithful
-    -- idle implementation; only the sequence number (bytes 0..3 of
-    -- payload = idx 42..45) carries non-zero data.
+    -- bytes 4..59 (idx 46..101) are mostly zero; the non-zero tells are
+    -- byte 7 = drive_level echo (idx 49) and byte 49 = mercury_caps
+    -- (idx 91).  Sequence number (payload bytes 0..3 = idx 42..45) is
+    -- the only other non-zero data.
     -- ------------------------------------------------------------------
     function status_byte_at(
-        idx       : natural;
-        host_mac  : std_logic_vector(47 downto 0);
-        our_mac   : std_logic_vector(47 downto 0);
-        our_ip    : std_logic_vector(31 downto 0);
-        host_ip   : std_logic_vector(31 downto 0);
-        host_port : std_logic_vector(15 downto 0);
-        ip_chk    : std_logic_vector(15 downto 0);
-        seq       : unsigned(31 downto 0)
+        idx          : natural;
+        host_mac     : std_logic_vector(47 downto 0);
+        our_mac      : std_logic_vector(47 downto 0);
+        our_ip       : std_logic_vector(31 downto 0);
+        host_ip      : std_logic_vector(31 downto 0);
+        host_port    : std_logic_vector(15 downto 0);
+        ip_chk       : std_logic_vector(15 downto 0);
+        seq          : unsigned(31 downto 0);
+        drive_level  : std_logic_vector(7 downto 0);
+        mercury_caps : std_logic_vector(7 downto 0)
     ) return std_logic_vector is
     begin
         case idx is
@@ -293,12 +329,13 @@ architecture arch of hpsdr_hp_status_sender is
             -- ---- UDP header ----
             when 34 => return HPSDR_HP_PORT_HI;   -- UDP src = 1025
             when 35 => return HPSDR_HP_PORT_LO;
-            -- UDP dst = 1025 hardcoded (= High_Priority_to_PC_port default
-            -- per Orion2; the value Thetis configures in its General Packet).
-            -- host_port is the discovery probe's ephemeral and is NOT used
-            -- here -- that rule applies only to the discovery reply.
-            when 36 => return HPSDR_HP_PORT_HI;
-            when 37 => return HPSDR_HP_PORT_LO;
+            -- UDP dst = host_port = HP Command's UDP source ephemeral,
+            -- latched by hpsdr_hp_cmd_handler at rx_sop.  Thetis binds
+            -- its receive socket to its HP Command sendto() source, NOT
+            -- to 1025 -- confirmed by hpsdr_sim engagement tcpdump
+            -- (pelto.1025 > kissa.50138).
+            when 36 => return host_port(15 downto 8);
+            when 37 => return host_port( 7 downto 0);
             when 38 => return UDP_LEN_VEC(15 downto 8);
             when 39 => return UDP_LEN_VEC( 7 downto 0);
             when 40 | 41 => return x"00";          -- UDP checksum = 0
@@ -309,11 +346,16 @@ architecture arch of hpsdr_hp_status_sender is
             when 43 => return std_logic_vector(seq(23 downto 16));
             when 44 => return std_logic_vector(seq(15 downto  8));
             when 45 => return std_logic_vector(seq( 7 downto  0));
-            -- bytes 4..59 of payload (idx 46..101): all zero, matching
-            -- Orion2's idle behaviour (no PTT, no overload, no analogue
-            -- sources).  Real Orion2's CC_encoder.v populates these when
-            -- the upstream signals go active; we have no upstream sources
-            -- in this iteration so all stay zero.
+            -- payload byte 7 (idx 49) = Exciter Power 0 [7:0] in spec
+            -- terms, used by Thetis as a "drive level echo" check.
+            -- Driven from drive_level input (= HP Command byte 345 echo).
+            when 49 => return drive_level;
+            -- payload byte 49 (idx 91) = Mercury sample-rate caps;
+            -- 0x3f = "all four rates supported", which hpsdr_sim sends
+            -- and Thetis is happy with.
+            when 91 => return mercury_caps;
+            -- All other payload bytes (idx 46..101 except 49 and 91):
+            -- zero, matching Orion2's idle behaviour.
             when others => return x"00";
         end case;
     end function;
@@ -324,13 +366,15 @@ begin
     -- Output drivers
     -- ----------------------------------------------------------------------
     tx_data_mux : process(state, tx_byte_idx, host_mac, our_mac,
-                          our_ip, host_ip, host_port, ip_chk_r, seq_r)
+                          our_ip, host_ip, host_port, ip_chk_r, seq_r,
+                          drive_level, mercury_caps)
     begin
         if state = S_TX then
             tx_data <= status_byte_at(to_integer(tx_byte_idx),
                                       host_mac, our_mac,
                                       our_ip, host_ip, host_port,
-                                      ip_chk_r, seq_r);
+                                      ip_chk_r, seq_r,
+                                      drive_level, mercury_caps);
         else
             tx_data <= (others => '0');
         end if;
