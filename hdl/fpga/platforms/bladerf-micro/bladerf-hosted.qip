@@ -50,6 +50,8 @@ set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/icmp_responder.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/udp_rx_handler.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/dhcp_client.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/udp_tx_pkg.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/ip_hdr_checksum.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/hpsdr_discovery_responder.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/hpsdr_hp_status_sender.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/hpsdr_hp_cmd_handler.vhd]]

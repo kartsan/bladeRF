@@ -198,19 +198,9 @@ architecture hosted_bladerf of bladerf is
     signal udp_dst_port           : std_logic_vector(15 downto 0);
     signal hpsdr_pulse            : std_logic;
 
-    -- udp_rx_handler -> hpsdr_hp_cmd_handler (UDP/1027 HP Command payload)
-    --
-    -- Two distinct pulses live on this path:
-    --   hpsdr_hp_cmd_pulse        - from udp_rx_handler: fires at UDP
-    --                               header parse (~early, ~start of
-    --                               packet), used in the led(3) reply
-    --                               chain.
-    --   hpsdr_hp_cmd_decode_pulse - from hpsdr_hp_cmd_handler: fires at
-    --                               rx_eop after the full 1444-byte HP
-    --                               Command has been consumed and
-    --                               host_run/host_ptt0 latched.  Not
-    --                               wired to anything functional;
-    --                               "keep"-pinned for SignalTap.
+    -- udp_rx_handler -> hpsdr_hp_cmd_handler (UDP/1027 HP Command payload).
+    -- hpsdr_hp_cmd_pulse fires early (header parse, drives led(3));
+    -- hpsdr_hp_cmd_decode_pulse fires at rx_eop (SignalTap only).
     signal hpsdr_hp_cmd_rx_data     : std_logic_vector(7 downto 0);
     signal hpsdr_hp_cmd_rx_valid    : std_logic;
     signal hpsdr_hp_cmd_rx_sop      : std_logic;
@@ -219,30 +209,17 @@ architecture hosted_bladerf of bladerf is
     signal hpsdr_hp_cmd_pulse       : std_logic;
     signal hpsdr_hp_cmd_decode_pulse: std_logic;
 
-    -- hpsdr_hp_cmd_handler -> hpsdr_hp_status_sender (engagement state)
-    --
-    --   hpsdr_host_run           - byte 4 bit 0; gates the HP Status sender
-    --   hpsdr_host_ptt0          - byte 4 bit 1; reserved for future Tx-path
-    --   hpsdr_hp_cmd_host_port   - HP Command's UDP source ephemeral, latched
-    --                              at rx_sop.  Used as the UDP dst port for
-    --                              HP Status replies (Thetis binds its
-    --                              receive socket to its HP Command sendto()
-    --                              source, NOT to the discovery probe's
-    --                              ephemeral nor to 1025 -- confirmed by
-    --                              hpsdr_sim engagement tcpdump 2026-05-25).
-    --   hpsdr_host_drive_level   - HP Command byte 345 (Tx0 drive 0..255),
-    --                              echoed in HP Status payload byte 7 so
-    --                              Thetis's "drive round-trip" check passes.
+    -- hpsdr_hp_cmd_handler -> HP Status / DDC IQ senders (engagement state).
+    -- hpsdr_host_run/ptt0 = HP Command byte 4 bits 0/1.  hpsdr_hp_cmd_host_port
+    -- = HP Command's UDP source ephemeral, the dst port replies must target
+    -- (Thetis binds its rx socket there; see hpsdr_hp_cmd_handler header).
     signal hpsdr_host_run         : std_logic;
     signal hpsdr_host_ptt0        : std_logic;
     signal hpsdr_hp_cmd_host_port : std_logic_vector(15 downto 0);
-    signal hpsdr_host_drive_level : std_logic_vector(7 downto 0);
 
-    -- udp_dst_port isn't consumed yet (the responder already knows it
-    -- handled a port-1024 probe by virtue of being on the hpsdr_*
-    -- channel).  ip_rx_dst_ip / ip_rx_pulse are still observability-only.
-    -- host_ptt0 isn't consumed yet either; once Thetis engages and a Tx
-    -- producer / PTT-output exists we'll wire it.
+    -- Observability-only signals, "keep"-pinned for SignalTap (no functional
+    -- consumer yet): udp_dst_port, ip_rx_dst_ip, ip_rx_pulse, host_ptt0,
+    -- hpsdr_hp_cmd_decode_pulse.
     attribute keep of udp_src_port             : signal is true;
     attribute keep of udp_dst_port             : signal is true;
     attribute keep of ip_rx_dst_ip             : signal is true;
@@ -259,17 +236,9 @@ architecture hosted_bladerf of bladerf is
     signal hpsdr_tx_ready         : std_logic;
     signal hpsdr_disc_reply_pulse : std_logic;
 
-    -- Committed HPSDR client identity, captured by
-    -- hpsdr_discovery_responder at S_RX->S_TX.  Consumed by
-    -- hpsdr_hp_status_sender (MAC + IP only) and any future DDC IQ
-    -- streamers.
-    --
-    -- host_port here is the **discovery probe's** UDP source ephemeral
-    -- (= UDP dst for any reply to the discovery probe itself).  It is NOT
-    -- the right port for HP Status replies, because Thetis uses a
-    -- distinct ephemeral for HP Command -- the HP Command source is
-    -- latched separately by hpsdr_hp_cmd_handler and exposed via
-    -- hpsdr_hp_cmd_host_port above.
+    -- Committed HPSDR client identity from hpsdr_discovery_responder.
+    -- hpsdr_host_port is the discovery probe's ephemeral; HP Status / DDC IQ
+    -- instead use hpsdr_hp_cmd_host_port (the HP Command's ephemeral).
     signal hpsdr_host_mac         : std_logic_vector(47 downto 0);
     signal hpsdr_host_ip          : std_logic_vector(31 downto 0);
     signal hpsdr_host_port        : std_logic_vector(15 downto 0);
@@ -284,11 +253,8 @@ architecture hosted_bladerf of bladerf is
     signal hpsdr_hp_tx_ready      : std_logic;
     signal hpsdr_hp_send_pulse    : std_logic;
 
-    -- hpsdr_ddc_iq_sender -> tx_arbiter (port F) byte stream.  1486-byte
-    -- DDC IQ packet on UDP/1035 at ~200 Hz while host_run='1'.  Currently
-    -- emits zero IQ samples -- present primarily to satisfy Thetis's
-    -- post-engagement "no IQ -> disconnect" timer.  See the entity header
-    -- for the disconnect-hypothesis history.
+    -- hpsdr_ddc_iq_sender -> tx_arbiter (port F).  1486-byte zero-IQ packet
+    -- on UDP/1035 at ~200 Hz while host_run='1' (keeps Thetis engaged).
     signal hpsdr_ddc_tx_data      : std_logic_vector(7 downto 0);
     signal hpsdr_ddc_tx_valid     : std_logic;
     signal hpsdr_ddc_tx_sop       : std_logic;
@@ -928,20 +894,10 @@ begin
         );
 
     -- ========================================================================
-    -- HPSDR Protocol 2 discovery responder.  Sits on udp_rx_handler's
-    -- hpsdr_* channel (UDP/1024 payload, Eth/IP/UDP stripped); recognises
-    -- the General-Packet "discovery request" by payload byte 4 == 0x02
-    -- and replies with a 102-byte Ethernet frame advertising this device
-    -- as an Orion MkII (board type 0x05, modelled on the upstream Orion2
-    -- reference firmware Y:\Ilkka\ham\bladerf\orion2).  Reply is unicast
-    -- back to the probing host: Eth dst = eth_rx_demux's src_mac sideband,
-    -- IP dst = ip_rx_handler's src_ip sideband, UDP dst port = udp_rx_
-    -- handler's src_port sideband (= host's ephemeral port).  IP src =
-    -- effective_ip (DHCP-leased post-lease, static EEM_OUR_IP pre-lease).
-    --
-    -- host_mac / host_ip / host_port / host_valid expose the committed
-    -- client identity for downstream HPSDR producers.  First consumer is
-    -- hpsdr_hp_status_sender immediately below.  Drives tx_arbiter port D.
+    -- HPSDR P2 discovery responder (UDP/1024).  Replies to byte-4=0x02 probes
+    -- with a 102-byte Orion MkII reply, unicast to the probe's MAC/IP/port.
+    -- IP src = effective_ip.  Exports the committed client identity for the
+    -- senders below.  Drives tx_arbiter port D.
     -- ========================================================================
     U_hpsdr_discovery_responder : entity work.hpsdr_discovery_responder
         port map (
@@ -976,12 +932,10 @@ begin
         );
 
     -- ========================================================================
-    -- HPSDR P2 High-Priority Command receiver.  Consumes UDP/1027 stream
-    -- from udp_rx_handler.hpsdr_hp_cmd_* and latches host_run (byte 4
-    -- bit 0) -- the engagement gate for every radio->host TX producer
-    -- per Orion2 sdr_send.v line 195.  Also latches host_ptt0 (byte 4
-    -- bit 1) for future Tx-path gating.  Frequency / drive / Alex /
-    -- attenuators are not decoded in this iteration (no consumer yet).
+    -- HPSDR P2 High-Priority Command receiver (UDP/1027).  Latches host_run /
+    -- host_ptt0 (byte 4) and the HP Command's source ephemeral; a watchdog
+    -- forces run=0 after command silence.  Freq/Alex/attenuators not decoded
+    -- yet (no consumer).
     -- ========================================================================
     U_hpsdr_hp_cmd_handler : entity work.hpsdr_hp_cmd_handler
         port map (
@@ -994,37 +948,20 @@ begin
             rx_eop           => hpsdr_hp_cmd_rx_eop,
             rx_length        => hpsdr_hp_cmd_rx_length,
 
-            -- udp_rx_handler holds src_port stable from header parse
-            -- onwards; latched here at the cycle rx_sop=1.
             udp_src_port     => udp_src_port,
 
             host_run         => hpsdr_host_run,
             host_ptt0        => hpsdr_host_ptt0,
             host_port        => hpsdr_hp_cmd_host_port,
-            host_drive_level => hpsdr_host_drive_level,
 
             hp_cmd_pulse     => hpsdr_hp_cmd_decode_pulse
         );
 
     -- ========================================================================
-    -- HPSDR P2 High-Priority Status sender.  20 Hz heartbeat from UDP src
-    -- port 1025 to the discovered host on the **HP Command's** UDP source
-    -- ephemeral (latched by hpsdr_hp_cmd_handler).  hpsdr_sim engagement
-    -- tcpdump (2026-05-25) showed this is what Thetis actually listens on;
-    -- replying to 1025 makes Thetis disengage after ~2 s, and the
-    -- discovery probe's source is wrong because Thetis uses a distinct
-    -- ephemeral for HP Command.
-    --
-    -- Payload mostly zero plus drive_level echo at byte 7 and Mercury caps
-    -- 0x3f at byte 49 (per hpsdr_sim engagement trace; see
-    -- [[feedback_hpsdr_thetis_disconnect_bytes]]).
-    --
-    -- Gated on (hpsdr_host_valid='1' AND host_run='1').  Orion2's
-    -- sdr_send.v line 195 only enters CC_SEND when `run` is asserted --
-    -- the radio is SILENT between discovery and the host sending HP
-    -- Command with run=1, which a live tcpdump of hpsdr_sim confirms.
-    -- host_run is driven by hpsdr_hp_cmd_handler.  Drives tx_arbiter port
-    -- E (lowest priority).
+    -- HPSDR P2 High-Priority Status sender.  20 Hz heartbeat from UDP/1025 to
+    -- the HP Command's source ephemeral (Thetis binds its rx socket there, not
+    -- 1025).  Gated on (host_valid AND host_run): silent until the host sends
+    -- HP Command run=1.  Drives tx_arbiter port E.
     -- ========================================================================
     U_hpsdr_hp_status_sender : entity work.hpsdr_hp_status_sender
         port map (
@@ -1036,27 +973,10 @@ begin
 
             host_mac     => hpsdr_host_mac,
             host_ip      => hpsdr_host_ip,
-            -- UDP dst = HP Command's source ephemeral, NOT the discovery
-            -- probe's source (Thetis uses different ephemerals for each).
             host_port    => hpsdr_hp_cmd_host_port,
             host_valid   => hpsdr_host_valid,
 
-            -- Driven by hpsdr_hp_cmd_handler from byte 4 bit 0 of the
-            -- most recently received HP Command on UDP/1027.  Matches
-            -- Orion2's High_Priority_CC.v `run <= udp_rx_data[0]`.
             host_run     => hpsdr_host_run,
-
-            -- HP Command byte 345 (Tx0 drive 0..255), echoed by the
-            -- sender at HP Status payload byte 7.  Thetis disengages if
-            -- this round-trip ever shows zero while it's commanding a
-            -- non-zero drive.
-            drive_level  => hpsdr_host_drive_level,
-
-            -- Mercury sample-rate caps advertised in payload byte 49.
-            -- 0x3f = "all four rates supported", the value hpsdr_sim
-            -- sends and Thetis is happy with.  Hard-coded pending a
-            -- real Mercury source.
-            mercury_caps => x"3f",
 
             tx_data      => hpsdr_hp_tx_data,
             tx_valid     => hpsdr_hp_tx_valid,
@@ -1069,20 +989,10 @@ begin
         );
 
     -- ========================================================================
-    -- HPSDR P2 DDC IQ sender.  Continuous ~200 Hz, 1486-byte zero-payload
-    -- packets on UDP src 1035 -> host's HP Command source ephemeral.  Gated
-    -- on (hpsdr_host_valid='1' AND hpsdr_host_run='1') just like HP Status.
-    --
-    -- Sole purpose in this iteration: hold off Thetis's post-engagement
-    -- disconnect timer.  Empirically Thetis closes the connection within
-    -- ~2 s of HP Command run=1 if no packets arrive on the DDC port -- the
-    -- same symptom affects hpsdr_sim -P2, which also skips port 1035 (the
-    -- user's tcpdump confirmed).  Per Orion2 sdr_send.v:201-221 the
-    -- reference firmware continuously round-robins ready DDC FIFOs while
-    -- run=1; we mirror only the "stream exists" half of that contract.
-    --
-    -- Drives tx_arbiter port F (lowest priority).  HP Status, ARP, etc.
-    -- can still preempt it for their (much rarer) packets.
+    -- HPSDR P2 DDC IQ sender.  ~200 Hz, 1486-byte zero-IQ packets on UDP/1035
+    -- to the HP Command's source ephemeral; same gate as HP Status.  Holds off
+    -- Thetis's post-engagement "no IQ -> disconnect" timer until a real DDC
+    -- stream lands.  Drives tx_arbiter port F (lowest priority).
     -- ========================================================================
     U_hpsdr_ddc_iq_sender : entity work.hpsdr_ddc_iq_sender
         port map (
