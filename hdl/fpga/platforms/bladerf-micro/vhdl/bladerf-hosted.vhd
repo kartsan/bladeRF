@@ -238,6 +238,11 @@ architecture hosted_bladerf of bladerf is
     signal hpsdr_hp_cmd_host_port : std_logic_vector(15 downto 0);
     signal hpsdr_host_drive_level : std_logic_vector(7 downto 0);
 
+    -- RX0 frequency (Hz) latched from HP Command bytes 9..12 by
+    -- hpsdr_hp_cmd_handler.  In fx3_pclk_pll domain; synchronised below
+    -- onto nios_xb_gpio_in so the NIOS mailbox poller can read it.
+    signal hpsdr_host_rx0_freq    : std_logic_vector(31 downto 0);
+
     -- udp_dst_port isn't consumed yet (the responder already knows it
     -- handled a port-1024 probe by virtue of being on the hpsdr_*
     -- channel).  ip_rx_dst_ip / ip_rx_pulse are still observability-only.
@@ -403,6 +408,19 @@ architecture hosted_bladerf of bladerf is
     signal adc_controls           : sample_controls_t(ad9361.ch'range)    := (others => SAMPLE_CONTROL_DISABLE);
     signal adc_streams            : sample_streams_t(adc_controls'range)  := (others => ZERO_SAMPLE);
     signal adc_streams_last_v     : std_logic_vector(adc_controls'range)  := (others => '0');
+
+    -- Post-rx_mux samples exposed by rx.vhd for the HPSDR RX chain.  In
+    -- normal operation this mirrors adc_streams; in test-pattern modes it
+    -- carries synthetic samples (useful for smoke-testing the HPSDR pipe
+    -- without RFIC traffic).  Same rx_clock domain.
+    signal rx_mux_streams         : sample_streams_t(adc_controls'range)  := (others => ZERO_SAMPLE);
+
+    -- IQ samples coming out of hpsdr_rx_chain in the fx3_pclk_pll domain
+    -- (CIC-decimated to 48 kHz in the bring-up cut).  Consumed by
+    -- hpsdr_ddc_iq_sender's ring buffer.
+    signal hpsdr_iq_i             : signed(23 downto 0) := (others => '0');
+    signal hpsdr_iq_q             : signed(23 downto 0) := (others => '0');
+    signal hpsdr_iq_valid         : std_logic           := '0';
 
     signal   ps_sync              : std_logic_vector(0 downto 0)          := (others => '0');
 
@@ -1002,6 +1020,7 @@ begin
             host_ptt0        => hpsdr_host_ptt0,
             host_port        => hpsdr_hp_cmd_host_port,
             host_drive_level => hpsdr_host_drive_level,
+            host_rx0_freq    => hpsdr_host_rx0_freq,
 
             hp_cmd_pulse     => hpsdr_hp_cmd_decode_pulse
         );
@@ -1084,6 +1103,38 @@ begin
     -- Drives tx_arbiter port F (lowest priority).  HP Status, ARP, etc.
     -- can still preempt it for their (much rarer) packets.
     -- ========================================================================
+    -- ========================================================================
+    -- HPSDR RX chain: taps the post-rx_mux sample stream (rx_clock domain),
+    -- CIC-decimates from the AD9361's native rate (we configure 1.536 MSPS
+    -- via libbladeRF) down to 48 kHz, and crosses to fx3_pclk_pll via an
+    -- async FIFO.  The output feeds U_hpsdr_ddc_iq_sender's ring buffer.
+    --
+    -- Decimation is currently hardcoded to 32 (1536/32 = 48 kHz).  When
+    -- hpsdr_ddc_specific_handler lands the DECIMATION generic will become
+    -- a runtime input driven by the host's selected sample rate.
+    -- ========================================================================
+    U_hpsdr_rx_chain : entity work.hpsdr_rx_chain
+        generic map (
+            CIC_STAGES    => 5,
+            DECIMATION    => 32,
+            CIC_IN_WIDTH  => 16,
+            CIC_OUT_WIDTH => 24,
+            FIFO_DEPTH    => 256
+        )
+        port map (
+            rx_clock  => rx_clock,
+            rx_reset  => rx_reset,
+            adc_i     => rx_mux_streams(0).data_i,
+            adc_q     => rx_mux_streams(0).data_q,
+            adc_valid => rx_mux_streams(0).data_v,
+
+            iq_clock  => fx3_pclk_pll,
+            iq_reset  => sys_reset_pclk,
+            iq_i      => hpsdr_iq_i,
+            iq_q      => hpsdr_iq_q,
+            iq_valid  => hpsdr_iq_valid
+        );
+
     U_hpsdr_ddc_iq_sender : entity work.hpsdr_ddc_iq_sender
         port map (
             clock        => fx3_pclk_pll,
@@ -1098,6 +1149,10 @@ begin
             host_valid   => hpsdr_host_valid,
 
             host_run     => hpsdr_host_run,
+
+            iq_i         => hpsdr_iq_i,
+            iq_q         => hpsdr_iq_q,
+            iq_valid     => hpsdr_iq_valid,
 
             tx_data      => hpsdr_ddc_tx_data,
             tx_valid     => hpsdr_ddc_tx_valid,
@@ -1611,7 +1666,10 @@ begin
 
             -- RFFE Interface
             adc_controls           => adc_controls,
-            adc_streams            => adc_streams
+            adc_streams            => adc_streams,
+
+            -- Post-mux tap for the HPSDR RX chain (same rx_clock domain).
+            mux_streams_out        => rx_mux_streams
         );
 
     adc_assignment_proc : process( all )
@@ -1896,14 +1954,24 @@ begin
             sync                =>  rffe_gpio.i.adf_muxout
         );
 
-    generate_sync_xb_gpio_in : for i in exp_gpio'range generate
+    -- HPSDR mailbox: repurpose the 32-bit nios_xb_gpio_in (originally the
+    -- expansion-board GPIO input path; the bladeRF-micro HPSDR build has no
+    -- expansion board) to carry the HPSDR-commanded RX0 frequency in Hz.
+    --
+    -- hpsdr_host_rx0_freq lives in fx3_pclk_pll; nios_xb_gpio_in is read by
+    -- the NIOS subsystem on sys_clock.  Per-bit synchronisers are CDC-unsafe
+    -- for a multi-bit field in general (bits can arrive on different
+    -- cycles), but the NIOS firmware applies a "stable across two polls"
+    -- check before acting, which absorbs any brief tearing.  See
+    -- [[project_hpsdr_freq_mailbox]] (to be written) for the contract.
+    generate_sync_xb_gpio_in : for i in nios_xb_gpio_in'range generate
         U_sync_xb_gpio_in : entity work.synchronizer
           generic map (
             RESET_LEVEL         =>  '0'
           ) port map (
             reset               =>  '0',
             clock               =>  sys_clock,
-            async               =>  exp_gpio(i),
+            async               =>  hpsdr_host_rx0_freq(i),
             sync                =>  nios_xb_gpio_in(i)
           );
     end generate;

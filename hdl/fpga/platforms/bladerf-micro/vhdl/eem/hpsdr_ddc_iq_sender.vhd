@@ -21,9 +21,8 @@
 -- Modelled on Orion / Orion MkII reference firmware's sdr_send.v RX_SEND /
 -- RX_SEND_2 path (Y:\Ilkka\ham\bladerf\orion2\Ethernet\sdr_send.v lines
 -- 331-391).  Real Orion2 round-robins per-DDC FIFOs and emits one 1444-byte
--- UDP payload per ready FIFO; this iteration is a single-DDC zero-IQ
--- placeholder to satisfy Thetis's post-engagement "I expect IQ data to flow"
--- timer.
+-- UDP payload per ready FIFO; this single-DDC implementation streams real
+-- I/Q from the AD9361 RX path via hpsdr_rx_chain's CIC decimator.
 --
 -- Disconnect hypothesis
 -- ---------------------
@@ -34,7 +33,7 @@
 -- via priority arbitration).  Thetis is presumed to start a "no-IQ" timer
 -- when it commands run=1 and disconnect if no packets appear on the
 -- configured Rx0_to_PC_port within that window.  Sending even an all-zero
--- IQ stream should satisfy the timer.
+-- IQ stream satisfies the timer; a real IQ stream gives audio.
 --
 -- Payload (1444 bytes, from Orion2 sdr_send.v:331-391)
 -- ----------------------------------------------------
@@ -44,9 +43,20 @@
 --   bytes 14..15 : Samples per frame (16-bit BE; = 238)
 --   bytes 16..1443: IQ data (238 samples * 6 bytes [24-bit I + 24-bit Q])
 --
--- All IQ samples are zero in this placeholder.  When a real DDC is wired
--- up, bytes 16..1443 get filled from the AD9361 RX stream via a 6-byte-wide
--- FIFO.
+-- Sample buffering
+-- ----------------
+-- An on-chip 256-deep x 48-bit ring buffer absorbs the CIC output (iq_valid
+-- pulses at the configured decimated rate, 48 kHz by default).  On each
+-- iq_valid the producer writes {iq_i, iq_q} to iq_buf(write_ptr) and
+-- advances write_ptr (mod 256).  At packet TX entry we latch
+-- read_start = write_ptr - 238 (mod 256) so the packet contains the 238
+-- most recent samples in chronological order (Orion2 FIFO convention:
+-- byte 16 is the oldest of the 238 in this packet).  No backpressure
+-- because the buffer's 256-entry depth comfortably exceeds 238 + the
+-- worst-case sample drift across a 14 us packet transmission.
+--
+-- The ring buffer infers as Cyclone V MLABs (~24 MLABs for 256x48) via the
+-- sync-write / async-read pattern proven in eem_tx_framer.
 --
 -- Addressing
 -- ----------
@@ -117,6 +127,14 @@ entity hpsdr_ddc_iq_sender is
         -- Engagement gate.  '0' silences the sender; '1' starts the
         -- TICK_CYCLES-paced output and resets seq.
         host_run      : in  std_logic;
+
+        -- Real-time I/Q stream from hpsdr_rx_chain (CIC decimator output,
+        -- 24-bit signed I and Q at the host-selected sample rate -- 48 kHz
+        -- in the bring-up cut).  iq_valid pulses once per sample pair in
+        -- the local clock domain.
+        iq_i          : in  signed(23 downto 0);
+        iq_q          : in  signed(23 downto 0);
+        iq_valid      : in  std_logic;
 
         -- TX byte stream output (to tx_arbiter port F -> eem_tx_framer).
         tx_data       : out std_logic_vector(7 downto 0);
@@ -205,20 +223,68 @@ architecture arch of hpsdr_ddc_iq_sender is
     signal send_pulse_r    : std_logic := '0';
 
     -- ------------------------------------------------------------------
-    -- Combinational byte lookup for the 1486-byte DDC IQ frame.  IQ data
-    -- bytes (idx 58..1485 = payload bytes 16..1443) are all zero in this
-    -- placeholder implementation; only the headers + per-packet
-    -- descriptors carry non-zero data.
+    -- Sample ring buffer.  256 entries x 48 bits ({I[23:0], Q[23:0]}).
+    -- Sync-write / async-read so Quartus infers MLABs on Cyclone V; see
+    -- the eem_tx_framer commit log for the same pattern.
     -- ------------------------------------------------------------------
+    constant BUF_DEPTH       : natural := 256;
+    constant SAMPLES_PER_PKT : natural := 238;
+
+    type iq_buf_t is array (0 to BUF_DEPTH-1)
+        of std_logic_vector(47 downto 0);
+    signal iq_buf            : iq_buf_t := (others => (others => '0'));
+
+    -- 8-bit pointers cover the full BUF_DEPTH=256 with natural wrap.
+    signal wr_ptr            : unsigned(7 downto 0) := (others => '0');
+    signal read_start_r      : unsigned(7 downto 0) := (others => '0');
+
+    -- Helper counters advanced in lockstep with tx_byte_idx during the IQ
+    -- region of the frame, so the byte mux can do
+    --   sample = iq_buf(read_start_r + tx_sample_idx)
+    --   byte   = sample(byte selected by tx_byte_in_sample)
+    -- without a runtime divide-by-6.
+    signal tx_sample_idx     : unsigned(7 downto 0) := (others => '0');
+    signal tx_byte_in_sample : unsigned(2 downto 0) := (others => '0');
+
+    -- Async read of the buffer, indexed by the current sample idx.  Held
+    -- combinational so the byte mux sees the right sample on the same
+    -- cycle that produces its output byte.
+    signal current_sample    : std_logic_vector(47 downto 0);
+
+    -- ------------------------------------------------------------------
+    -- Combinational byte lookup for the 1486-byte DDC IQ frame.  Headers
+    -- (idx 0..57) come from the case statement.  IQ region (idx 58..1485)
+    -- is dispatched to iq_byte_at, which selects one of six bytes out of
+    -- current_sample based on tx_byte_in_sample.
+    -- ------------------------------------------------------------------
+    function iq_byte_at(
+        byte_in_sample : unsigned(2 downto 0);
+        sample         : std_logic_vector(47 downto 0)
+    ) return std_logic_vector is
+    begin
+        -- {I[23:16], I[15:8], I[7:0], Q[23:16], Q[15:8], Q[7:0]}
+        -- big-endian on the wire per HPSDR P2 spec.
+        case to_integer(byte_in_sample) is
+            when 0 => return sample(47 downto 40);
+            when 1 => return sample(39 downto 32);
+            when 2 => return sample(31 downto 24);
+            when 3 => return sample(23 downto 16);
+            when 4 => return sample(15 downto  8);
+            when others => return sample( 7 downto 0);
+        end case;
+    end function;
+
     function ddc_byte_at(
-        idx          : natural;
-        host_mac     : std_logic_vector(47 downto 0);
-        our_mac      : std_logic_vector(47 downto 0);
-        our_ip       : std_logic_vector(31 downto 0);
-        host_ip      : std_logic_vector(31 downto 0);
-        host_port    : std_logic_vector(15 downto 0);
-        ip_chk       : std_logic_vector(15 downto 0);
-        seq          : unsigned(31 downto 0)
+        idx              : natural;
+        byte_in_sample   : unsigned(2 downto 0);
+        current_sample   : std_logic_vector(47 downto 0);
+        host_mac         : std_logic_vector(47 downto 0);
+        our_mac          : std_logic_vector(47 downto 0);
+        our_ip           : std_logic_vector(31 downto 0);
+        host_ip          : std_logic_vector(31 downto 0);
+        host_port        : std_logic_vector(15 downto 0);
+        ip_chk           : std_logic_vector(15 downto 0);
+        seq              : unsigned(31 downto 0)
     ) return std_logic_vector is
     begin
         case idx is
@@ -282,9 +348,10 @@ architecture arch of hpsdr_ddc_iq_sender is
             -- payload bytes 14..15 (frame idx 56..57) = samples/frame = 238
             when 56 => return SAMPLES_PER_FRAME(15 downto 8);
             when 57 => return SAMPLES_PER_FRAME( 7 downto 0);
-            -- payload bytes 16..1443 (frame idx 58..1485) = IQ samples,
-            -- all zero in this placeholder.
-            when others => return x"00";
+            -- payload bytes 16..1443 (frame idx 58..1485) = IQ samples
+            -- (238 samples * 6 bytes each).  current_sample and
+            -- byte_in_sample are kept in sync with idx by the FSM.
+            when others => return iq_byte_at(byte_in_sample, current_sample);
         end case;
     end function;
 
@@ -293,11 +360,18 @@ begin
     -- ----------------------------------------------------------------------
     -- Output drivers
     -- ----------------------------------------------------------------------
-    tx_data_mux : process(state, tx_byte_idx, host_mac, our_mac,
+
+    -- Async read of the ring buffer at the current sample position, used by
+    -- the byte mux during the IQ payload region.  Quartus infers MLAB.
+    current_sample <= iq_buf(to_integer(read_start_r + tx_sample_idx));
+
+    tx_data_mux : process(state, tx_byte_idx, tx_byte_in_sample,
+                          current_sample, host_mac, our_mac,
                           our_ip, host_ip, host_port, ip_chk_r, seq_r)
     begin
         if state = S_TX then
             tx_data <= ddc_byte_at(to_integer(tx_byte_idx),
+                                   tx_byte_in_sample, current_sample,
                                    host_mac, our_mac,
                                    our_ip, host_ip, host_port,
                                    ip_chk_r, seq_r);
@@ -305,6 +379,23 @@ begin
             tx_data <= (others => '0');
         end if;
     end process tx_data_mux;
+
+    -- ----------------------------------------------------------------------
+    -- Ring buffer write -- one entry per iq_valid pulse from hpsdr_rx_chain.
+    -- Pointer wraps naturally because BUF_DEPTH=256 = 2^8.
+    -- ----------------------------------------------------------------------
+    iq_write_proc : process(clock, reset)
+    begin
+        if reset = '1' then
+            wr_ptr <= (others => '0');
+        elsif rising_edge(clock) then
+            if iq_valid = '1' then
+                iq_buf(to_integer(wr_ptr)) <=
+                    std_logic_vector(iq_i) & std_logic_vector(iq_q);
+                wr_ptr <= wr_ptr + 1;
+            end if;
+        end if;
+    end process iq_write_proc;
 
     tx_valid   <= '1' when state = S_TX else '0';
     tx_sop     <= '1' when (state = S_TX and tx_byte_idx = 0) else '0';
@@ -353,11 +444,14 @@ begin
     fsm : process(clock, reset)
     begin
         if reset = '1' then
-            state         <= S_IDLE;
-            tick_counter  <= (others => '0');
-            seq_r         <= (others => '0');
-            tx_byte_idx   <= (others => '0');
-            send_pulse_r  <= '0';
+            state             <= S_IDLE;
+            tick_counter      <= (others => '0');
+            seq_r             <= (others => '0');
+            tx_byte_idx       <= (others => '0');
+            tx_sample_idx     <= (others => '0');
+            tx_byte_in_sample <= (others => '0');
+            read_start_r      <= (others => '0');
+            send_pulse_r      <= '0';
         elsif rising_edge(clock) then
             send_pulse_r <= '0';
 
@@ -372,9 +466,18 @@ begin
                 if host_valid = '1' and host_run = '1' then
                     if tick_counter = to_unsigned(TICK_CYCLES - 1,
                                                   tick_counter'length) then
-                        tick_counter <= (others => '0');
-                        tx_byte_idx  <= (others => '0');
-                        state        <= S_TX;
+                        tick_counter      <= (others => '0');
+                        tx_byte_idx       <= (others => '0');
+                        tx_sample_idx     <= (others => '0');
+                        tx_byte_in_sample <= (others => '0');
+                        -- Snapshot the 238-sample read window ending at the
+                        -- most recent write.  Byte 16 of the payload will
+                        -- be the oldest of those 238 samples (Orion2 FIFO
+                        -- convention).
+                        read_start_r      <= wr_ptr - to_unsigned(
+                                               SAMPLES_PER_PKT,
+                                               read_start_r'length);
+                        state             <= S_TX;
                     else
                         tick_counter <= tick_counter + 1;
                     end if;
@@ -393,6 +496,24 @@ begin
                         tx_byte_idx  <= (others => '0');
                     else
                         tx_byte_idx <= tx_byte_idx + 1;
+
+                        -- Advance helper counters while we are in (or
+                        -- entering) the IQ payload region.  At tx_byte_idx
+                        -- = 57 we are about to emit byte 58 (= first IQ
+                        -- byte) on the next cycle, so leave the helpers at
+                        -- (0, 0).  From tx_byte_idx >= 58 onwards, advance
+                        -- tx_byte_in_sample (wrapping with tx_sample_idx
+                        -- every 6 bytes) so they reflect the byte we will
+                        -- emit next cycle.
+                        if tx_byte_idx >= to_unsigned(58,
+                                                     tx_byte_idx'length) then
+                            if tx_byte_in_sample = to_unsigned(5, 3) then
+                                tx_byte_in_sample <= (others => '0');
+                                tx_sample_idx     <= tx_sample_idx + 1;
+                            else
+                                tx_byte_in_sample <= tx_byte_in_sample + 1;
+                            end if;
+                        end if;
                     end if;
                 end if;
 

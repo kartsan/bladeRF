@@ -118,9 +118,12 @@ entity hpsdr_discovery_responder is
         -- Byte 21: Frequency or phase word advertisement
         -- (0 = frequency in Hz, 1 = phase word).  Orion2 uses phase mode
         -- (= 1) since its HP Command's RX frequency bytes carry pre-computed
-        -- 32-bit phase increments.  We follow the same convention even
-        -- though we don't (yet) consume the field.
-        FREQ_PHASE       : std_logic_vector(7 downto 0) := x"01";
+        -- 32-bit phase increments at the radio's 122.88 MHz reference clock.
+        -- We advertise Hz mode (= 0) instead: Thetis then sends raw Hz in
+        -- HP Command bytes 9..12, which hpsdr_hp_cmd_handler latches and
+        -- forwards to NIOS via the xb_gpio mailbox -> ad9361_set_rx_lo_freq.
+        -- Avoids needing a phase-word -> Hz conversion in NIOS.
+        FREQ_PHASE       : std_logic_vector(7 downto 0) := x"00";
 
         -- Byte 23: Beta version tag (0 = official release, non-zero = beta
         -- number).  0x0A matches Orion firmware v2.2's beta_version.

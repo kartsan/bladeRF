@@ -36,6 +36,8 @@
 #include <unistd.h>
 
 #include "devices.h"
+#include "devices_rfic.h"
+#include "libbladeRF_nios_compat.h"
 #include "pkt_handler.h"
 #include "pkt_8x8.h"
 #include "pkt_8x16.h"
@@ -289,6 +291,54 @@ int main(void)
 
     DBG("=== System Ready ===\n");
 
+    /* ------------------------------------------------------------------
+     * HPSDR autonomous RX bring-up
+     * ------------------------------------------------------------------
+     * Bring the AD9361 fully online at boot so the bladeRF operates as a
+     * standalone HPSDR radio with no host / bladeRF-cli involvement.  Each
+     * step is the same NIOS function a libbladeRF host command would invoke;
+     * parameters come from compile-time defaults, so no host data is needed.
+     *
+     * Sample rate is 3.072 MHz: above the AD9361's 2.083 MHz plain-datapath
+     * floor, so a single SAMPLERATE command suffices -- no 4x decimation-FIR
+     * sequence (which libbladeRF's bladerf2_set_sample_rate does for sub-
+     * 2.083 MHz rates, and which the NIOS samplerate primitive does NOT).
+     * The FPGA CIC then decimates by 64 to the 48 kHz HPSDR audio rate.
+     *
+     * Frequency is deliberately NOT set here: Thetis drives it via HP
+     * Command bytes 9..12, latched by hpsdr_hp_cmd_handler and applied by
+     * the mailbox poller in the loop below.  The radio parks at the AD9361
+     * init default (2.4 GHz) until Thetis engages -- invisible, since Thetis
+     * shows no spectrum pre-engagement.
+     *
+     * Safe if a libbladeRF host later connects: _rfic_initialize skips
+     * ad9361_init when state->phy is already set, and _rfic_cmd_wr_enable is
+     * a no-op when the channel is already enabled.
+     *
+     * Define HPSDR_AUTONOMOUS_RX_INIT to 0 to revert to host-driven bring-up
+     * (e.g. for bench debugging via bladeRF-cli). */
+#if defined(BLADERF_NIOS_LIBAD936X)
+#   ifndef HPSDR_AUTONOMOUS_RX_INIT
+#       define HPSDR_AUTONOMOUS_RX_INIT 1
+#   endif
+#   if HPSDR_AUTONOMOUS_RX_INIT
+    {
+        bladerf_channel const rxch = BLADERF_CHANNEL_RX(0);
+
+        DBG("HPSDR: autonomous RX bring-up @ 3.072 MSPS\n");
+        rfic_command_write_immed(BLADERF_RFIC_COMMAND_INIT,       rxch,
+                                 BLADERF_RFIC_INIT_STATE_ON);
+        rfic_command_write_immed(BLADERF_RFIC_COMMAND_SAMPLERATE, rxch,
+                                 3072000);
+        rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAINMODE,   rxch,
+                                 BLADERF_GAIN_MGC);
+        rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAIN,       rxch, 40);
+        /* No FREQUENCY -- HPSDR sets it via the mailbox below. */
+        rfic_command_write_immed(BLADERF_RFIC_COMMAND_ENABLE,     rxch, 1);
+    }
+#   endif
+#endif  // defined(BLADERF_NIOS_LIBAD936X)
+
     while (run_nios) {
         have_request = HAVE_REQUEST();
 
@@ -444,6 +494,45 @@ int main(void)
                     pkt_handlers[i].do_work();
                 }
             }
+
+            /* HPSDR retune mailbox: the FPGA-side hpsdr_hp_cmd_handler
+             * latches RX0 frequency (in Hz, BE) from HP Command bytes 9..12
+             * and drives it onto the 32-bit nios_xb_gpio_in register (read
+             * here via expansion_port_read()).  We require the value to be
+             * stable across two consecutive polls before acting -- the
+             * per-bit synchronisers on the FPGA->NIOS crossing can briefly
+             * present a torn value when a few bits flip simultaneously, and
+             * an AD9361 retune takes ~10-100 ms of SPI traffic that we
+             * don't want to spend on garbage.
+             *
+             * After the user's bladerf-cli init helper has set the initial
+             * RX freq, Thetis takes over once it engages: every HP Command
+             * (~30 Hz) refreshes the FPGA latch with the dial's current
+             * value.  We only call rfic_command_write_immed() when the
+             * stable value differs from the one we last applied.
+             *
+             * rfic_command_write_immed() only exists when the libad936x
+             * driver is compiled in, so guard with the same condition that
+             * gates its definition in devices_rfic.c. */
+#if defined(BLADERF_NIOS_LIBAD936X)
+            {
+                static uint32_t hpsdr_freq_prev    = 0xffffffffu;
+                static uint32_t hpsdr_freq_applied = 0;
+                uint32_t        hpsdr_freq_now    = expansion_port_read();
+
+                if (hpsdr_freq_now == hpsdr_freq_prev &&
+                    hpsdr_freq_now != hpsdr_freq_applied &&
+                    hpsdr_freq_now != 0) {
+                    if (rfic_command_write_immed(
+                            BLADERF_RFIC_COMMAND_FREQUENCY,
+                            BLADERF_CHANNEL_RX(0),
+                            (uint64_t)hpsdr_freq_now)) {
+                        hpsdr_freq_applied = hpsdr_freq_now;
+                    }
+                }
+                hpsdr_freq_prev = hpsdr_freq_now;
+            }
+#endif  // defined(BLADERF_NIOS_LIBAD936X)
         }
     }
 

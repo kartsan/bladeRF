@@ -90,7 +90,15 @@ entity rx is
 
         -- RFFE Interface
         adc_controls           : in    sample_controls_t(0 to NUM_STREAMS-1) := (others => SAMPLE_CONTROL_DISABLE);
-        adc_streams            : in    sample_streams_t(0 to NUM_STREAMS-1)  := (others => ZERO_SAMPLE)
+        adc_streams            : in    sample_streams_t(0 to NUM_STREAMS-1)  := (others => ZERO_SAMPLE);
+
+        -- Post-rx_mux stream tap exposed for the HPSDR / EEM RX chain.  In
+        -- RX_MUX_NORMAL this mirrors adc_streams; in the test-pattern modes
+        -- (RX_MUX_12BIT_COUNTER, RX_MUX_DIGITAL_LOOPBACK, ...) it carries
+        -- the synthetic samples, which is useful for bring-up smoke tests
+        -- where you want a known signal flowing into hpsdr_rx_chain without
+        -- touching the AD9361.  Same rx_clock domain.
+        mux_streams_out        : out   sample_streams_t(0 to NUM_STREAMS-1)
     );
 end entity;
 
@@ -131,6 +139,9 @@ begin
 
     rx_mux_mode            <= rx_mux_mode_t'val(to_integer(rx_mux_sel));
     loopback_fifo_wenabled <= loopback_fifo_wenabled_i;
+
+    -- Expose the post-mux stream to the EEM RX chain.  See entity header.
+    mux_streams_out        <= mux_streams;
 
     set_timestamp_reset : process(rx_clock, rx_reset)
     begin

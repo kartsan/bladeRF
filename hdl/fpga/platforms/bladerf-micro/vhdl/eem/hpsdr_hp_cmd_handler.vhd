@@ -78,10 +78,26 @@
 -- packet emitted after engagement targets the correct host ephemeral.
 --
 -- host_run / host_ptt0 / host_port / host_drive_level reset on bladeRF
--- reset and are monotonically driven from the host's most recent HP
--- Command thereafter.  We do NOT implement Orion2's HW_timeout that forces
--- run=0 after a long silence -- the bladeRF USB stack resets the FPGA on
--- reconnect, which restores `run='0'` cleanly enough for the bring-up phase.
+-- reset and are driven from the host's most recent HP Command thereafter.
+--
+-- Watchdog
+-- --------
+-- Thetis silently disconnects (stops sending HP Commands and General
+-- Packets) on power-off / app close / network drop, but doesn't signal
+-- the radio.  Without a timeout the radio would keep streaming forever,
+-- saturating USB and the EEM pipe.  We implement Orion2's HW_timeout
+-- behaviour (High_Priority_CC.v `HW_timeout_cnt` -> `run`-clear) here:
+--
+--   * `watchdog_r` counts down from WATCHDOG_CYCLES.
+--   * Every accepted HP Command (rx_eop) resets it to WATCHDOG_CYCLES.
+--   * When it reaches 0, host_run / host_ptt0 are forced to '0'.
+--
+-- WATCHDOG_CYCLES = 200 ms at 100 MHz fx3_pclk_pll.  Thetis's HP Command
+-- rate is ~30 Hz (~33 ms inter-packet), so 200 ms tolerates 5 missed
+-- packets before declaring the host gone.  When the host comes back the
+-- first HP Command with run=1 resumes streaming cleanly (host_valid from
+-- the discovery responder stays latched throughout, so no re-discovery
+-- is required).
 --
 -- hp_cmd_pulse fires once per fully-consumed HP Command (rx_eop) so the
 -- LED chain / SignalTap can confirm we're seeing the host's command stream.
@@ -123,6 +139,15 @@ entity hpsdr_hp_cmd_handler is
         -- hpsdr_hp_status_sender in payload byte 7.
         host_drive_level : out std_logic_vector(7 downto 0);
 
+        -- RX0 LO frequency.  Latched big-endian from HP Command payload
+        -- bytes 9..12.  Interpretation (Hz vs NCO phase word) follows the
+        -- value advertised by hpsdr_discovery_responder's FREQ_PHASE byte
+        -- (byte 21 of the discovery reply); current FREQ_PHASE = 0x00
+        -- means "Hz".  Consumed by the NIOS mailbox poller, which calls
+        -- rfic_command_write_immed(... FREQUENCY ... RX(0) ...) when it
+        -- detects a stable change.
+        host_rx0_freq    : out std_logic_vector(31 downto 0);
+
         -- Observability: one cycle when the final byte of an HP Command
         -- is consumed (~10 Hz steady-state once Thetis is engaged).
         hp_cmd_pulse     : out std_logic
@@ -138,7 +163,14 @@ architecture arch of hpsdr_hp_cmd_handler is
     signal host_ptt0_r      : std_logic                    := '0';
     signal host_port_r      : std_logic_vector(15 downto 0):= (others => '0');
     signal host_drive_r     : std_logic_vector(7 downto 0) := (others => '0');
+    signal host_rx0_freq_r  : std_logic_vector(31 downto 0):= (others => '0');
     signal hp_cmd_pulse_r   : std_logic                    := '0';
+
+    -- Watchdog: clears host_run / host_ptt0 if no HP Command has arrived
+    -- in WATCHDOG_CYCLES.  Reloaded on every rx_eop.
+    constant WATCHDOG_CYCLES : natural := 20_000_000;  -- 200 ms @ 100 MHz
+    signal watchdog_r        : unsigned(24 downto 0)
+        := (others => '0');
 
 begin
 
@@ -146,20 +178,34 @@ begin
     host_ptt0        <= host_ptt0_r;
     host_port        <= host_port_r;
     host_drive_level <= host_drive_r;
+    host_rx0_freq    <= host_rx0_freq_r;
     hp_cmd_pulse     <= hp_cmd_pulse_r;
 
     fsm : process(clock, reset)
         variable n_byte_idx : unsigned(10 downto 0);
     begin
         if reset = '1' then
-            byte_idx       <= (others => '0');
-            host_run_r     <= '0';
-            host_ptt0_r    <= '0';
-            host_port_r    <= (others => '0');
-            host_drive_r   <= (others => '0');
-            hp_cmd_pulse_r <= '0';
+            byte_idx        <= (others => '0');
+            host_run_r      <= '0';
+            host_ptt0_r     <= '0';
+            host_port_r     <= (others => '0');
+            host_drive_r    <= (others => '0');
+            host_rx0_freq_r <= (others => '0');
+            hp_cmd_pulse_r  <= '0';
+            watchdog_r      <= (others => '0');
         elsif rising_edge(clock) then
             hp_cmd_pulse_r <= '0';
+
+            -- Watchdog: clear run/ptt0 if the host stops talking to us.
+            -- The reload on rx_eop below races with this decrement; in
+            -- VHDL the later assignment wins, so a packet arriving on the
+            -- same cycle the watchdog would expire keeps us alive.
+            if watchdog_r = 0 then
+                host_run_r  <= '0';
+                host_ptt0_r <= '0';
+            else
+                watchdog_r <= watchdog_r - 1;
+            end if;
 
             if rx_valid = '1' then
                 n_byte_idx := byte_idx;
@@ -178,6 +224,15 @@ begin
                     host_ptt0_r <= rx_data(1);
                 end if;
 
+                -- Shift-and-load RX0 frequency over bytes 9..12 (BE).  One
+                -- shift-register update per byte is significantly cheaper
+                -- than four separate byte-select assignments.  Bytes 13..16
+                -- carry RX1 freq; we don't expose that yet.
+                if n_byte_idx >= to_unsigned(9, n_byte_idx'length) and
+                   n_byte_idx <= to_unsigned(12, n_byte_idx'length) then
+                    host_rx0_freq_r <= host_rx0_freq_r(23 downto 0) & rx_data;
+                end if;
+
                 -- Latch Tx0 drive level (byte 345) for HP Status payload
                 -- byte 7 echo.  Orion2 High_Priority_CC.v stores this in
                 -- the `Drive_Level` register at the corresponding index.
@@ -188,6 +243,10 @@ begin
                 if rx_eop = '1' then
                     hp_cmd_pulse_r <= '1';
                     n_byte_idx := (others => '0');
+                    -- Reload the watchdog -- this assignment runs after the
+                    -- decrement above and takes precedence on this cycle.
+                    watchdog_r <= to_unsigned(WATCHDOG_CYCLES,
+                                              watchdog_r'length);
                 else
                     n_byte_idx := n_byte_idx + 1;
                 end if;
