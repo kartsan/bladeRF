@@ -85,34 +85,41 @@ begin
     used_words <= used ;
 
     follow_used_words : process( clock, areset )
+        -- A write only stores a word if the FIFO isn't full; a read only
+        -- removes one if it isn't empty.  Decide both up front and key every
+        -- update (pointers AND occupancy) off these, so the boundary
+        -- collisions resolve correctly:
+        --   * write-into-empty + read  -> write counts, read is a no-op
+        --   * read-from-full  + write  -> read counts, write is dropped
+        -- The previous version left `used` UNCHANGED on any simultaneous
+        -- read+write.  That is only right in the interior (0 < used < DEPTH);
+        -- on an empty FIFO it silently dropped the write's count while the
+        -- write pointer still advanced, permanently desyncing `used` from the
+        -- pointers.  eem_rx_consumer issues empty reads while draining each
+        -- packet's trailing pad word, so a colliding fx3_gpif write hit
+        -- exactly this case.  See feedback_sync_fifo_rw_collision.md.
+        variable do_write : boolean ;
+        variable do_read  : boolean ;
     begin
         if( areset = '1' ) then
             used <= 0 ;
             write_address <= 0 ;
             read_address <= 0 ;
         elsif( rising_edge(clock) ) then
-            -- Simultaneous read+write must advance BOTH pointers independently.
-            -- The original sync_fifo skipped both pointer updates on
-            -- write_en='1' AND read_en='1', which silently lost the write
-            -- (overwritten next time) and stalled the read (returned stale
-            -- data the next cycle).  See feedback_sync_fifo_rw_collision.md.
-            if( write_en = '1' and used < DEPTH ) then
+            do_write := (write_en = '1') and (used < DEPTH) ;
+            do_read  := (read_en  = '1') and (used > 0) ;
+
+            if( do_write ) then
                 write_address <= (write_address + 1) mod DEPTH ;
-            elsif( write_en = '1' ) then
-                report "Trying to write a full FIFO!" severity error ;
             end if ;
 
-            if( read_en = '1' and used > 0 ) then
+            if( do_read ) then
                 read_address <= (read_address + 1) mod DEPTH ;
-            elsif( read_en = '1' ) then
-                report "Trying to read an empty FIFO!" severity error ;
             end if ;
 
-            -- used count: +1 on write-only, -1 on read-only, unchanged on R+W
-            -- (the new word goes straight through), unchanged on idle.
-            if( write_en = '1' and read_en = '0' and used < DEPTH ) then
+            if( do_write and not do_read ) then
                 used <= used + 1 ;
-            elsif( read_en = '1' and write_en = '0' and used > 0 ) then
+            elsif( do_read and not do_write ) then
                 used <= used - 1 ;
             end if ;
         end if ;
@@ -122,7 +129,9 @@ begin
     begin
         if( rising_edge( clock ) ) then
             data_out <= ram(read_address) ;
-            if( write_en = '1' ) then
+            -- Gate on not-full so a read-from-full colliding with a write
+            -- can't overwrite the oldest (about-to-be-read) word.
+            if( write_en = '1' and used < DEPTH ) then
                 ram(write_address) <= data_in ;
             end if ;
         end if ;
