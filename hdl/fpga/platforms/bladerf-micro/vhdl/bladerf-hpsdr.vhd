@@ -263,6 +263,18 @@ architecture hpsdr_bladerf of bladerf is
     signal hpsdr_ddc_tx_ready     : std_logic;
     signal hpsdr_ddc_send_pulse   : std_logic;
 
+    -- HPSDR DDC RX path: hpsdr_ddc (rx_clock) -> async FIFO -> ddc_iq_sender.
+    signal ddc_out_i              : signed(23 downto 0);
+    signal ddc_out_q              : signed(23 downto 0);
+    signal ddc_out_valid          : std_logic;
+    signal ddc_fifo_wrdata        : std_logic_vector(47 downto 0);
+    signal ddc_fifo_wrfull        : std_logic;
+    signal ddc_fifo_rddata        : std_logic_vector(47 downto 0);
+    signal ddc_fifo_rdreq         : std_logic;
+    signal ddc_fifo_rdempty       : std_logic;
+    signal ddc_fifo_rdusedw       : std_logic_vector(8 downto 0);
+    signal ddc_fifo_aclr          : std_logic;
+
     -- icmp_responder -> tx_arbiter byte stream
     signal icmp_tx_data           : std_logic_vector(7 downto 0);
     signal icmp_tx_valid          : std_logic;
@@ -392,6 +404,134 @@ architecture hpsdr_bladerf of bladerf is
     signal wbm_wb_stb_o           : std_logic;
     signal wbm_wb_ack_i           : std_logic;
     signal wbm_wb_cyc_o           : std_logic;
+
+    -- HPSDR DDC0 receive frequency mailbox (FPGA -> Nios).
+    -- host_rx0_freq is decoded by hpsdr_hp_cmd_handler in the fx3_pclk_pll
+    -- domain; hpsdr_freq_sync is the sys_clock-domain copy driven into the
+    -- hpsdr_freq Avalon PIO (see the per-bit synchronizer generate below and
+    -- the local nios_system component override).  Firmware reads the PIO and
+    -- retunes RX0; a 2-poll stability check there absorbs the multi-bit
+    -- tearing inherent to per-bit CDC of this rarely-changing value.
+    signal host_rx0_freq          : std_logic_vector(31 downto 0);
+    signal hpsdr_freq_sync        : std_logic_vector(31 downto 0) := (others => '0');
+
+    -- HPSDR engagement status -> Nios (sys_clock).  bit0 = host_valid (Thetis
+    -- discovery committed a client; NIOS uses this to trigger RX bring-up
+    -- "during discovery"), bit1 = host_run (reserved for future ENABLE gating).
+    signal hpsdr_status_sync      : std_logic_vector(1 downto 0) := (others => '0');
+
+    -- Local override of the nios_system component from work.bladerf_p: this
+    -- hpsdr revision's Qsys (nios_system.tcl, platform_revision==hpsdr) adds an
+    -- hpsdr_freq Input PIO, so the generated entity has an extra
+    -- hpsdr_freq_export the shared package declaration lacks.  Declaring the
+    -- component here shadows the package one for this file only, leaving the
+    -- sibling revisions (hosted/adsb/wlan) that share bladerf_p untouched.
+    -- Same technique as bladerf-foxhunt.vhd's tone_generator ports.
+    component nios_system is
+      port (
+        clk_clk                         :   in  std_logic := 'X';
+        reset_reset_n                   :   in  std_logic := 'X';
+        dac_MISO                        :   in  std_logic := 'X';
+        dac_MOSI                        :   out std_logic;
+        dac_SCLK                        :   out std_logic;
+        dac_SS_n                        :   out std_logic_vector(1 downto 0);
+        spi_MISO                        :   in  std_logic := 'X';
+        spi_MOSI                        :   out std_logic;
+        spi_SCLK                        :   out std_logic;
+        spi_SS_n                        :   out std_logic;
+        gpio_in_port                    :   in  std_logic_vector(31 downto 0);
+        gpio_out_port                   :   out std_logic_vector(31 downto 0);
+        gpio_rffe_0_in_port             :   in  std_logic_vector(31 downto 0);
+        gpio_rffe_0_out_port            :   out std_logic_vector(31 downto 0);
+        ad9361_dac_sync_in_sync         :   in  std_logic;
+        ad9361_dac_sync_out_sync        :   out std_logic;
+        ad9361_data_clock_clk           :   out std_logic;
+        ad9361_data_reset_reset         :   out std_logic;
+        ad9361_device_if_rx_clk_in_p    :   in  std_logic;
+        ad9361_device_if_rx_clk_in_n    :   in  std_logic;
+        ad9361_device_if_rx_frame_in_p  :   in  std_logic;
+        ad9361_device_if_rx_frame_in_n  :   in  std_logic;
+        ad9361_device_if_rx_data_in_p   :   in  std_logic_vector(5 downto 0);
+        ad9361_device_if_rx_data_in_n   :   in  std_logic_vector(5 downto 0);
+        ad9361_device_if_tx_clk_out_p   :   out std_logic;
+        ad9361_device_if_tx_clk_out_n   :   out std_logic;
+        ad9361_device_if_tx_frame_out_p :   out std_logic;
+        ad9361_device_if_tx_frame_out_n :   out std_logic;
+        ad9361_device_if_tx_data_out_p  :   out std_logic_vector(5 downto 0);
+        ad9361_device_if_tx_data_out_n  :   out std_logic_vector(5 downto 0);
+        ad9361_adc_i0_enable            :   out std_logic;
+        ad9361_adc_i0_valid             :   out std_logic;
+        ad9361_adc_i0_data              :   out std_logic_vector(15 downto 0);
+        ad9361_adc_i1_enable            :   out std_logic;
+        ad9361_adc_i1_valid             :   out std_logic;
+        ad9361_adc_i1_data              :   out std_logic_vector(15 downto 0);
+        ad9361_adc_overflow_ovf         :   in  std_logic;
+        ad9361_adc_q0_enable            :   out std_logic;
+        ad9361_adc_q0_valid             :   out std_logic;
+        ad9361_adc_q0_data              :   out std_logic_vector(15 downto 0);
+        ad9361_adc_q1_enable            :   out std_logic;
+        ad9361_adc_q1_valid             :   out std_logic;
+        ad9361_adc_q1_data              :   out std_logic_vector(15 downto 0);
+        ad9361_adc_underflow_unf        :   in  std_logic;
+        ad9361_dac_i0_enable            :   out std_logic;
+        ad9361_dac_i0_valid             :   out std_logic;
+        ad9361_dac_i0_data              :   in  std_logic_vector(15 downto 0);
+        ad9361_dac_i1_enable            :   out std_logic;
+        ad9361_dac_i1_valid             :   out std_logic;
+        ad9361_dac_i1_data              :   in  std_logic_vector(15 downto 0);
+        ad9361_dac_overflow_ovf         :   in  std_logic;
+        ad9361_dac_q0_enable            :   out std_logic;
+        ad9361_dac_q0_valid             :   out std_logic;
+        ad9361_dac_q0_data              :   in  std_logic_vector(15 downto 0);
+        ad9361_dac_q1_enable            :   out std_logic;
+        ad9361_dac_q1_valid             :   out std_logic;
+        ad9361_dac_q1_data              :   in  std_logic_vector(15 downto 0);
+        ad9361_dac_underflow_unf        :   in  std_logic;
+        oc_i2c_arst_i                   :   in  std_logic;
+        oc_i2c_scl_pad_i                :   in  std_logic;
+        oc_i2c_scl_pad_o                :   out std_logic;
+        oc_i2c_scl_padoen_o             :   out std_logic;
+        oc_i2c_sda_pad_i                :   in  std_logic;
+        oc_i2c_sda_pad_o                :   out std_logic;
+        oc_i2c_sda_padoen_o             :   out std_logic;
+        xb_gpio_in_port                 :   in  std_logic_vector(31 downto 0) := (others => 'X');
+        xb_gpio_out_port                :   out std_logic_vector(31 downto 0);
+        xb_gpio_dir_export              :   out std_logic_vector(31 downto 0);
+        command_serial_in               :   in  std_logic;
+        command_serial_out              :   out std_logic;
+        rx_tamer_ts_sync_in             :   in  std_logic;
+        rx_tamer_ts_sync_out            :   out std_logic;
+        rx_tamer_ts_pps                 :   in  std_logic;
+        rx_tamer_ts_clock               :   in  std_logic;
+        rx_tamer_ts_reset               :   in  std_logic;
+        rx_tamer_ts_time                :   out std_logic_vector(63 downto 0);
+        tx_tamer_ts_sync_in             :   in  std_logic;
+        tx_tamer_ts_sync_out            :   out std_logic;
+        tx_tamer_ts_pps                 :   in  std_logic;
+        tx_tamer_ts_clock               :   in  std_logic;
+        tx_tamer_ts_reset               :   in  std_logic;
+        tx_tamer_ts_time                :   out std_logic_vector(63 downto 0);
+        tx_trigger_ctl_in_port          :   in  std_logic_vector(7 downto 0);
+        tx_trigger_ctl_out_port         :   out std_logic_vector(7 downto 0);
+        rx_trigger_ctl_in_port          :   in  std_logic_vector(7 downto 0);
+        rx_trigger_ctl_out_port         :   out std_logic_vector(7 downto 0);
+        arbiter_request                 :   in  std_logic_vector(1 downto 0)  := (others => 'X');
+        arbiter_granted                 :   out std_logic_vector(1 downto 0);
+        arbiter_ack                     :   in  std_logic_vector(1 downto 0)  := (others => 'X');
+        wbm_wb_clk_i                    :   in  std_logic                     := 'X';
+        wbm_wb_rst_i                    :   in  std_logic                     := 'X';
+        wbm_wb_adr_o                    :   out std_logic_vector(31 downto 0);
+        wbm_wb_dat_o                    :   out std_logic_vector(31 downto 0);
+        wbm_wb_dat_i                    :   in  std_logic_vector(31 downto 0) := (others => 'X');
+        wbm_wb_we_o                     :   out std_logic;
+        wbm_wb_sel_o                    :   out std_logic;
+        wbm_wb_stb_o                    :   out std_logic;
+        wbm_wb_ack_i                    :   in  std_logic                     := 'X';
+        wbm_wb_cyc_o                    :   out std_logic;
+        hpsdr_freq_export              :   in  std_logic_vector(31 downto 0) := (others => '0');
+        hpsdr_status_export            :   in  std_logic_vector(1 downto 0)  := (others => '0')
+      );
+    end component;
 begin
 
     U_rx_pkt_gen : entity work.rx_packet_generator
@@ -953,6 +1093,7 @@ begin
             host_run         => hpsdr_host_run,
             host_ptt0        => hpsdr_host_ptt0,
             host_port        => hpsdr_hp_cmd_host_port,
+            host_rx0_freq    => host_rx0_freq,
 
             hp_cmd_pulse     => hpsdr_hp_cmd_decode_pulse
         );
@@ -995,6 +1136,9 @@ begin
     -- stream lands.  Drives tx_arbiter port F (lowest priority).
     -- ========================================================================
     U_hpsdr_ddc_iq_sender : entity work.hpsdr_ddc_iq_sender
+        generic map (
+            IQ_FROM_FIFO => true
+        )
         port map (
             clock        => fx3_pclk_pll,
             reset        => sys_reset_pclk,
@@ -1016,7 +1160,12 @@ begin
             tx_length    => hpsdr_ddc_tx_length,
             tx_ready     => hpsdr_ddc_tx_ready,
 
-            send_pulse   => hpsdr_ddc_send_pulse
+            send_pulse   => hpsdr_ddc_send_pulse,
+
+            iq_rdreq     => ddc_fifo_rdreq,
+            iq_q         => ddc_fifo_rddata,
+            iq_rdempty   => ddc_fifo_rdempty,
+            iq_level     => ddc_fifo_rdusedw
         );
 
     -- ========================================================================
@@ -1300,7 +1449,9 @@ begin
             wbm_wb_sel_o                    => wbm_wb_sel_o,
             wbm_wb_stb_o                    => wbm_wb_stb_o,
             wbm_wb_ack_i                    => wbm_wb_ack_i,
-            wbm_wb_cyc_o                    => wbm_wb_cyc_o
+            wbm_wb_cyc_o                    => wbm_wb_cyc_o,
+            hpsdr_freq_export              => hpsdr_freq_sync,
+            hpsdr_status_export            => hpsdr_status_sync
         );
 
     -- FX3 UART
@@ -1545,6 +1696,61 @@ begin
             end loop;
         end if;
     end process;
+
+    -- ========================================================================
+    -- HPSDR DDC RX path.  Taps adc_streams(0) -- the same complex-baseband
+    -- samples the libbladeRF/FX3 path uses -- decimates 12.288 MSPS -> 48 kHz in
+    -- a CIC (rx_clock), then crosses to fx3_pclk_pll through an async FIFO that
+    -- feeds hpsdr_ddc_iq_sender.  The FIFO is held clear while not engaged so
+    -- each run starts empty.  NOTE: this path produces packets only while the
+    -- AD9361 is actually streaming (NIOS autonomous bring-up lands next; until
+    -- then enable RX at 12.288 MSPS via bladeRF-cli to exercise it).
+    -- ========================================================================
+    U_hpsdr_ddc : entity work.hpsdr_ddc
+        generic map (
+            IN_WIDTH   => 16,
+            OUT_WIDTH  => 24,
+            STAGES     => 5,
+            DECIMATION => 256          -- 12.288 MHz / 48 kHz
+        )
+        port map (
+            clock     => rx_clock,
+            reset     => rx_reset,
+            in_i      => adc_streams(0).data_i,
+            in_q      => adc_streams(0).data_q,
+            in_valid  => adc_streams(0).data_v,
+            out_i     => ddc_out_i,
+            out_q     => ddc_out_q,
+            out_valid => ddc_out_valid
+        );
+
+    ddc_fifo_wrdata <= std_logic_vector(ddc_out_i) & std_logic_vector(ddc_out_q);
+    ddc_fifo_aclr   <= not hpsdr_host_run;   -- clear FIFO unless engaged
+
+    U_hpsdr_ddc_iq_fifo : entity work.common_dcfifo
+        generic map (
+            LPM_NUMWORDS     => 512,
+            LPM_WIDTH        => 48,
+            LPM_WIDTH_R      => 48,
+            LPM_SHOWAHEAD    => "ON",
+            RDSYNC_DELAYPIPE => 5,
+            WRSYNC_DELAYPIPE => 5
+        )
+        port map (
+            aclr    => ddc_fifo_aclr,
+            data    => ddc_fifo_wrdata,
+            wrclk   => rx_clock,
+            wrreq   => ddc_out_valid and (not ddc_fifo_wrfull),
+            wrempty => open,
+            wrfull  => ddc_fifo_wrfull,
+            wrusedw => open,
+            rdclk   => fx3_pclk_pll,
+            rdreq   => ddc_fifo_rdreq,
+            q       => ddc_fifo_rddata,
+            rdempty => ddc_fifo_rdempty,
+            rdfull  => open,
+            rdusedw => ddc_fifo_rdusedw
+        );
 
     -- ========================================================================
     -- RESET SYNCHRONIZERS
@@ -1817,6 +2023,47 @@ begin
             sync                =>  nios_xb_gpio_in(i)
           );
     end generate;
+
+    -- HPSDR RX0 frequency mailbox CDC: host_rx0_freq (fx3_pclk_pll, from
+    -- hpsdr_hp_cmd_handler) -> hpsdr_freq_sync (sys_clock, the nios_system
+    -- clock that clocks the hpsdr_freq PIO).  Per-bit 2-FF synchronizer like
+    -- xb_gpio_in above; the firmware 2-poll stability check tolerates the
+    -- transient multi-bit tearing that per-bit CDC can produce.
+    generate_sync_hpsdr_freq : for i in host_rx0_freq'range generate
+        U_sync_hpsdr_freq : entity work.synchronizer
+          generic map (
+            RESET_LEVEL         =>  '0'
+          ) port map (
+            reset               =>  '0',
+            clock               =>  sys_clock,
+            async               =>  host_rx0_freq(i),
+            sync                =>  hpsdr_freq_sync(i)
+          );
+    end generate;
+
+    -- HPSDR engagement status into the hpsdr_status PIO (sys_clock).  bit0 =
+    -- host_valid: a Thetis discovery has committed a client -- the NIOS triggers
+    -- autonomous RX bring-up on this, "during discovery", well before Thetis
+    -- sends run=1.  bit1 = host_run, wired for a future host_run-gated ENABLE.
+    U_sync_hpsdr_host_valid : entity work.synchronizer
+      generic map (
+        RESET_LEVEL         =>  '0'
+      ) port map (
+        reset               =>  '0',
+        clock               =>  sys_clock,
+        async               =>  hpsdr_host_valid,
+        sync                =>  hpsdr_status_sync(0)
+      );
+
+    U_sync_hpsdr_host_run : entity work.synchronizer
+      generic map (
+        RESET_LEVEL         =>  '0'
+      ) port map (
+        reset               =>  '0',
+        clock               =>  sys_clock,
+        async               =>  hpsdr_host_run,
+        sync                =>  hpsdr_status_sync(1)
+      );
 
     U_sync_rx_enable : entity work.synchronizer
         generic map (

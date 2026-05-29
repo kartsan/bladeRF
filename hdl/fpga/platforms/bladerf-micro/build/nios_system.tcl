@@ -697,4 +697,61 @@ if { $platform_revision == "foxhunt" } {
     set_connection_parameter_value nios2.data_master/tone_generator_0.avalon_slave_0 defaultConnection {0}
 }
 
+if { $platform_revision == "hpsdr" } {
+    puts "Adding hpsdr_freq PIO..."
+    # Input-only 32-bit PIO carrying the HPSDR DDC0 receive frequency (Hz)
+    # decoded by hpsdr_hp_cmd_handler.  Nios polls it and retunes RX0.
+    # Param set mirrors the xb_gpio PIO, but direction is Input.
+    add_instance hpsdr_freq altera_avalon_pio
+    set_instance_parameter_value hpsdr_freq {bitClearingEdgeCapReg} {0}
+    set_instance_parameter_value hpsdr_freq {bitModifyingOutReg} {0}
+    set_instance_parameter_value hpsdr_freq {captureEdge} {0}
+    set_instance_parameter_value hpsdr_freq {direction} {Input}
+    set_instance_parameter_value hpsdr_freq {edgeType} {RISING}
+    set_instance_parameter_value hpsdr_freq {generateIRQ} {0}
+    set_instance_parameter_value hpsdr_freq {irqType} {LEVEL}
+    set_instance_parameter_value hpsdr_freq {resetValue} {0.0}
+    set_instance_parameter_value hpsdr_freq {simDoTestBenchWiring} {0}
+    set_instance_parameter_value hpsdr_freq {simDrivenValue} {0.0}
+    set_instance_parameter_value hpsdr_freq {width} {32}
+
+    add_interface hpsdr_freq conduit end
+    set_interface_property hpsdr_freq EXPORT_OF hpsdr_freq.external_connection
+
+    add_connection system_clock.clk hpsdr_freq.clk
+    add_connection system_clock.clk_reset hpsdr_freq.reset
+    add_connection nios2.data_master hpsdr_freq.s1
+    set_connection_parameter_value nios2.data_master/hpsdr_freq.s1 arbitrationPriority {1}
+    set_connection_parameter_value nios2.data_master/hpsdr_freq.s1 baseAddress {0x90c0}
+    set_connection_parameter_value nios2.data_master/hpsdr_freq.s1 defaultConnection {0}
+
+    # 2-bit HPSDR engagement status from the fabric: bit0 = host_valid (a Thetis
+    # discovery has committed a client), bit1 = host_run.  NIOS triggers RX
+    # bring-up on host_valid -- there are seconds of slack before Thetis sends
+    # run=1, and discovery only happens in standalone Ethernet operation so a USB
+    # libbladeRF load never trips it.
+    add_instance hpsdr_status altera_avalon_pio
+    set_instance_parameter_value hpsdr_status {bitClearingEdgeCapReg} {0}
+    set_instance_parameter_value hpsdr_status {bitModifyingOutReg} {0}
+    set_instance_parameter_value hpsdr_status {captureEdge} {0}
+    set_instance_parameter_value hpsdr_status {direction} {Input}
+    set_instance_parameter_value hpsdr_status {edgeType} {RISING}
+    set_instance_parameter_value hpsdr_status {generateIRQ} {0}
+    set_instance_parameter_value hpsdr_status {irqType} {LEVEL}
+    set_instance_parameter_value hpsdr_status {resetValue} {0.0}
+    set_instance_parameter_value hpsdr_status {simDoTestBenchWiring} {0}
+    set_instance_parameter_value hpsdr_status {simDrivenValue} {0.0}
+    set_instance_parameter_value hpsdr_status {width} {2}
+
+    add_interface hpsdr_status conduit end
+    set_interface_property hpsdr_status EXPORT_OF hpsdr_status.external_connection
+
+    add_connection system_clock.clk hpsdr_status.clk
+    add_connection system_clock.clk_reset hpsdr_status.reset
+    add_connection nios2.data_master hpsdr_status.s1
+    set_connection_parameter_value nios2.data_master/hpsdr_status.s1 arbitrationPriority {1}
+    set_connection_parameter_value nios2.data_master/hpsdr_status.s1 baseAddress {0x90d0}
+    set_connection_parameter_value nios2.data_master/hpsdr_status.s1 defaultConnection {0}
+}
+
 save_system {nios_system.qsys}

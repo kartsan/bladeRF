@@ -47,6 +47,31 @@
 #include "pkt_legacy.h"
 #include "debug.h"
 
+/* HPSDR RX0 retune mailbox + autonomous bring-up.  Fenced on HPSDR_FREQ_BASE,
+ * which the BSP only defines for the hpsdr revision (the hpsdr_freq PIO exists
+ * only in that revision's Qsys), so this entire block compiles out for every
+ * other micro revision that shares this source file. */
+#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_FREQ_BASE)
+#  include "altera_avalon_pio_regs.h"
+#  include "devices_rfic.h"
+/* Bring RX0 online with no host / bladeRF-cli session.  Set to 0 to revert to
+ * purely host-driven bring-up for bench debugging.  The bring-up runs from the
+ * main loop (NOT before it) and is triggered by an HPSDR client discovery (the
+ * hpsdr_status host_valid bit), which only happens in standalone Ethernet
+ * operation -- so it never blocks the host's post-load FPGA-version handshake
+ * and never fights libbladeRF's own RFIC init during a USB FPGA load.  There are
+ * seconds of slack between Thetis's discovery and its run=1. */
+#  ifndef HPSDR_AUTONOMOUS_RX_INIT
+#    define HPSDR_AUTONOMOUS_RX_INIT 1
+#  endif
+/* hpsdr_status PIO bits (engagement state from the FPGA fabric). */
+#  define HPSDR_STATUS_HOST_VALID (1u << 0)  /* a Thetis discovery committed */
+#  define HPSDR_STATUS_HOST_RUN   (1u << 1)  /* HP Command run=1 (reserved) */
+/* Native AD9361 RX rate: matches U_hpsdr_ddc DECIMATION=256 -> 48 kHz, and is
+ * above the AD9361 decimation-FIR floor so a single SAMPLERATE command works. */
+#  define HPSDR_RX_SAMPLERATE 12288000u
+#endif
+
 #define BLADERF_DEVICE_NAME "Nuand bladeRF 2.0 Micro"
 
 #ifdef BLADERF_NIOS_PC_SIMULATION
@@ -137,6 +162,16 @@ int main(void)
     const volatile uint8_t *magic = &pkt.req[PKT_MAGIC_IDX];
 
     volatile bool have_request = false;
+
+#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_FREQ_BASE)
+    /* HPSDR RX0 retune mailbox state.  prev = previous raw PIO sample (for the
+     * 2-poll stability filter); applied = last frequency pushed to the RFIC. */
+    uint32_t hpsdr_freq_prev    = 0;
+    uint32_t hpsdr_freq_applied = 0;
+#  if HPSDR_AUTONOMOUS_RX_INIT
+    bool     hpsdr_brought_up   = false;  /* autonomous bring-up done (one-shot) */
+#  endif
+#endif
 
 #ifdef BLADERF_NIOS_DEBUG
     // Twiddler: gratuitous screen placebo
@@ -444,6 +479,60 @@ int main(void)
                     pkt_handlers[i].do_work();
                 }
             }
+
+#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_FREQ_BASE) && HPSDR_AUTONOMOUS_RX_INIT
+            /* Autonomous RX0 bring-up, one-shot, triggered by an HPSDR client
+             * discovery (hpsdr_status host_valid).  Runs here -- in the main
+             * loop, not before it -- so the command UART stays responsive for a
+             * USB host's post-load FPGA-version read.  Discovery only occurs in
+             * standalone Ethernet operation, so a USB libbladeRF session never
+             * trips this and we never fight its RFIC init.  No FREQUENCY: the
+             * radio parks at the AD9361 init default until Thetis's first HP
+             * Command, which the poller below then applies. */
+            if (!hpsdr_brought_up &&
+                (IORD_ALTERA_AVALON_PIO_DATA(HPSDR_STATUS_BASE) &
+                 HPSDR_STATUS_HOST_VALID)) {
+                DBG("HPSDR: discovery seen, RX0 bring-up\n");
+                rfic_command_write_immed(BLADERF_RFIC_COMMAND_INIT,
+                                         RFIC_SYSTEM_CHANNEL,
+                                         BLADERF_RFIC_INIT_STATE_ON);
+                rfic_command_write_immed(BLADERF_RFIC_COMMAND_SAMPLERATE,
+                                         BLADERF_CHANNEL_RX(0),
+                                         HPSDR_RX_SAMPLERATE);
+                rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAINMODE,
+                                         BLADERF_CHANNEL_RX(0),
+                                         BLADERF_GAIN_MGC);
+                rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAIN,
+                                         BLADERF_CHANNEL_RX(0), 40);
+                rfic_command_write_immed(BLADERF_RFIC_COMMAND_ENABLE,
+                                         BLADERF_CHANNEL_RX(0), 1);
+                hpsdr_brought_up = true;
+            }
+#endif
+
+#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_FREQ_BASE)
+            /* HPSDR RX0 retune poll.  The hpsdr_freq PIO carries the dial
+             * frequency (Hz) latched by hpsdr_hp_cmd_handler and crossed into
+             * this clock domain bit-by-bit, so a multi-bit value can tear for a
+             * couple of cycles.  Act only on a sample that is stable across two
+             * consecutive reads and differs from the last applied (non-zero)
+             * value -- retunes are rare (user moving the dial), so polling here
+             * in the idle branch is plenty fast. */
+            {
+                uint32_t freq = IORD_ALTERA_AVALON_PIO_DATA(HPSDR_FREQ_BASE);
+
+                if (freq == hpsdr_freq_prev && freq != hpsdr_freq_applied &&
+                    freq != 0) {
+                    if (rfic_command_write_immed(BLADERF_RFIC_COMMAND_FREQUENCY,
+                                                 BLADERF_CHANNEL_RX(0), freq)) {
+                        hpsdr_freq_applied = freq;
+                        DBG("HPSDR: RX0 retune to %u Hz\n", freq);
+                    }
+                }
+
+                hpsdr_freq_prev = freq;
+            }
+#endif
         }
     }
 

@@ -20,13 +20,18 @@
 -- OpenHPSDR Protocol 2 "High Priority Command" receiver (host -> radio,
 -- UDP/1027), per Orion2 High_Priority_CC.v.  Consumes udp_rx_handler's
 -- hpsdr_hp_cmd_* stream (UDP header stripped) and latches:
---   * host_run  (byte 4 bit 0) - engagement gate for every radio->host
---                                producer (Orion2 sdr_send.v:195)
---   * host_ptt0 (byte 4 bit 1) - reserved for the Tx path
---   * host_port (HP Command's UDP source ephemeral, latched at rx_sop) -
---                the dst port HP Status / DDC IQ replies must target.
---                Thetis binds its receive socket to its HP Command sendto()
---                source, NOT to the discovery probe's port nor 1025.
+--   * host_run      (byte 4 bit 0) - engagement gate for every radio->host
+--                                    producer (Orion2 sdr_send.v:195)
+--   * host_ptt0     (byte 4 bit 1) - reserved for the Tx path
+--   * host_rx0_freq (bytes 9..12, big-endian Hz) - DDC0 receive frequency
+--                    (Orion2 High_Priority_CC.v: RX0 = byte9[31:24]..byte12[7:0]).
+--                    Assembled in a shift register and committed at rx_eop so a
+--                    partial big-endian value is never published.  Crosses to
+--                    the Nios via the hpsdr_freq PIO; firmware retunes RX0.
+--   * host_port     (HP Command's UDP source ephemeral, latched at rx_sop) -
+--                    the dst port HP Status / DDC IQ replies must target.
+--                    Thetis binds its receive socket to its HP Command sendto()
+--                    source, NOT to the discovery probe's port nor 1025.
 --
 -- Watchdog: host_run is forced back to 0 if no complete HP Command arrives
 -- within RUN_TIMEOUT_CYCLES, so a host that vanishes without sending run=0
@@ -64,6 +69,10 @@ entity hpsdr_hp_cmd_handler is
         host_ptt0        : out std_logic;
         host_port        : out std_logic_vector(15 downto 0);
 
+        -- DDC0 receive frequency in Hz (HP Command bytes 9..12, big-endian),
+        -- committed at rx_eop.  Held across packets until the next command.
+        host_rx0_freq    : out std_logic_vector(31 downto 0);
+
         -- One cycle per fully-consumed HP Command (~10 Hz once engaged).
         hp_cmd_pulse     : out std_logic
     );
@@ -79,15 +88,21 @@ architecture arch of hpsdr_hp_cmd_handler is
     signal host_port_r    : std_logic_vector(15 downto 0) := (others => '0');
     signal hp_cmd_pulse_r : std_logic                     := '0';
 
+    -- RX0 frequency: shift register assembles bytes 9..12 big-endian
+    -- (freq_sr); committed to host_rx0_freq_r at rx_eop.
+    signal freq_sr        : std_logic_vector(31 downto 0) := (others => '0');
+    signal host_rx0_freq_r: std_logic_vector(31 downto 0) := (others => '0');
+
     -- Watchdog (see RUN_TIMEOUT_CYCLES).
     signal wd_counter     : unsigned(27 downto 0) := (others => '0');
 
 begin
 
-    host_run     <= host_run_r;
-    host_ptt0    <= host_ptt0_r;
-    host_port    <= host_port_r;
-    hp_cmd_pulse <= hp_cmd_pulse_r;
+    host_run      <= host_run_r;
+    host_ptt0     <= host_ptt0_r;
+    host_port     <= host_port_r;
+    host_rx0_freq <= host_rx0_freq_r;
+    hp_cmd_pulse  <= hp_cmd_pulse_r;
 
     fsm : process(clock, reset)
         variable n_byte_idx : unsigned(10 downto 0);
@@ -97,6 +112,8 @@ begin
             host_run_r     <= '0';
             host_ptt0_r    <= '0';
             host_port_r    <= (others => '0');
+            freq_sr        <= (others => '0');
+            host_rx0_freq_r<= (others => '0');
             hp_cmd_pulse_r <= '0';
             wd_counter     <= (others => '0');
         elsif rising_edge(clock) then
@@ -129,9 +146,19 @@ begin
                     host_ptt0_r <= rx_data(1);
                 end if;
 
+                -- Orion2 High_Priority_CC.v: RX0 frequency bytes 9..12,
+                -- big-endian (byte 9 = [31:24] MSB).  Shift in MSB-first; a
+                -- byte-9..12 window leaves freq_sr holding the full 32-bit
+                -- value, committed below at rx_eop.
+                if (n_byte_idx >= to_unsigned(9, n_byte_idx'length)) and
+                   (n_byte_idx <= to_unsigned(12, n_byte_idx'length)) then
+                    freq_sr <= freq_sr(23 downto 0) & rx_data;
+                end if;
+
                 if rx_eop = '1' then
-                    hp_cmd_pulse_r <= '1';
-                    wd_counter     <= (others => '0');   -- refresh on each command
+                    host_rx0_freq_r <= freq_sr;           -- commit assembled value
+                    hp_cmd_pulse_r  <= '1';
+                    wd_counter      <= (others => '0');   -- refresh on each command
                     n_byte_idx := (others => '0');
                 else
                     n_byte_idx := n_byte_idx + 1;
