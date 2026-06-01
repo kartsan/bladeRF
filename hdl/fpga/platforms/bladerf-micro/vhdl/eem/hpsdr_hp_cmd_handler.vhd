@@ -33,10 +33,15 @@
 --                    Thetis binds its receive socket to its HP Command sendto()
 --                    source, NOT to the discovery probe's port nor 1025.
 --
--- Watchdog: host_run is forced back to 0 if no complete HP Command arrives
--- within RUN_TIMEOUT_CYCLES, so a host that vanishes without sending run=0
--- stops the radio's streams (Orion2 HW_timeout equivalent).  Thetis sends HP
--- Commands at ~10 Hz, so the 2 s default leaves wide margin.
+-- Watchdog: host_run is forced back to 0 if no C&C packet arrives within
+-- RUN_TIMEOUT_CYCLES, so a host that vanishes without sending run=0 stops
+-- the radio's streams (Orion2 HW_timeout equivalent).  Per V4.4 spec p.7-8
+-- ("any C&C packet ... must be sent ... at least every second"),
+-- cc_activity_pulse - driven by udp_rx_handler for every recognised HPSDR
+-- C&C dst port (1024/1025/1026/1027/1029) - refreshes the timer alongside
+-- a fully decoded HP Command.  Thetis sends HP Commands at ~10 Hz once
+-- engaged, but the slower per-port cadences (e.g. DDC Specific resends or
+-- DUC I&Q streaming) are now sufficient on their own.
 -- =============================================================================
 
 library ieee;
@@ -64,6 +69,13 @@ entity hpsdr_hp_cmd_handler is
         -- UDP source port of the HP Command (held stable by udp_rx_handler);
         -- latched at rx_sop and republished on host_port.
         udp_src_port     : in  std_logic_vector(15 downto 0);
+
+        -- C&C activity pulse from udp_rx_handler: one cycle per recognised
+        -- HPSDR C&C dst port (1024/1025/1026/1027/1029).  Refreshes the
+        -- watchdog so non-1027 traffic keeps host_run alive (V4.4 spec
+        -- p.7-8 "any C&C packet").  Tie to '0' to retain HP-Command-only
+        -- behaviour.
+        cc_activity_pulse: in  std_logic;
 
         host_run         : out std_logic;
         host_ptt0        : out std_logic;
@@ -119,8 +131,10 @@ begin
         elsif rising_edge(clock) then
             hp_cmd_pulse_r <= '0';
 
-            -- Watchdog ages while engaged; an arriving command refreshes it
-            -- below (those assignments come later and win).
+            -- Watchdog ages while engaged; an arriving C&C packet (any
+            -- HPSDR port, via cc_activity_pulse) or a fully-decoded HP
+            -- Command (rx_eop below) refreshes it.  Later assignments
+            -- in this process win, so the order here is fine.
             if host_run_r = '1' then
                 if wd_counter = to_unsigned(RUN_TIMEOUT_CYCLES - 1,
                                             wd_counter'length) then
@@ -130,6 +144,11 @@ begin
                     wd_counter <= wd_counter + 1;
                 end if;
             else
+                wd_counter <= (others => '0');
+            end if;
+
+            -- Any C&C packet refreshes the watchdog (V4.4 spec p.7-8).
+            if cc_activity_pulse = '1' then
                 wd_counter <= (others => '0');
             end if;
 

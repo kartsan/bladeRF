@@ -27,10 +27,16 @@
 -- out_strobes are bit-aligned and the I channel's serves as the pair's valid.
 --
 -- Native AD9361 rate is 12.288 MSPS; DECIMATION = 12_288_000 / hpsdr_rate.
--- This first cut is fixed at 48 kHz => DECIMATION = 256, built as a single-rate
--- CIC (MIN_DECIMATION = MAX_DECIMATION), which uses cic.v's fixed-rounding path
--- and ignores the decimation port.  Phase 2 (DDC-Specific decode) re-parameter-
--- ises to MIN/MAX = 2/256 and drives a runtime decimation select.
+-- Runtime-selectable across the six rates Thetis can request for DDC2:
+--   48/96/192/384/768/1536 kHz  <->  decim 256/128/64/32/16/8.
+-- Drive `rate_id_gray` from hpsdr_ddc_spec_handler (lives in the EEM clock
+-- domain); this block syncs and decodes it locally.  Boot default and any
+-- invalid gray code fall back to 48 kHz / decim 256.
+--
+-- Cyclone V CIC accumulator: ACC_WIDTH = IN_WIDTH + N*log2(R_max)
+--   = 16 + 5*log2(256) = 56.  Bit-growth at the slowest decim (8) is only
+-- 15 bits, so the same 56-bit accumulator covers the full 8..256 range
+-- with no truncation concern.
 --
 -- Runs entirely in rx_clock (= ad9361.clock).  A downstream async FIFO crosses
 -- the decimated stream to the EEM/system clock for hpsdr_ddc_iq_sender.
@@ -47,25 +53,35 @@ library ieee;
 
 entity hpsdr_ddc is
     generic (
-        IN_WIDTH   : natural := 16;    -- adc_streams(0) sample width
-        OUT_WIDTH  : natural := 24;    -- HPSDR DDC IQ sample width
-        STAGES     : natural := 5;
-        DECIMATION : natural := 256    -- 12.288 MHz / 48 kHz
+        IN_WIDTH       : natural := 16;   -- adc_streams(0) sample width
+        OUT_WIDTH      : natural := 24;   -- HPSDR DDC IQ sample width
+        STAGES         : natural := 5;
+        MIN_DECIMATION : natural := 8;    -- 12.288 MHz / 1536 kHz
+        MAX_DECIMATION : natural := 256   -- 12.288 MHz / 48 kHz (boot default)
     );
     port (
-        clock     : in  std_logic;     -- rx_clock (= ad9361.clock)
-        reset     : in  std_logic;
+        clock        : in  std_logic;    -- rx_clock (= ad9361.clock)
+        reset        : in  std_logic;
+
+        -- Gray-coded 3-bit DDC2 rate selector from hpsdr_ddc_spec_handler
+        -- (which lives in the EEM clock domain).  Treated as async wrt
+        -- this clock; synchronised internally with a per-bit 2-FF
+        -- synchroniser and decoded to the CIC decimation.  Encoding:
+        --   "000"->256 (48k)  "001"->128 (96k)  "011"->64  (192k)
+        --   "010"->32  (384k) "110"->16  (768k) "111"->8   (1536k)
+        --   "100"/"101"       -> invalid, fall back to 256 (48k)
+        rate_id_gray : in  std_logic_vector(2 downto 0);
 
         -- Complex baseband from the AD9361 tap (adc_streams(0)); in_valid
         -- strobes one I/Q sample at the native AD9361 rate.
-        in_i      : in  signed(IN_WIDTH-1 downto 0);
-        in_q      : in  signed(IN_WIDTH-1 downto 0);
-        in_valid  : in  std_logic;
+        in_i         : in  signed(IN_WIDTH-1 downto 0);
+        in_q         : in  signed(IN_WIDTH-1 downto 0);
+        in_valid     : in  std_logic;
 
         -- Decimated I/Q; out_valid pulses one sample at the HPSDR DDC rate.
-        out_i     : out signed(OUT_WIDTH-1 downto 0);
-        out_q     : out signed(OUT_WIDTH-1 downto 0);
-        out_valid : out std_logic
+        out_i        : out signed(OUT_WIDTH-1 downto 0);
+        out_q        : out signed(OUT_WIDTH-1 downto 0);
+        out_valid    : out std_logic
     );
 end entity;
 
@@ -84,10 +100,8 @@ architecture arch of hpsdr_ddc is
     end function;
 
     -- cic.v declares decimation as [$clog2(MAX_DECIMATION):0] => clog2+1 bits.
-    -- Unused in single-rate (MIN=MAX) mode, but must still match width & be tied.
-    constant DECIM_PORT_W : natural := clog2(DECIMATION) + 1;
-    constant DECIM_VEC    : std_logic_vector(DECIM_PORT_W-1 downto 0)
-        := std_logic_vector(to_unsigned(DECIMATION, DECIM_PORT_W));
+    -- Driven at runtime from decim_r (decoded below from the synced gray ID).
+    constant DECIM_PORT_W : natural := clog2(MAX_DECIMATION) + 1;
 
     component cic is
         generic (
@@ -108,23 +122,66 @@ architecture arch of hpsdr_ddc is
         );
     end component;
 
+    -- Per-bit 2-FF synchroniser for rate_id_gray.  Gray coding means any
+    -- single-bit metastable cycle resolves to an adjacent valid code -
+    -- i.e. an adjacent rate, not garbage.
+    signal rate_id_meta : std_logic_vector(2 downto 0) := "000";
+    signal rate_id_sync : std_logic_vector(2 downto 0) := "000";
+
+    -- Decoded CIC decimation, held stable between rate transitions.
+    -- Boot default = MAX_DECIMATION (48 kHz / decim 256) so the chain is
+    -- functional before the first DDC Specific command arrives.
+    signal decim_r : std_logic_vector(DECIM_PORT_W-1 downto 0)
+        := std_logic_vector(to_unsigned(MAX_DECIMATION, DECIM_PORT_W));
+
     signal cic_out_i : std_logic_vector(OUT_WIDTH-1 downto 0);
     signal cic_out_q : std_logic_vector(OUT_WIDTH-1 downto 0);
     signal strobe_i  : std_logic;
 
 begin
 
+    -- --------------------------------------------------------------------
+    -- Sync rate_id_gray into this clock domain (per-bit 2-FF), then decode
+    -- to the CIC decimation.  Unrecognised gray codes (the two unused
+    -- reflected-gray entries 4/5) fall back to 48 kHz per design - safer
+    -- than holding a possibly-stale rate.
+    -- --------------------------------------------------------------------
+    cdc : process(clock)
+    begin
+        if rising_edge(clock) then
+            rate_id_meta <= rate_id_gray;
+            rate_id_sync <= rate_id_meta;
+
+            case to_integer(unsigned(rate_id_sync)) is
+                when 0 =>      -- gray "000" -> 48   kHz
+                    decim_r <= std_logic_vector(to_unsigned(256, DECIM_PORT_W));
+                when 1 =>      -- gray "001" -> 96   kHz
+                    decim_r <= std_logic_vector(to_unsigned(128, DECIM_PORT_W));
+                when 3 =>      -- gray "011" -> 192  kHz
+                    decim_r <= std_logic_vector(to_unsigned(64,  DECIM_PORT_W));
+                when 2 =>      -- gray "010" -> 384  kHz
+                    decim_r <= std_logic_vector(to_unsigned(32,  DECIM_PORT_W));
+                when 6 =>      -- gray "110" -> 768  kHz
+                    decim_r <= std_logic_vector(to_unsigned(16,  DECIM_PORT_W));
+                when 7 =>      -- gray "111" -> 1536 kHz
+                    decim_r <= std_logic_vector(to_unsigned(8,   DECIM_PORT_W));
+                when others => -- 4 / 5 invalid -> fall back to 48 kHz
+                    decim_r <= std_logic_vector(to_unsigned(256, DECIM_PORT_W));
+            end case;
+        end if;
+    end process;
+
     U_cic_i : cic
         generic map (
             STAGES         => STAGES,
-            MIN_DECIMATION => DECIMATION,
-            MAX_DECIMATION => DECIMATION,
+            MIN_DECIMATION => MIN_DECIMATION,
+            MAX_DECIMATION => MAX_DECIMATION,
             IN_WIDTH       => IN_WIDTH,
             OUT_WIDTH      => OUT_WIDTH
         )
         port map (
             reset      => reset,
-            decimation => DECIM_VEC,
+            decimation => decim_r,
             clock      => clock,
             in_strobe  => in_valid,
             out_strobe => strobe_i,
@@ -135,14 +192,14 @@ begin
     U_cic_q : cic
         generic map (
             STAGES         => STAGES,
-            MIN_DECIMATION => DECIMATION,
-            MAX_DECIMATION => DECIMATION,
+            MIN_DECIMATION => MIN_DECIMATION,
+            MAX_DECIMATION => MAX_DECIMATION,
             IN_WIDTH       => IN_WIDTH,
             OUT_WIDTH      => OUT_WIDTH
         )
         port map (
             reset      => reset,
-            decimation => DECIM_VEC,
+            decimation => decim_r,
             clock      => clock,
             in_strobe  => in_valid,
             out_strobe => open,

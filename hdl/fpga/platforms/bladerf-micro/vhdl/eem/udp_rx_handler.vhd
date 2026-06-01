@@ -28,7 +28,18 @@
 --                                                   (High Priority Command
 --                                                    from host: run/PTT/
 --                                                    freq/drive)
+--   dst_port = HPSDR_DDC_SPEC_PORT (default 1025) -> hpsdr_ddc_spec_* channel
+--                                                   (DDC Specific / Rx_specific
+--                                                    Command: per-DDC enable
+--                                                    bitmap + sample rates)
 --   dst_port = DHCP_PORT          (default 68)   -> dhcp_*         channel
+--   dst_port in {HPSDR_DUC_SPEC_PORT (1026),
+--                HPSDR_DUC_IQ_PORT   (1029)}
+--                                                -> payload dropped, but
+--                                                   hpsdr_cc_pulse fires
+--                                                   (feeds hp_cmd_handler's
+--                                                   watchdog refresh; spec
+--                                                   p.7-8 "any C&C packet")
 --   anything else                                -> silently dropped
 --
 -- Input byte stream layout (output of ip_rx_handler, IP header stripped):
@@ -45,12 +56,18 @@
 --
 -- Detection pulses
 -- ----------------
--- hpsdr_pulse / hpsdr_hp_cmd_pulse / dhcp_pulse fire for one cycle at the
--- moment we transition from header-walk into the matching forward state
--- (after dst_port matches at byte 3 AND we reach byte 7 without rx_eop
--- closing the packet prematurely).  This signals "saw a syntactically
--- valid header for the given application" even if the payload itself is
--- zero bytes long.
+-- hpsdr_pulse / hpsdr_hp_cmd_pulse / hpsdr_ddc_spec_pulse / dhcp_pulse fire
+-- for one cycle at the moment we transition from header-walk into the
+-- matching forward state (after dst_port matches at byte 3 AND we reach
+-- byte 7 without rx_eop closing the packet prematurely).  This signals
+-- "saw a syntactically valid header for the given application" even if
+-- the payload itself is zero bytes long.
+--
+-- hpsdr_cc_pulse fires on the same boundary for any HPSDR C&C dst port -
+-- 1024/1025/1026/1027/1029 - so the HP Command handler's watchdog can
+-- accept any C&C packet as a keepalive (V4.4 spec p.7-8 "any C&C packet
+-- must be sent ... at least every second").  Note that 1025 fires BOTH
+-- hpsdr_ddc_spec_pulse (dedicated channel) AND hpsdr_cc_pulse (watchdog).
 -- =============================================================================
 
 library ieee;
@@ -70,6 +87,21 @@ entity udp_rx_handler is
         -- 1444-byte HP Command (run, PTT, freq, drive, Alex, attenuators).
         -- Configurable via General Packet but Thetis sends the default.
         HPSDR_HP_CMD_PORT : natural := 1027;
+
+        -- UDP destination port that selects the DDC Specific channel.
+        -- Default 1025 per Orion2 V4.0 (Hermes legacy) layout - what
+        -- Thetis-with-Orion2 actually sends.  This is the inverse of
+        -- the V4.4 spec ports table; see memory note
+        -- feedback_hpsdr_orion2_port_mapping.  1444-byte payload with
+        -- per-DDC enable bitmap + sample rate fields.
+        HPSDR_DDC_SPEC_PORT : natural := 1025;
+
+        -- Additional HPSDR C&C ports recognised for watchdog-refresh only
+        -- (no payload routed yet): DUC Specific (1026, TX/CW config),
+        -- DUC0 I&Q (1029, TX samples).  Each emits hpsdr_cc_pulse and
+        -- is then discarded.
+        HPSDR_DUC_SPEC_PORT : natural := 1026;
+        HPSDR_DUC_IQ_PORT   : natural := 1029;
 
         -- UDP destination port that selects the DHCP-client channel.
         -- DHCP servers respond to clients on port 68 (BOOTP-client).
@@ -101,6 +133,15 @@ entity udp_rx_handler is
         hpsdr_hp_cmd_eop     : out std_logic;
         hpsdr_hp_cmd_length  : out std_logic_vector(13 downto 0); -- payload bytes
 
+        -- HPSDR DDC Specific byte stream output (UDP/1025 payload only).
+        -- Consumed by hpsdr_ddc_spec_handler walker to extract DDC2's
+        -- sample-rate selection.
+        hpsdr_ddc_spec_data   : out std_logic_vector(7 downto 0);
+        hpsdr_ddc_spec_valid  : out std_logic;
+        hpsdr_ddc_spec_sop    : out std_logic;
+        hpsdr_ddc_spec_eop    : out std_logic;
+        hpsdr_ddc_spec_length : out std_logic_vector(13 downto 0); -- payload bytes
+
         -- DHCP byte stream output (UDP payload only).
         dhcp_data         : out std_logic_vector(7 downto 0);
         dhcp_valid        : out std_logic;
@@ -114,9 +155,15 @@ entity udp_rx_handler is
         dst_port          : out std_logic_vector(15 downto 0);
 
         -- Observability: one-cycle pulse on each accepted header.
-        hpsdr_pulse       : out std_logic;
-        hpsdr_hp_cmd_pulse: out std_logic;
-        dhcp_pulse        : out std_logic
+        hpsdr_pulse         : out std_logic;
+        hpsdr_hp_cmd_pulse  : out std_logic;
+        hpsdr_ddc_spec_pulse: out std_logic;
+        dhcp_pulse          : out std_logic;
+
+        -- One-cycle pulse on any recognised HPSDR C&C dst port
+        -- (1024/1025/1026/1027/1029).  Feeds the HP Command handler's
+        -- watchdog so non-1027 C&C keeps run alive (spec p.7-8).
+        hpsdr_cc_pulse    : out std_logic
     );
 end entity;
 
@@ -126,19 +173,29 @@ architecture arch of udp_rx_handler is
 
     -- Pre-resolve the dst-port comparison constants once at elaboration so
     -- the byte-3 classify is a plain vector compare.
-    constant HPSDR_PORT_VEC        : std_logic_vector(15 downto 0)
-        := std_logic_vector(to_unsigned(HPSDR_PORT,        16));
-    constant HPSDR_HP_CMD_PORT_VEC : std_logic_vector(15 downto 0)
-        := std_logic_vector(to_unsigned(HPSDR_HP_CMD_PORT, 16));
-    constant DHCP_PORT_VEC         : std_logic_vector(15 downto 0)
-        := std_logic_vector(to_unsigned(DHCP_PORT,         16));
+    constant HPSDR_PORT_VEC          : std_logic_vector(15 downto 0)
+        := std_logic_vector(to_unsigned(HPSDR_PORT,          16));
+    constant HPSDR_HP_CMD_PORT_VEC   : std_logic_vector(15 downto 0)
+        := std_logic_vector(to_unsigned(HPSDR_HP_CMD_PORT,   16));
+    constant HPSDR_DDC_SPEC_PORT_VEC : std_logic_vector(15 downto 0)
+        := std_logic_vector(to_unsigned(HPSDR_DDC_SPEC_PORT, 16));
+    constant HPSDR_DUC_SPEC_PORT_VEC : std_logic_vector(15 downto 0)
+        := std_logic_vector(to_unsigned(HPSDR_DUC_SPEC_PORT, 16));
+    constant HPSDR_DUC_IQ_PORT_VEC   : std_logic_vector(15 downto 0)
+        := std_logic_vector(to_unsigned(HPSDR_DUC_IQ_PORT,   16));
+    constant DHCP_PORT_VEC           : std_logic_vector(15 downto 0)
+        := std_logic_vector(to_unsigned(DHCP_PORT,           16));
 
-    -- Classified destination of the in-flight packet.
-    type kind_t is (K_NONE, K_HPSDR, K_HPSDR_HP_CMD, K_DHCP);
+    -- Classified destination of the in-flight packet.  K_HPSDR_CC is the
+    -- catch-all for HPSDR C&C dst ports without a dedicated forward
+    -- channel (1026/1029): we emit hpsdr_cc_pulse and discard.  1025 has
+    -- its own K_HPSDR_DDC_SPEC + S_FWD_HPSDR_DDC_SPEC pair.
+    type kind_t is (K_NONE, K_HPSDR, K_HPSDR_HP_CMD, K_HPSDR_DDC_SPEC,
+                    K_HPSDR_CC, K_DHCP);
     signal kind        : kind_t := K_NONE;
 
     type state_t is (S_HDR, S_FWD_HPSDR, S_FWD_HPSDR_HP_CMD,
-                     S_FWD_DHCP, S_DISCARD);
+                     S_FWD_HPSDR_DDC_SPEC, S_FWD_DHCP, S_DISCARD);
     signal state : state_t := S_HDR;
 
     -- 4 bits cover hdr_byte_idx 0..7 plus margin.
@@ -169,12 +226,24 @@ architecture arch of udp_rx_handler is
     signal hp_cmd_eop_r   : std_logic                    := '0';
     signal hp_cmd_pulse_r : std_logic                    := '0';
 
+    -- Registered outputs (HPSDR DDC Specific / port 1025)
+    signal ddc_spec_data_r  : std_logic_vector(7 downto 0) := (others => '0');
+    signal ddc_spec_valid_r : std_logic                    := '0';
+    signal ddc_spec_sop_r   : std_logic                    := '0';
+    signal ddc_spec_eop_r   : std_logic                    := '0';
+    signal ddc_spec_pulse_r : std_logic                    := '0';
+
     -- Registered outputs (DHCP)
     signal dhcp_data_r   : std_logic_vector(7 downto 0)  := (others => '0');
     signal dhcp_valid_r  : std_logic                     := '0';
     signal dhcp_sop_r    : std_logic                     := '0';
     signal dhcp_eop_r    : std_logic                     := '0';
     signal dhcp_pulse_r  : std_logic                     := '0';
+
+    -- Generic HPSDR C&C activity pulse (watchdog feed); fires for any of
+    -- 1024/1025/1026/1027/1029 on the same boundary as the per-channel
+    -- pulses above.
+    signal hpsdr_cc_pulse_r : std_logic := '0';
 
 begin
 
@@ -192,12 +261,21 @@ begin
     hpsdr_hp_cmd_length<= pay_len_r;
     hpsdr_hp_cmd_pulse <= hp_cmd_pulse_r;
 
+    hpsdr_ddc_spec_data   <= ddc_spec_data_r;
+    hpsdr_ddc_spec_valid  <= ddc_spec_valid_r;
+    hpsdr_ddc_spec_sop    <= ddc_spec_sop_r;
+    hpsdr_ddc_spec_eop    <= ddc_spec_eop_r;
+    hpsdr_ddc_spec_length <= pay_len_r;
+    hpsdr_ddc_spec_pulse  <= ddc_spec_pulse_r;
+
     dhcp_data          <= dhcp_data_r;
     dhcp_valid         <= dhcp_valid_r;
     dhcp_sop           <= dhcp_sop_r;
     dhcp_eop           <= dhcp_eop_r;
     dhcp_length        <= pay_len_r;
     dhcp_pulse         <= dhcp_pulse_r;
+
+    hpsdr_cc_pulse     <= hpsdr_cc_pulse_r;
 
     src_port           <= src_port_r;
     dst_port           <= dst_port_r;
@@ -227,11 +305,17 @@ begin
             hp_cmd_sop_r   <= '0';
             hp_cmd_eop_r   <= '0';
             hp_cmd_pulse_r <= '0';
+            ddc_spec_data_r  <= (others => '0');
+            ddc_spec_valid_r <= '0';
+            ddc_spec_sop_r   <= '0';
+            ddc_spec_eop_r   <= '0';
+            ddc_spec_pulse_r <= '0';
             dhcp_data_r    <= (others => '0');
             dhcp_valid_r   <= '0';
             dhcp_sop_r     <= '0';
             dhcp_eop_r     <= '0';
             dhcp_pulse_r   <= '0';
+            hpsdr_cc_pulse_r <= '0';
         elsif rising_edge(clock) then
             -- One-cycle defaults
             hpsdr_valid_r  <= '0';
@@ -242,10 +326,15 @@ begin
             hp_cmd_sop_r   <= '0';
             hp_cmd_eop_r   <= '0';
             hp_cmd_pulse_r <= '0';
+            ddc_spec_valid_r <= '0';
+            ddc_spec_sop_r   <= '0';
+            ddc_spec_eop_r   <= '0';
+            ddc_spec_pulse_r <= '0';
             dhcp_valid_r   <= '0';
             dhcp_sop_r     <= '0';
             dhcp_eop_r     <= '0';
             dhcp_pulse_r   <= '0';
+            hpsdr_cc_pulse_r <= '0';
 
             case state is
 
@@ -286,6 +375,11 @@ begin
                                 n_kind := K_HPSDR;
                             elsif n_dst_port = HPSDR_HP_CMD_PORT_VEC then
                                 n_kind := K_HPSDR_HP_CMD;
+                            elsif n_dst_port = HPSDR_DDC_SPEC_PORT_VEC then
+                                n_kind := K_HPSDR_DDC_SPEC;
+                            elsif n_dst_port = HPSDR_DUC_SPEC_PORT_VEC or
+                                  n_dst_port = HPSDR_DUC_IQ_PORT_VEC then
+                                n_kind := K_HPSDR_CC;
                             elsif n_dst_port = DHCP_PORT_VEC then
                                 n_kind := K_DHCP;
                             else
@@ -304,15 +398,26 @@ begin
                             -- Still pulse on detection so the LED catches a
                             -- zero-payload probe.
                             case n_kind is
-                                when K_HPSDR        => hpsdr_pulse_r  <= '1';
-                                when K_HPSDR_HP_CMD => hp_cmd_pulse_r <= '1';
-                                when K_DHCP         => dhcp_pulse_r   <= '1';
-                                when others         => null;
+                                when K_HPSDR          =>
+                                    hpsdr_pulse_r    <= '1';
+                                    hpsdr_cc_pulse_r <= '1';
+                                when K_HPSDR_HP_CMD   =>
+                                    hp_cmd_pulse_r   <= '1';
+                                    hpsdr_cc_pulse_r <= '1';
+                                when K_HPSDR_DDC_SPEC =>
+                                    ddc_spec_pulse_r <= '1';
+                                    hpsdr_cc_pulse_r <= '1';
+                                when K_HPSDR_CC       =>
+                                    hpsdr_cc_pulse_r <= '1';
+                                when K_DHCP           =>
+                                    dhcp_pulse_r     <= '1';
+                                when others           => null;
                             end case;
                             state      <= S_HDR;
                             n_byte_idx := (others => '0');
                         elsif n_kind = K_HPSDR or n_kind = K_HPSDR_HP_CMD or
-                              n_kind = K_DHCP then
+                              n_kind = K_HPSDR_DDC_SPEC or
+                              n_kind = K_HPSDR_CC or n_kind = K_DHCP then
                             -- Compute payload length = IP payload bytes - 8.
                             if unsigned(rx_length) >= to_unsigned(UDP_HDR_BYTES, rx_length'length) then
                                 payload_len := unsigned(rx_length)
@@ -324,14 +429,30 @@ begin
                             sop_pending <= '1';
                             case n_kind is
                             when K_HPSDR =>
-                                hpsdr_pulse_r <= '1';
-                                state         <= S_FWD_HPSDR;
+                                hpsdr_pulse_r    <= '1';
+                                hpsdr_cc_pulse_r <= '1';
+                                state            <= S_FWD_HPSDR;
                             when K_HPSDR_HP_CMD =>
-                                hp_cmd_pulse_r <= '1';
-                                state          <= S_FWD_HPSDR_HP_CMD;
+                                hp_cmd_pulse_r   <= '1';
+                                hpsdr_cc_pulse_r <= '1';
+                                state            <= S_FWD_HPSDR_HP_CMD;
+                            when K_HPSDR_DDC_SPEC =>
+                                -- Dedicated forward channel for the DDC
+                                -- Specific command; cc_pulse still fires
+                                -- so the HP Command handler's watchdog
+                                -- refreshes on 1025 traffic too.
+                                ddc_spec_pulse_r <= '1';
+                                hpsdr_cc_pulse_r <= '1';
+                                state            <= S_FWD_HPSDR_DDC_SPEC;
+                            when K_HPSDR_CC =>
+                                -- No dedicated forward channel for the
+                                -- remaining DUC C&C ports (1026, 1029);
+                                -- pulse for the watchdog and drop.
+                                hpsdr_cc_pulse_r <= '1';
+                                state            <= S_DISCARD;
                             when others =>  -- K_DHCP
-                                dhcp_pulse_r  <= '1';
-                                state         <= S_FWD_DHCP;
+                                dhcp_pulse_r     <= '1';
+                                state            <= S_FWD_DHCP;
                             end case;
                             n_byte_idx := (others => '0');
                         else
@@ -387,6 +508,26 @@ begin
                     if rx_eop = '1' then
                         hp_cmd_eop_r <= '1';
                         state        <= S_HDR;
+                    end if;
+                end if;
+
+            -- --------------------------------------------------------------
+            -- Forward bytes to HPSDR DDC Specific channel (UDP/1025).
+            -- Mirror of S_FWD_HPSDR_HP_CMD for the hpsdr_ddc_spec_* port
+            -- set; payload is the 1444-byte Rx_specific command per the
+            -- orion2 V4.0 layout (per-DDC enable bitmap + sample rates).
+            -- --------------------------------------------------------------
+            when S_FWD_HPSDR_DDC_SPEC =>
+                if rx_valid = '1' then
+                    ddc_spec_data_r  <= rx_data;
+                    ddc_spec_valid_r <= '1';
+                    if sop_pending = '1' then
+                        ddc_spec_sop_r <= '1';
+                        sop_pending    <= '0';
+                    end if;
+                    if rx_eop = '1' then
+                        ddc_spec_eop_r <= '1';
+                        state          <= S_HDR;
                     end if;
                 end if;
 

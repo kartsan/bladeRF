@@ -97,7 +97,8 @@ architecture arch of hpsdr_hp_status_sender is
     signal send_pulse_r : std_logic := '0';
 
     -- Byte idx of the 102-byte frame: shared header for 0..41, HP Status
-    -- payload (V4.4 spec p.46) for 42..101 - all zero except the sequence.
+    -- payload (V4.4 spec p.46) for 42..101.  Sequence at bytes 0..3,
+    -- PLL-locked (byte 4 bit 4) hardwired set; everything else zero.
     function status_byte_at(
         idx       : natural;
         host_mac  : std_logic_vector(47 downto 0);
@@ -121,6 +122,11 @@ architecture arch of hpsdr_hp_status_sender is
             when 1 => return std_logic_vector(seq(23 downto 16));
             when 2 => return std_logic_vector(seq(15 downto  8));
             when 3 => return std_logic_vector(seq( 7 downto  0));
+            -- byte 4 bit 4 = 10 MHz reference PLL locked (V4.4 spec
+            -- p.46/47).  Some clients (Thetis) wait for this bit to
+            -- settle before fully engaging; the bladeRF reference is
+            -- always stable, so report locked from the first packet.
+            when 4 => return x"10";
             when others => return x"00";
         end case;
     end function;

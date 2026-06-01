@@ -209,6 +209,27 @@ architecture hpsdr_bladerf of bladerf is
     signal hpsdr_hp_cmd_pulse       : std_logic;
     signal hpsdr_hp_cmd_decode_pulse: std_logic;
 
+    -- udp_rx_handler -> hpsdr_ddc_spec_handler (UDP/1025 DDC Specific
+    -- payload).  Walker extracts DDC2 sample rate into hpsdr_rate_id_gray
+    -- (held stable between commands, async wrt rx_clock).
+    signal hpsdr_ddc_spec_rx_data   : std_logic_vector(7 downto 0);
+    signal hpsdr_ddc_spec_rx_valid  : std_logic;
+    signal hpsdr_ddc_spec_rx_sop    : std_logic;
+    signal hpsdr_ddc_spec_rx_eop    : std_logic;
+    signal hpsdr_ddc_spec_rx_length : std_logic_vector(13 downto 0);
+    signal hpsdr_ddc_spec_pulse     : std_logic;
+
+    -- Gray-coded DDC2 sample rate selector, driven by hpsdr_ddc_spec_handler
+    -- in the fx3_pclk_pll domain, synced + decoded inside hpsdr_ddc on
+    -- rx_clock.  Boot default "000" = 48 kHz (decim 256).
+    signal hpsdr_rate_id_gray       : std_logic_vector(2 downto 0);
+
+    -- Generic HPSDR C&C activity pulse from udp_rx_handler: fires for any
+    -- recognised C&C dst port (1024/1025/1026/1027/1029).  Feeds the HP
+    -- Command handler's watchdog so non-1027 traffic keeps host_run alive
+    -- (V4.4 spec p.7-8 "any C&C packet ... at least every second").
+    signal hpsdr_cc_pulse           : std_logic;
+
     -- hpsdr_hp_cmd_handler -> HP Status / DDC IQ senders (engagement state).
     -- hpsdr_host_run/ptt0 = HP Command byte 4 bits 0/1.  hpsdr_hp_cmd_host_port
     -- = HP Command's UDP source ephemeral, the dst port replies must target
@@ -948,6 +969,12 @@ begin
             hpsdr_hp_cmd_eop   => hpsdr_hp_cmd_rx_eop,
             hpsdr_hp_cmd_length=> hpsdr_hp_cmd_rx_length,
 
+            hpsdr_ddc_spec_data   => hpsdr_ddc_spec_rx_data,
+            hpsdr_ddc_spec_valid  => hpsdr_ddc_spec_rx_valid,
+            hpsdr_ddc_spec_sop    => hpsdr_ddc_spec_rx_sop,
+            hpsdr_ddc_spec_eop    => hpsdr_ddc_spec_rx_eop,
+            hpsdr_ddc_spec_length => hpsdr_ddc_spec_rx_length,
+
             dhcp_data          => dhcp_rx_data,
             dhcp_valid         => dhcp_rx_valid,
             dhcp_sop           => dhcp_rx_sop,
@@ -957,9 +984,12 @@ begin
             src_port           => udp_src_port,
             dst_port           => udp_dst_port,
 
-            hpsdr_pulse        => hpsdr_pulse,
-            hpsdr_hp_cmd_pulse => hpsdr_hp_cmd_pulse,
-            dhcp_pulse         => dhcp_rx_pulse
+            hpsdr_pulse          => hpsdr_pulse,
+            hpsdr_hp_cmd_pulse   => hpsdr_hp_cmd_pulse,
+            hpsdr_ddc_spec_pulse => hpsdr_ddc_spec_pulse,
+            dhcp_pulse           => dhcp_rx_pulse,
+
+            hpsdr_cc_pulse     => hpsdr_cc_pulse
         );
 
     -- ========================================================================
@@ -1090,12 +1120,36 @@ begin
 
             udp_src_port     => udp_src_port,
 
+            cc_activity_pulse=> hpsdr_cc_pulse,
+
             host_run         => hpsdr_host_run,
             host_ptt0        => hpsdr_host_ptt0,
             host_port        => hpsdr_hp_cmd_host_port,
             host_rx0_freq    => host_rx0_freq,
 
             hp_cmd_pulse     => hpsdr_hp_cmd_decode_pulse
+        );
+
+    -- ========================================================================
+    -- HPSDR P2 DDC Specific (Rx_specific) command walker.  Sits on
+    -- udp_rx_handler's hpsdr_ddc_spec_* channel (UDP/1025) and extracts
+    -- DDC2's sample rate from byte 31 of the payload, gated by Rx2 being
+    -- enabled at byte 7.  Output is a gray-coded 3-bit selector that
+    -- hpsdr_ddc syncs into rx_clock and decodes to a CIC decimation.
+    -- See project_thetis_ddc_role_mapping memory note for the DDC<->RX
+    -- assignment and feedback_hpsdr_orion2_port_mapping for the byte layout.
+    -- ========================================================================
+    U_hpsdr_ddc_spec_handler : entity work.hpsdr_ddc_spec_handler
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            rx_data      => hpsdr_ddc_spec_rx_data,
+            rx_valid     => hpsdr_ddc_spec_rx_valid,
+            rx_sop       => hpsdr_ddc_spec_rx_sop,
+            rx_eop       => hpsdr_ddc_spec_rx_eop,
+
+            rate_id_gray => hpsdr_rate_id_gray
         );
 
     -- ========================================================================
@@ -1706,22 +1760,29 @@ begin
     -- AD9361 is actually streaming (NIOS autonomous bring-up lands next; until
     -- then enable RX at 12.288 MSPS via bladeRF-cli to exercise it).
     -- ========================================================================
+    -- AD9361 delivers 12-bit signed samples sign-extended into a 16-bit
+    -- container -- effective swing only +/-2048 of a +/-32768 field.  Shift
+    -- left by 4 so the 12-bit MSB aligns with the 16-bit MSB; CIC then sees
+    -- proper full-scale input and IQ on the wire is 24 dB louder (no
+    -- precision loss -- the bottom 4 bits were always zero).
     U_hpsdr_ddc : entity work.hpsdr_ddc
         generic map (
-            IN_WIDTH   => 16,
-            OUT_WIDTH  => 24,
-            STAGES     => 5,
-            DECIMATION => 256          -- 12.288 MHz / 48 kHz
+            IN_WIDTH       => 16,
+            OUT_WIDTH      => 24,
+            STAGES         => 5,
+            MIN_DECIMATION => 8,           -- 12.288 MHz / 1536 kHz
+            MAX_DECIMATION => 256          -- 12.288 MHz / 48 kHz (boot default)
         )
         port map (
-            clock     => rx_clock,
-            reset     => rx_reset,
-            in_i      => adc_streams(0).data_i,
-            in_q      => adc_streams(0).data_q,
-            in_valid  => adc_streams(0).data_v,
-            out_i     => ddc_out_i,
-            out_q     => ddc_out_q,
-            out_valid => ddc_out_valid
+            clock        => rx_clock,
+            reset        => rx_reset,
+            rate_id_gray => hpsdr_rate_id_gray,  -- async; synced internally
+            in_i         => shift_left(adc_streams(0).data_i, 4),
+            in_q         => shift_left(adc_streams(0).data_q, 4),
+            in_valid     => adc_streams(0).data_v,
+            out_i        => ddc_out_i,
+            out_q        => ddc_out_q,
+            out_valid    => ddc_out_valid
         );
 
     ddc_fifo_wrdata <= std_logic_vector(ddc_out_i) & std_logic_vector(ddc_out_q);

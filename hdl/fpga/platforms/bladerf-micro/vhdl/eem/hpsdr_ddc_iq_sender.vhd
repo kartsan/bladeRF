@@ -103,7 +103,7 @@ architecture arch of hpsdr_ddc_iq_sender is
     constant UDP_LEN_VEC : std_logic_vector(15 downto 0)
         := std_logic_vector(to_unsigned(UDP_LEN, 16));
 
-    constant HPSDR_DDC_PORT      : std_logic_vector(15 downto 0) := x"040b"; -- 1035
+    constant HPSDR_DDC_PORT      : std_logic_vector(15 downto 0) := x"040d"; -- 1035
     constant BITS_PER_SAMPLE     : std_logic_vector(15 downto 0) := x"0018"; -- 24
     constant SAMPLES_PER_FRAME   : std_logic_vector(15 downto 0) := x"00ee"; -- 238
 
