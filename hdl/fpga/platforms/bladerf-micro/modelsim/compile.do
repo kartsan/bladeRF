@@ -26,6 +26,7 @@ vcom -work nuand -2008 ../vhdl/eem/ip_hdr_checksum.vhd
 vcom -work nuand -2008 ../vhdl/eem/hpsdr_discovery_responder.vhd
 vcom -work nuand -2008 ../vhdl/eem/hpsdr_hp_status_sender.vhd
 vcom -work nuand -2008 ../vhdl/eem/hpsdr_hp_cmd_handler.vhd
+vcom -work nuand -2008 ../vhdl/eem/hpsdr_ddc_spec_handler.vhd
 vcom -work nuand -2008 ../vhdl/eem/hpsdr_ddc_iq_sender.vhd
 vcom -work nuand -2008 ../vhdl/eem/tx_arbiter.vhd
 vcom -work nuand -2008 ../vhdl/bladerf-hosted.vhd
