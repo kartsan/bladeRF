@@ -70,6 +70,23 @@
 /* Native AD9361 RX rate: matches U_hpsdr_ddc DECIMATION=256 -> 48 kHz, and is
  * above the AD9361 decimation-FIR floor so a single SAMPLERATE command works. */
 #  define HPSDR_RX_SAMPLERATE 12288000u
+/* Virtual-transverter LO offset (Hz, signed).  Added to the IF frequency Thetis
+ * sends in the HP Command before commanding the AD9361, so the radio behaves as
+ * if a transverter sits between it and the antenna.  Lets one work above the
+ * 61.44 MHz Thetis NCO half-Nyquist cap, and around the 70 MHz bladeRF RX
+ * floor.  Thetis's own Setup -> Transverter dialog must be set to the same LO
+ * so its dial display reads the true RF frequency.  Set to 0 to disable.
+ *
+ * Examples (Thetis dial range 0..61.43 MHz):
+ *   HPSDR_LO_OFFSET_HZ =  100000000 -> covers 100..161.44 MHz (2 m band)
+ *   HPSDR_LO_OFFSET_HZ =  400000000 -> covers 400..461.44 MHz (70 cm band)
+ *   HPSDR_LO_OFFSET_HZ = 1090000000 -> covers 1090..1151.44 MHz (ADS-B / 23 cm)
+ *
+ * The post-offset frequency still has to land in the AD9361's 70 MHz..6 GHz
+ * range or _modify_spdt_bits_by_freq() returns BLADERF_ERR_INVAL. */
+#  ifndef HPSDR_LO_OFFSET_HZ
+#    define HPSDR_LO_OFFSET_HZ 400000000
+#  endif
 #endif
 
 #define BLADERF_DEVICE_NAME "Nuand bladeRF 2.0 Micro"
@@ -492,45 +509,84 @@ int main(void)
             if (!hpsdr_brought_up &&
                 (IORD_ALTERA_AVALON_PIO_DATA(HPSDR_STATUS_BASE) &
                  HPSDR_STATUS_HOST_VALID)) {
-                DBG("HPSDR: discovery seen, RX0 bring-up\n");
-                rfic_command_write_immed(BLADERF_RFIC_COMMAND_INIT,
-                                         RFIC_SYSTEM_CHANNEL,
-                                         BLADERF_RFIC_INIT_STATE_ON);
-                rfic_command_write_immed(BLADERF_RFIC_COMMAND_SAMPLERATE,
-                                         BLADERF_CHANNEL_RX(0),
-                                         HPSDR_RX_SAMPLERATE);
-                rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAINMODE,
-                                         BLADERF_CHANNEL_RX(0),
-                                         BLADERF_GAIN_MGC);
-                rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAIN,
-                                         BLADERF_CHANNEL_RX(0), 40);
-                rfic_command_write_immed(BLADERF_RFIC_COMMAND_ENABLE,
-                                         BLADERF_CHANNEL_RX(0), 1);
+                bool ok;
+                DBG("HPSDR: discovery seen, RX0 bring-up start\n");
+
+                ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_INIT,
+                                              RFIC_SYSTEM_CHANNEL,
+                                              BLADERF_RFIC_INIT_STATE_ON);
+                DBG("HPSDR:  INIT       -> %s\n", ok ? "ok" : "FAIL");
+
+                ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_SAMPLERATE,
+                                              BLADERF_CHANNEL_RX(0),
+                                              HPSDR_RX_SAMPLERATE);
+                DBG("HPSDR:  SAMPLERATE -> %s\n", ok ? "ok" : "FAIL");
+
+                ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAINMODE,
+                                              BLADERF_CHANNEL_RX(0),
+                                              BLADERF_GAIN_MGC);
+                DBG("HPSDR:  GAINMODE   -> %s\n", ok ? "ok" : "FAIL");
+
+                ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAIN,
+                                              BLADERF_CHANNEL_RX(0), 40);
+                DBG("HPSDR:  GAIN       -> %s\n", ok ? "ok" : "FAIL");
+
+                ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_ENABLE,
+                                              BLADERF_CHANNEL_RX(0), 1);
+                DBG("HPSDR:  ENABLE     -> %s\n", ok ? "ok" : "FAIL");
+
                 hpsdr_brought_up = true;
+                DBG("HPSDR: bring-up done\n");
             }
 #endif
 
 #if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_FREQ_BASE)
-            /* HPSDR RX0 retune poll.  The hpsdr_freq PIO carries the dial
-             * frequency (Hz) latched by hpsdr_hp_cmd_handler and crossed into
-             * this clock domain bit-by-bit, so a multi-bit value can tear for a
-             * couple of cycles.  Act only on a sample that is stable across two
-             * consecutive reads and differs from the last applied (non-zero)
-             * value -- retunes are rare (user moving the dial), so polling here
-             * in the idle branch is plenty fast. */
+            /* HPSDR RX0 retune poll.  The hpsdr_freq PIO carries the HP
+             * Command phase word (bytes 9..12 big-endian) latched by
+             * hpsdr_hp_cmd_handler and crossed into this clock domain
+             * bit-by-bit, so a multi-bit value can tear for a couple of cycles.
+             * Act only on a sample that is stable across two consecutive reads
+             * and differs from the last applied (non-zero) value -- retunes
+             * are rare (user moving the dial), so polling here in the idle
+             * branch is plenty fast.
+             *
+             * Discovery advertises FREQ_PHASE=0x01 (Orion MkII default), so
+             * the mailbox is a 32-bit NCO phase word, NOT Hz.  Convert before
+             * commanding the AD9361:  freq_Hz = phase * 122.88e6 / 2^32, where
+             * 122.88 MHz is the Orion MkII DSP clock Thetis derives the phase
+             * from.  Max input phase = 2^32-1 -> max output ~122.88 MHz, fits
+             * in uint32_t.  hpsdr_freq_applied still tracks the phase word so
+             * the change-detect compares the raw PIO sample, and is updated
+             * even when the AD9361 rejects (e.g. <47 MHz floor) so the same
+             * out-of-range value isn't replayed every poll -- the next dial
+             * change retrigger the attempt. */
             {
-                uint32_t freq = IORD_ALTERA_AVALON_PIO_DATA(HPSDR_FREQ_BASE);
+                uint32_t phase = IORD_ALTERA_AVALON_PIO_DATA(HPSDR_FREQ_BASE);
 
-                if (freq == hpsdr_freq_prev && freq != hpsdr_freq_applied &&
-                    freq != 0) {
-                    if (rfic_command_write_immed(BLADERF_RFIC_COMMAND_FREQUENCY,
-                                                 BLADERF_CHANNEL_RX(0), freq)) {
-                        hpsdr_freq_applied = freq;
-                        DBG("HPSDR: RX0 retune to %u Hz\n", freq);
-                    }
+                if (phase == hpsdr_freq_prev && phase != hpsdr_freq_applied &&
+                    phase != 0) {
+                    uint32_t if_hz = (uint32_t)
+                        (((uint64_t)phase * 122880000ULL) >> 32);
+                    /* Virtual-transverter offset: signed add in 64-bit so a
+                     * UHF/microwave tune (>4.29 GHz) doesn't overflow.  Clamp
+                     * negative results to 0; the RFIC layer rejects sub-70 MHz
+                     * anyway via _modify_spdt_bits_by_freq. */
+                    int64_t  signed_tune = (int64_t)if_hz +
+                                           (int32_t)HPSDR_LO_OFFSET_HZ;
+                    uint64_t tune_hz     = (signed_tune < 0)
+                                           ? 0 : (uint64_t)signed_tune;
+                    bool ok = rfic_command_write_immed(
+                                BLADERF_RFIC_COMMAND_FREQUENCY,
+                                BLADERF_CHANNEL_RX(0),
+                                tune_hz);
+
+                    hpsdr_freq_applied = phase;
+                    DBG("HPSDR: RX0 retune phase=%x IF=%x tune=%x %s\n",
+                        phase, if_hz, (uint32_t)tune_hz,
+                        ok ? "ok" : "REJECTED");
                 }
 
-                hpsdr_freq_prev = freq;
+                hpsdr_freq_prev = phase;
             }
 #endif
         }
