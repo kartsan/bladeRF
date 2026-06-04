@@ -47,13 +47,56 @@
 #include "pkt_legacy.h"
 #include "debug.h"
 
-/* HPSDR RX0 retune mailbox + autonomous bring-up.  Fenced on HPSDR_FREQ_BASE,
- * which the BSP only defines for the hpsdr revision (the hpsdr_freq PIO exists
- * only in that revision's Qsys), so this entire block compiles out for every
- * other micro revision that shares this source file. */
-#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_FREQ_BASE)
+/* HPSDR command-mailbox dispatcher + autonomous bring-up.  Fenced on
+ * HPSDR_CMD_OP_BASE, which the BSP only defines for the hpsdr revision
+ * (the hpsdr_cmd_* PIOs exist only in that revision's Qsys), so this
+ * entire block compiles out for every other micro revision that shares
+ * this source file. */
+#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_CMD_OP_BASE)
 #  include "altera_avalon_pio_regs.h"
 #  include "devices_rfic.h"
+/* hpsdr_cmd_op PIO bit-layout (matches hpsdr_cmd_mux.vhd):
+ *   [7:0]   opcode  (BLADERF_RFIC_COMMAND_* from bladerf2_common.h)
+ *   [10:8]  channel (0=RX0, 1=RX1, 2=TX0, 3=TX1, 7=SYSTEM)
+ *   [11]    rw      (0=write, 1=read)
+ *   [15:12] seq     (strobe; fabric increments on every commit)
+ *
+ * hpsdr_cmd_status PIO bit-layout (driven by this code):
+ *   [3:0]   done_seq -- the seq we just serviced
+ *   [4]     err      -- the rfic_command_* call returned false
+ *   [7:5]   reserved
+ */
+#  define HPSDR_CMD_OP_OPCODE(x)  ((uint8_t)((x) & 0xFF))
+#  define HPSDR_CMD_OP_CHANNEL(x) ((uint8_t)(((x) >> 8) & 0x7))
+#  define HPSDR_CMD_OP_RW(x)      ((((x) >> 11) & 0x1) != 0)
+#  define HPSDR_CMD_OP_SEQ(x)     ((uint8_t)(((x) >> 12) & 0xF))
+#  define HPSDR_CMD_STATUS_ERR    (1u << 4)
+
+/* Map the 3-bit hpsdr_cmd_op channel field to a bladerf_channel handle. */
+static inline bladerf_channel hpsdr_decode_channel(uint8_t ch)
+{
+    switch (ch) {
+        case 0:  return BLADERF_CHANNEL_RX(0);
+        case 1:  return BLADERF_CHANNEL_RX(1);
+        case 2:  return BLADERF_CHANNEL_TX(0);
+        case 3:  return BLADERF_CHANNEL_TX(1);
+        case 7:  return RFIC_SYSTEM_CHANNEL;
+        default: return RFIC_SYSTEM_CHANNEL;
+    }
+}
+
+/* Virtual-transverter LO offset applied to FREQUENCY writes (see
+ * HPSDR_LO_OFFSET_HZ below).  Discovery advertises FREQ_PHASE=0x01 (Orion
+ * MkII), so cmd_data_in is a 32-bit NCO phase word, NOT Hz.  Convert with
+ * freq_Hz = phase * 122.88e6 / 2^32 (122.88 MHz = Orion MkII DSP clock),
+ * then add the transverter LO.  Clamp negative results to 0; the RFIC
+ * layer rejects sub-70 MHz anyway via _modify_spdt_bits_by_freq. */
+static inline uint64_t hpsdr_phase_to_tune_hz(uint32_t phase, int32_t lo_offset)
+{
+    uint32_t if_hz       = (uint32_t)(((uint64_t)phase * 122880000ULL) >> 32);
+    int64_t  signed_tune = (int64_t)if_hz + (int64_t)lo_offset;
+    return (signed_tune < 0) ? 0u : (uint64_t)signed_tune;
+}
 /* Bring RX0 online with no host / bladeRF-cli session.  Set to 0 to revert to
  * purely host-driven bring-up for bench debugging.  The bring-up runs from the
  * main loop (NOT before it) and is triggered by an HPSDR client discovery (the
@@ -180,11 +223,14 @@ int main(void)
 
     volatile bool have_request = false;
 
-#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_FREQ_BASE)
-    /* HPSDR RX0 retune mailbox state.  prev = previous raw PIO sample (for the
-     * 2-poll stability filter); applied = last frequency pushed to the RFIC. */
-    uint32_t hpsdr_freq_prev    = 0;
-    uint32_t hpsdr_freq_applied = 0;
+#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_CMD_OP_BASE)
+    /* HPSDR command-mailbox dispatcher state.  prev_op = previous raw PIO
+     * sample (for the 2-poll tearing filter); last_seq = the seq value of
+     * the most recently dispatched request (initialised to 0 -- matches the
+     * fabric's reset state, so the first real seq=1 from the mux trips the
+     * delta and dispatches). */
+    uint16_t hpsdr_cmd_prev_op = 0;
+    uint8_t  hpsdr_cmd_last_seq = 0;
 #  if HPSDR_AUTONOMOUS_RX_INIT
     bool     hpsdr_brought_up   = false;  /* autonomous bring-up done (one-shot) */
 #  endif
@@ -497,7 +543,7 @@ int main(void)
                 }
             }
 
-#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_FREQ_BASE) && HPSDR_AUTONOMOUS_RX_INIT
+#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_CMD_OP_BASE) && HPSDR_AUTONOMOUS_RX_INIT
             /* Autonomous RX0 bring-up, one-shot, triggered by an HPSDR client
              * discovery (hpsdr_status host_valid).  Runs here -- in the main
              * loop, not before it -- so the command UART stays responsive for a
@@ -505,7 +551,7 @@ int main(void)
              * standalone Ethernet operation, so a USB libbladeRF session never
              * trips this and we never fight its RFIC init.  No FREQUENCY: the
              * radio parks at the AD9361 init default until Thetis's first HP
-             * Command, which the poller below then applies. */
+             * Command, which the dispatcher below then applies. */
             if (!hpsdr_brought_up &&
                 (IORD_ALTERA_AVALON_PIO_DATA(HPSDR_STATUS_BASE) &
                  HPSDR_STATUS_HOST_VALID)) {
@@ -540,53 +586,75 @@ int main(void)
             }
 #endif
 
-#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_FREQ_BASE)
-            /* HPSDR RX0 retune poll.  The hpsdr_freq PIO carries the HP
-             * Command phase word (bytes 9..12 big-endian) latched by
-             * hpsdr_hp_cmd_handler and crossed into this clock domain
-             * bit-by-bit, so a multi-bit value can tear for a couple of cycles.
-             * Act only on a sample that is stable across two consecutive reads
-             * and differs from the last applied (non-zero) value -- retunes
-             * are rare (user moving the dial), so polling here in the idle
-             * branch is plenty fast.
+#if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_CMD_OP_BASE)
+            /* HPSDR command-mailbox dispatcher.  The fabric (hpsdr_cmd_mux)
+             * encodes one libbladeRF RFIC request per write to hpsdr_cmd_op,
+             * incrementing a 4-bit seq strobe so duplicate opcode/data still
+             * fire.  Both cmd_op and cmd_data_in are crossed bit-by-bit out
+             * of fx3_pclk_pll into sys_clock, so a multi-bit sample can tear
+             * for a couple of cycles around a write.  Act only on a sample
+             * stable across two consecutive reads AND with a seq value we
+             * haven't serviced -- combined this absorbs both the per-bit
+             * tearing and the duplicate-op case (e.g. user re-applies the
+             * same gain).
              *
-             * Discovery advertises FREQ_PHASE=0x01 (Orion MkII default), so
-             * the mailbox is a 32-bit NCO phase word, NOT Hz.  Convert before
-             * commanding the AD9361:  freq_Hz = phase * 122.88e6 / 2^32, where
-             * 122.88 MHz is the Orion MkII DSP clock Thetis derives the phase
-             * from.  Max input phase = 2^32-1 -> max output ~122.88 MHz, fits
-             * in uint32_t.  hpsdr_freq_applied still tracks the phase word so
-             * the change-detect compares the raw PIO sample, and is updated
-             * even when the AD9361 rejects (e.g. <47 MHz floor) so the same
-             * out-of-range value isn't replayed every poll -- the next dial
-             * change retrigger the attempt. */
+             * Writes: cmd_data_in is the raw payload.  FREQUENCY is special
+             * (32b NCO phase word, see hpsdr_phase_to_tune_hz); everything
+             * else passes straight through as a uint64_t.  Reads: stash the
+             * 64b result into cmd_data_lo/_hi before raising done_seq, so
+             * the fabric sees stable data when it samples on the seq match.
+             */
             {
-                uint32_t phase = IORD_ALTERA_AVALON_PIO_DATA(HPSDR_FREQ_BASE);
+                uint16_t op_word = IORD_ALTERA_AVALON_PIO_DATA(HPSDR_CMD_OP_BASE);
+                uint8_t  seq     = HPSDR_CMD_OP_SEQ(op_word);
 
-                if (phase == hpsdr_freq_prev && phase != hpsdr_freq_applied &&
-                    phase != 0) {
-                    uint32_t if_hz = (uint32_t)
-                        (((uint64_t)phase * 122880000ULL) >> 32);
-                    /* Virtual-transverter offset: signed add in 64-bit so a
-                     * UHF/microwave tune (>4.29 GHz) doesn't overflow.  Clamp
-                     * negative results to 0; the RFIC layer rejects sub-70 MHz
-                     * anyway via _modify_spdt_bits_by_freq. */
-                    int64_t  signed_tune = (int64_t)if_hz +
-                                           (int32_t)HPSDR_LO_OFFSET_HZ;
-                    uint64_t tune_hz     = (signed_tune < 0)
-                                           ? 0 : (uint64_t)signed_tune;
-                    bool ok = rfic_command_write_immed(
-                                BLADERF_RFIC_COMMAND_FREQUENCY,
-                                BLADERF_CHANNEL_RX(0),
-                                tune_hz);
+                if (op_word == hpsdr_cmd_prev_op && seq != hpsdr_cmd_last_seq) {
+                    uint8_t  op  = HPSDR_CMD_OP_OPCODE(op_word);
+                    uint8_t  ch  = HPSDR_CMD_OP_CHANNEL(op_word);
+                    bool     rw  = HPSDR_CMD_OP_RW(op_word);
+                    uint32_t din = IORD_ALTERA_AVALON_PIO_DATA(HPSDR_CMD_DATA_IN_BASE);
+                    bladerf_channel bch = hpsdr_decode_channel(ch);
+                    bool     ok  = false;
+                    uint8_t  status_byte;
 
-                    hpsdr_freq_applied = phase;
-                    DBG("HPSDR: RX0 retune phase=%x IF=%x tune=%x %s\n",
-                        phase, if_hz, (uint32_t)tune_hz,
-                        ok ? "ok" : "REJECTED");
+                    if (!rw) {
+                        uint64_t value = (op == BLADERF_RFIC_COMMAND_FREQUENCY)
+                            ? hpsdr_phase_to_tune_hz(din,
+                                                     (int32_t)HPSDR_LO_OFFSET_HZ)
+                            : (uint64_t)din;
+                        ok = rfic_command_write_immed(
+                                 (bladerf_rfic_command)op, bch, value);
+                        DBG("HPSDR: W op=%x ch=%x din=%x val=%x:%x %s\n",
+                            op, ch, din,
+                            (uint32_t)(value >> 32), (uint32_t)value,
+                            ok ? "ok" : "FAIL");
+                    } else {
+                        uint64_t value = 0;
+                        ok = rfic_command_read_immed(
+                                 (bladerf_rfic_command)op, bch, &value);
+                        /* Data first, status last -- the fabric waits for
+                         * the seq match before sampling, so updates to
+                         * data_lo/_hi land before done_seq propagates. */
+                        IOWR_ALTERA_AVALON_PIO_DATA(HPSDR_CMD_DATA_LO_BASE,
+                                                    (uint32_t)value);
+                        IOWR_ALTERA_AVALON_PIO_DATA(HPSDR_CMD_DATA_HI_BASE,
+                                                    (uint32_t)(value >> 32));
+                        DBG("HPSDR: R op=%x ch=%x val=%x:%x %s\n",
+                            op, ch,
+                            (uint32_t)(value >> 32), (uint32_t)value,
+                            ok ? "ok" : "FAIL");
+                    }
+
+                    status_byte = (uint8_t)(seq & 0xF);
+                    if (!ok) {
+                        status_byte |= HPSDR_CMD_STATUS_ERR;
+                    }
+                    IOWR_ALTERA_AVALON_PIO_DATA(HPSDR_CMD_STATUS_BASE,
+                                                status_byte);
+                    hpsdr_cmd_last_seq = seq;
                 }
 
-                hpsdr_freq_prev = phase;
+                hpsdr_cmd_prev_op = op_word;
             }
 #endif
         }

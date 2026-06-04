@@ -698,38 +698,63 @@ if { $platform_revision == "foxhunt" } {
 }
 
 if { $platform_revision == "hpsdr" } {
-    puts "Adding hpsdr_freq PIO..."
-    # Input-only 32-bit PIO carrying the HPSDR DDC0 receive frequency (Hz)
-    # decoded by hpsdr_hp_cmd_handler.  Nios polls it and retunes RX0.
-    # Param set mirrors the xb_gpio PIO, but direction is Input.
-    add_instance hpsdr_freq altera_avalon_pio
-    set_instance_parameter_value hpsdr_freq {bitClearingEdgeCapReg} {0}
-    set_instance_parameter_value hpsdr_freq {bitModifyingOutReg} {0}
-    set_instance_parameter_value hpsdr_freq {captureEdge} {0}
-    set_instance_parameter_value hpsdr_freq {direction} {Input}
-    set_instance_parameter_value hpsdr_freq {edgeType} {RISING}
-    set_instance_parameter_value hpsdr_freq {generateIRQ} {0}
-    set_instance_parameter_value hpsdr_freq {irqType} {LEVEL}
-    set_instance_parameter_value hpsdr_freq {resetValue} {0.0}
-    set_instance_parameter_value hpsdr_freq {simDoTestBenchWiring} {0}
-    set_instance_parameter_value hpsdr_freq {simDrivenValue} {0.0}
-    set_instance_parameter_value hpsdr_freq {width} {32}
+    puts "Adding HPSDR command-mailbox PIOs..."
 
-    add_interface hpsdr_freq conduit end
-    set_interface_property hpsdr_freq EXPORT_OF hpsdr_freq.external_connection
+    # Generic command-mailbox surface for the HPSDR fabric to drive any
+    # libbladeRF RFIC command (FREQUENCY, GAIN, GAINMODE, BANDWIDTH, FILTER,
+    # TXMUTE, RSSI, ...) via NIOS without growing the PIO count per knob.
+    # Fixed PIO surface:
+    #
+    #   hpsdr_cmd_data_in (32b, Input,  fabric -> NIOS) - write payload / read
+    #                                   request data.  Encoding is per-opcode
+    #                                   (FREQUENCY: NCO phase word, GAIN: dB,
+    #                                   BANDWIDTH: Hz, ...).
+    #   hpsdr_cmd_op      (16b, Input,  fabric -> NIOS) - request word:
+    #                                   bits [7:0]  opcode (BLADERF_RFIC_CMD_*)
+    #                                   bits [10:8] channel (0=RX0, 1=RX1,
+    #                                               2=TX0, 3=TX1, 7=SYSTEM)
+    #                                   bit  [11]   rw (0=write, 1=read)
+    #                                   bits [15:12] seq -- strobe; fabric
+    #                                               increments on every commit
+    #                                               so duplicate opcodes still
+    #                                               trigger a new request.
+    #   hpsdr_cmd_data_lo (32b, Output, NIOS -> fabric) - read result LSBs
+    #                                   (RSSI sym+pre, etc.).
+    #   hpsdr_cmd_data_hi (32b, Output, NIOS -> fabric) - read result MSBs
+    #                                   (RSSI mult, 64b-future).
+    #   hpsdr_cmd_status  (8b,  Output, NIOS -> fabric) - response:
+    #                                   bits [3:0]  done_seq -- the seq NIOS
+    #                                               just serviced.  Fabric
+    #                                               waits for done_seq==issued.
+    #                                   bit  [4]    err (1 = NIOS call failed)
+    #                                   bits [7:5]  reserved.
+    #
+    # hpsdr_status (engagement state, bit0=host_valid, bit1=host_run) stays a
+    # separate Input PIO -- conceptually unrelated to command response status.
 
-    add_connection system_clock.clk hpsdr_freq.clk
-    add_connection system_clock.clk_reset hpsdr_freq.reset
-    add_connection nios2.data_master hpsdr_freq.s1
-    set_connection_parameter_value nios2.data_master/hpsdr_freq.s1 arbitrationPriority {1}
-    set_connection_parameter_value nios2.data_master/hpsdr_freq.s1 baseAddress {0x90c0}
-    set_connection_parameter_value nios2.data_master/hpsdr_freq.s1 defaultConnection {0}
+    add_instance hpsdr_cmd_data_in altera_avalon_pio
+    set_instance_parameter_value hpsdr_cmd_data_in {bitClearingEdgeCapReg} {0}
+    set_instance_parameter_value hpsdr_cmd_data_in {bitModifyingOutReg} {0}
+    set_instance_parameter_value hpsdr_cmd_data_in {captureEdge} {0}
+    set_instance_parameter_value hpsdr_cmd_data_in {direction} {Input}
+    set_instance_parameter_value hpsdr_cmd_data_in {edgeType} {RISING}
+    set_instance_parameter_value hpsdr_cmd_data_in {generateIRQ} {0}
+    set_instance_parameter_value hpsdr_cmd_data_in {irqType} {LEVEL}
+    set_instance_parameter_value hpsdr_cmd_data_in {resetValue} {0.0}
+    set_instance_parameter_value hpsdr_cmd_data_in {simDoTestBenchWiring} {0}
+    set_instance_parameter_value hpsdr_cmd_data_in {simDrivenValue} {0.0}
+    set_instance_parameter_value hpsdr_cmd_data_in {width} {32}
 
-    # 2-bit HPSDR engagement status from the fabric: bit0 = host_valid (a Thetis
-    # discovery has committed a client), bit1 = host_run.  NIOS triggers RX
-    # bring-up on host_valid -- there are seconds of slack before Thetis sends
-    # run=1, and discovery only happens in standalone Ethernet operation so a USB
-    # libbladeRF load never trips it.
+    add_interface hpsdr_cmd_data_in conduit end
+    set_interface_property hpsdr_cmd_data_in EXPORT_OF hpsdr_cmd_data_in.external_connection
+
+    add_connection system_clock.clk hpsdr_cmd_data_in.clk
+    add_connection system_clock.clk_reset hpsdr_cmd_data_in.reset
+    add_connection nios2.data_master hpsdr_cmd_data_in.s1
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_data_in.s1 arbitrationPriority {1}
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_data_in.s1 baseAddress {0x90c0}
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_data_in.s1 defaultConnection {0}
+
     add_instance hpsdr_status altera_avalon_pio
     set_instance_parameter_value hpsdr_status {bitClearingEdgeCapReg} {0}
     set_instance_parameter_value hpsdr_status {bitModifyingOutReg} {0}
@@ -752,6 +777,98 @@ if { $platform_revision == "hpsdr" } {
     set_connection_parameter_value nios2.data_master/hpsdr_status.s1 arbitrationPriority {1}
     set_connection_parameter_value nios2.data_master/hpsdr_status.s1 baseAddress {0x90d0}
     set_connection_parameter_value nios2.data_master/hpsdr_status.s1 defaultConnection {0}
+
+    add_instance hpsdr_cmd_op altera_avalon_pio
+    set_instance_parameter_value hpsdr_cmd_op {bitClearingEdgeCapReg} {0}
+    set_instance_parameter_value hpsdr_cmd_op {bitModifyingOutReg} {0}
+    set_instance_parameter_value hpsdr_cmd_op {captureEdge} {0}
+    set_instance_parameter_value hpsdr_cmd_op {direction} {Input}
+    set_instance_parameter_value hpsdr_cmd_op {edgeType} {RISING}
+    set_instance_parameter_value hpsdr_cmd_op {generateIRQ} {0}
+    set_instance_parameter_value hpsdr_cmd_op {irqType} {LEVEL}
+    set_instance_parameter_value hpsdr_cmd_op {resetValue} {0.0}
+    set_instance_parameter_value hpsdr_cmd_op {simDoTestBenchWiring} {0}
+    set_instance_parameter_value hpsdr_cmd_op {simDrivenValue} {0.0}
+    set_instance_parameter_value hpsdr_cmd_op {width} {16}
+
+    add_interface hpsdr_cmd_op conduit end
+    set_interface_property hpsdr_cmd_op EXPORT_OF hpsdr_cmd_op.external_connection
+
+    add_connection system_clock.clk hpsdr_cmd_op.clk
+    add_connection system_clock.clk_reset hpsdr_cmd_op.reset
+    add_connection nios2.data_master hpsdr_cmd_op.s1
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_op.s1 arbitrationPriority {1}
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_op.s1 baseAddress {0x90e0}
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_op.s1 defaultConnection {0}
+
+    add_instance hpsdr_cmd_data_lo altera_avalon_pio
+    set_instance_parameter_value hpsdr_cmd_data_lo {bitClearingEdgeCapReg} {0}
+    set_instance_parameter_value hpsdr_cmd_data_lo {bitModifyingOutReg} {0}
+    set_instance_parameter_value hpsdr_cmd_data_lo {captureEdge} {0}
+    set_instance_parameter_value hpsdr_cmd_data_lo {direction} {Output}
+    set_instance_parameter_value hpsdr_cmd_data_lo {edgeType} {RISING}
+    set_instance_parameter_value hpsdr_cmd_data_lo {generateIRQ} {0}
+    set_instance_parameter_value hpsdr_cmd_data_lo {irqType} {LEVEL}
+    set_instance_parameter_value hpsdr_cmd_data_lo {resetValue} {0.0}
+    set_instance_parameter_value hpsdr_cmd_data_lo {simDoTestBenchWiring} {0}
+    set_instance_parameter_value hpsdr_cmd_data_lo {simDrivenValue} {0.0}
+    set_instance_parameter_value hpsdr_cmd_data_lo {width} {32}
+
+    add_interface hpsdr_cmd_data_lo conduit end
+    set_interface_property hpsdr_cmd_data_lo EXPORT_OF hpsdr_cmd_data_lo.external_connection
+
+    add_connection system_clock.clk hpsdr_cmd_data_lo.clk
+    add_connection system_clock.clk_reset hpsdr_cmd_data_lo.reset
+    add_connection nios2.data_master hpsdr_cmd_data_lo.s1
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_data_lo.s1 arbitrationPriority {1}
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_data_lo.s1 baseAddress {0x91a0}
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_data_lo.s1 defaultConnection {0}
+
+    add_instance hpsdr_cmd_data_hi altera_avalon_pio
+    set_instance_parameter_value hpsdr_cmd_data_hi {bitClearingEdgeCapReg} {0}
+    set_instance_parameter_value hpsdr_cmd_data_hi {bitModifyingOutReg} {0}
+    set_instance_parameter_value hpsdr_cmd_data_hi {captureEdge} {0}
+    set_instance_parameter_value hpsdr_cmd_data_hi {direction} {Output}
+    set_instance_parameter_value hpsdr_cmd_data_hi {edgeType} {RISING}
+    set_instance_parameter_value hpsdr_cmd_data_hi {generateIRQ} {0}
+    set_instance_parameter_value hpsdr_cmd_data_hi {irqType} {LEVEL}
+    set_instance_parameter_value hpsdr_cmd_data_hi {resetValue} {0.0}
+    set_instance_parameter_value hpsdr_cmd_data_hi {simDoTestBenchWiring} {0}
+    set_instance_parameter_value hpsdr_cmd_data_hi {simDrivenValue} {0.0}
+    set_instance_parameter_value hpsdr_cmd_data_hi {width} {32}
+
+    add_interface hpsdr_cmd_data_hi conduit end
+    set_interface_property hpsdr_cmd_data_hi EXPORT_OF hpsdr_cmd_data_hi.external_connection
+
+    add_connection system_clock.clk hpsdr_cmd_data_hi.clk
+    add_connection system_clock.clk_reset hpsdr_cmd_data_hi.reset
+    add_connection nios2.data_master hpsdr_cmd_data_hi.s1
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_data_hi.s1 arbitrationPriority {1}
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_data_hi.s1 baseAddress {0x91b0}
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_data_hi.s1 defaultConnection {0}
+
+    add_instance hpsdr_cmd_status altera_avalon_pio
+    set_instance_parameter_value hpsdr_cmd_status {bitClearingEdgeCapReg} {0}
+    set_instance_parameter_value hpsdr_cmd_status {bitModifyingOutReg} {0}
+    set_instance_parameter_value hpsdr_cmd_status {captureEdge} {0}
+    set_instance_parameter_value hpsdr_cmd_status {direction} {Output}
+    set_instance_parameter_value hpsdr_cmd_status {edgeType} {RISING}
+    set_instance_parameter_value hpsdr_cmd_status {generateIRQ} {0}
+    set_instance_parameter_value hpsdr_cmd_status {irqType} {LEVEL}
+    set_instance_parameter_value hpsdr_cmd_status {resetValue} {0.0}
+    set_instance_parameter_value hpsdr_cmd_status {simDoTestBenchWiring} {0}
+    set_instance_parameter_value hpsdr_cmd_status {simDrivenValue} {0.0}
+    set_instance_parameter_value hpsdr_cmd_status {width} {8}
+
+    add_interface hpsdr_cmd_status conduit end
+    set_interface_property hpsdr_cmd_status EXPORT_OF hpsdr_cmd_status.external_connection
+
+    add_connection system_clock.clk hpsdr_cmd_status.clk
+    add_connection system_clock.clk_reset hpsdr_cmd_status.reset
+    add_connection nios2.data_master hpsdr_cmd_status.s1
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_status.s1 arbitrationPriority {1}
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_status.s1 baseAddress {0x91c0}
+    set_connection_parameter_value nios2.data_master/hpsdr_cmd_status.s1 defaultConnection {0}
 }
 
 save_system {nios_system.qsys}

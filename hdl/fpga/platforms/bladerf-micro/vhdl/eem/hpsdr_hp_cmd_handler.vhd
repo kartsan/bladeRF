@@ -27,7 +27,8 @@
 --                    (Orion2 High_Priority_CC.v: RX0 = byte9[31:24]..byte12[7:0]).
 --                    Assembled in a shift register and committed at rx_eop so a
 --                    partial big-endian value is never published.  Crosses to
---                    the Nios via the hpsdr_freq PIO; firmware retunes RX0.
+--                    the Nios via hpsdr_cmd_mux + the hpsdr_cmd_* PIOs;
+--                    firmware retunes RX0.
 --   * host_port     (HP Command's UDP source ephemeral, latched at rx_sop) -
 --                    the dst port HP Status / DDC IQ replies must target.
 --                    Thetis binds its receive socket to its HP Command sendto()

@@ -426,15 +426,30 @@ architecture hpsdr_bladerf of bladerf is
     signal wbm_wb_ack_i           : std_logic;
     signal wbm_wb_cyc_o           : std_logic;
 
-    -- HPSDR DDC0 receive frequency mailbox (FPGA -> Nios).
-    -- host_rx0_freq is decoded by hpsdr_hp_cmd_handler in the fx3_pclk_pll
-    -- domain; hpsdr_freq_sync is the sys_clock-domain copy driven into the
-    -- hpsdr_freq Avalon PIO (see the per-bit synchronizer generate below and
-    -- the local nios_system component override).  Firmware reads the PIO and
-    -- retunes RX0; a 2-poll stability check there absorbs the multi-bit
-    -- tearing inherent to per-bit CDC of this rarely-changing value.
+    -- HPSDR DDC0 receive frequency, decoded from HP Command by
+    -- hpsdr_hp_cmd_handler (fx3_pclk_pll domain).  Fed into hpsdr_cmd_mux as
+    -- the first command-mailbox source.
     signal host_rx0_freq          : std_logic_vector(31 downto 0);
-    signal hpsdr_freq_sync        : std_logic_vector(31 downto 0) := (others => '0');
+
+    -- HPSDR command mailbox -- generic surface for any libbladeRF RFIC
+    -- command (FREQUENCY, GAIN, BANDWIDTH, GAINMODE, FILTER, TXMUTE, RSSI,
+    -- ...) issued from fabric to NIOS via PIOs.  See nios_system.tcl's
+    -- hpsdr block for the PIO map + cmd_op bit-layout and hpsdr_cmd_mux.vhd
+    -- for the request encoding.
+    --
+    -- Pre-CDC (mux side, fx3_pclk_pll domain):
+    signal hpsdr_cmd_op_fab       : std_logic_vector(15 downto 0);
+    signal hpsdr_cmd_data_in_fab  : std_logic_vector(31 downto 0);
+    signal hpsdr_cmd_data_lo_fab  : std_logic_vector(31 downto 0) := (others => '0');
+    signal hpsdr_cmd_data_hi_fab  : std_logic_vector(31 downto 0) := (others => '0');
+    signal hpsdr_cmd_status_fab   : std_logic_vector(7  downto 0) := (others => '0');
+    -- Post-CDC (NIOS side, sys_clock domain):
+    signal hpsdr_cmd_op_sync      : std_logic_vector(15 downto 0) := (others => '0');
+    signal hpsdr_cmd_data_in_sync : std_logic_vector(31 downto 0) := (others => '0');
+    -- NIOS-driven response PIOs (sys_clock; per-bit CDC back to fx3_pclk_pll):
+    signal hpsdr_cmd_data_lo_nios : std_logic_vector(31 downto 0);
+    signal hpsdr_cmd_data_hi_nios : std_logic_vector(31 downto 0);
+    signal hpsdr_cmd_status_nios  : std_logic_vector(7  downto 0);
 
     -- HPSDR engagement status -> Nios (sys_clock).  bit0 = host_valid (Thetis
     -- discovery committed a client; NIOS uses this to trigger RX bring-up
@@ -442,11 +457,11 @@ architecture hpsdr_bladerf of bladerf is
     signal hpsdr_status_sync      : std_logic_vector(1 downto 0) := (others => '0');
 
     -- Local override of the nios_system component from work.bladerf_p: this
-    -- hpsdr revision's Qsys (nios_system.tcl, platform_revision==hpsdr) adds an
-    -- hpsdr_freq Input PIO, so the generated entity has an extra
-    -- hpsdr_freq_export the shared package declaration lacks.  Declaring the
-    -- component here shadows the package one for this file only, leaving the
-    -- sibling revisions (hosted/adsb/wlan) that share bladerf_p untouched.
+    -- hpsdr revision's Qsys (nios_system.tcl, platform_revision==hpsdr) adds
+    -- the HPSDR command-mailbox + engagement-status PIOs, so the generated
+    -- entity has extra ports the shared package declaration lacks.  Declaring
+    -- the component here shadows the package one for this file only, leaving
+    -- the sibling revisions (hosted/adsb/wlan) that share bladerf_p untouched.
     -- Same technique as bladerf-foxhunt.vhd's tone_generator ports.
     component nios_system is
       port (
@@ -549,8 +564,12 @@ architecture hpsdr_bladerf of bladerf is
         wbm_wb_stb_o                    :   out std_logic;
         wbm_wb_ack_i                    :   in  std_logic                     := 'X';
         wbm_wb_cyc_o                    :   out std_logic;
-        hpsdr_freq_export              :   in  std_logic_vector(31 downto 0) := (others => '0');
-        hpsdr_status_export            :   in  std_logic_vector(1 downto 0)  := (others => '0')
+        hpsdr_cmd_data_in_export       :   in  std_logic_vector(31 downto 0) := (others => '0');
+        hpsdr_status_export            :   in  std_logic_vector(1 downto 0)  := (others => '0');
+        hpsdr_cmd_op_export            :   in  std_logic_vector(15 downto 0) := (others => '0');
+        hpsdr_cmd_data_lo_export       :   out std_logic_vector(31 downto 0);
+        hpsdr_cmd_data_hi_export       :   out std_logic_vector(31 downto 0);
+        hpsdr_cmd_status_export        :   out std_logic_vector(7  downto 0)
       );
     end component;
 begin
@@ -1153,6 +1172,30 @@ begin
         );
 
     -- ========================================================================
+    -- HPSDR command-mailbox multiplexer.  Funnels per-knob fabric request
+    -- streams (initially just RX0 FREQUENCY from hp_cmd_handler; future:
+    -- GAIN / GAINMODE / BANDWIDTH / RSSI poll for HP Status / ...) into the
+    -- single (cmd_op, cmd_data_in) PIO pair that NIOS dispatches against
+    -- libbladeRF's rfic_command_{read,write}_immed.  Read-back PIOs
+    -- (cmd_data_lo/_hi, cmd_status) come in pre-synced to this clock domain
+    -- and are exposed for the first read consumer to plug in.
+    -- ========================================================================
+    U_hpsdr_cmd_mux : entity work.hpsdr_cmd_mux
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            rx0_freq     => host_rx0_freq,
+
+            cmd_op       => hpsdr_cmd_op_fab,
+            cmd_data_in  => hpsdr_cmd_data_in_fab,
+
+            cmd_status   => hpsdr_cmd_status_fab,
+            cmd_data_lo  => hpsdr_cmd_data_lo_fab,
+            cmd_data_hi  => hpsdr_cmd_data_hi_fab
+        );
+
+    -- ========================================================================
     -- HPSDR P2 High-Priority Status sender.  20 Hz heartbeat from UDP/1025 to
     -- the HP Command's source ephemeral (Thetis binds its rx socket there, not
     -- 1025).  Gated on (host_valid AND host_run): silent until the host sends
@@ -1504,8 +1547,12 @@ begin
             wbm_wb_stb_o                    => wbm_wb_stb_o,
             wbm_wb_ack_i                    => wbm_wb_ack_i,
             wbm_wb_cyc_o                    => wbm_wb_cyc_o,
-            hpsdr_freq_export              => hpsdr_freq_sync,
-            hpsdr_status_export            => hpsdr_status_sync
+            hpsdr_cmd_data_in_export       => hpsdr_cmd_data_in_sync,
+            hpsdr_status_export            => hpsdr_status_sync,
+            hpsdr_cmd_op_export            => hpsdr_cmd_op_sync,
+            hpsdr_cmd_data_lo_export       => hpsdr_cmd_data_lo_nios,
+            hpsdr_cmd_data_hi_export       => hpsdr_cmd_data_hi_nios,
+            hpsdr_cmd_status_export        => hpsdr_cmd_status_nios
         );
 
     -- FX3 UART
@@ -2085,20 +2132,79 @@ begin
           );
     end generate;
 
-    -- HPSDR RX0 frequency mailbox CDC: host_rx0_freq (fx3_pclk_pll, from
-    -- hpsdr_hp_cmd_handler) -> hpsdr_freq_sync (sys_clock, the nios_system
-    -- clock that clocks the hpsdr_freq PIO).  Per-bit 2-FF synchronizer like
-    -- xb_gpio_in above; the firmware 2-poll stability check tolerates the
-    -- transient multi-bit tearing that per-bit CDC can produce.
-    generate_sync_hpsdr_freq : for i in host_rx0_freq'range generate
-        U_sync_hpsdr_freq : entity work.synchronizer
+    -- HPSDR command-mailbox CDC.  Two clock crossings:
+    --
+    --   fx3_pclk_pll (mux) -> sys_clock (NIOS):
+    --     hpsdr_cmd_data_in_fab -> hpsdr_cmd_data_in_sync
+    --     hpsdr_cmd_op_fab      -> hpsdr_cmd_op_sync
+    --
+    --   sys_clock (NIOS) -> fx3_pclk_pll (mux + future consumers):
+    --     hpsdr_cmd_data_lo_nios -> hpsdr_cmd_data_lo_fab
+    --     hpsdr_cmd_data_hi_nios -> hpsdr_cmd_data_hi_fab
+    --     hpsdr_cmd_status_nios  -> hpsdr_cmd_status_fab
+    --
+    -- Per-bit 2-FF synchronisers like xb_gpio_in.  Multi-bit tearing is
+    -- handled at the consumer: NIOS uses a 2-read-stable check on cmd_op /
+    -- cmd_data_in (gated by seq delta) before dispatching; the fabric-side
+    -- consumer waits for cmd_status[3:0]==issued_seq before sampling
+    -- data_lo/_hi, so transient mid-CDC values are ignored.
+    generate_sync_hpsdr_cmd_data_in : for i in hpsdr_cmd_data_in_fab'range generate
+        U_sync_hpsdr_cmd_data_in : entity work.synchronizer
           generic map (
             RESET_LEVEL         =>  '0'
           ) port map (
             reset               =>  '0',
             clock               =>  sys_clock,
-            async               =>  host_rx0_freq(i),
-            sync                =>  hpsdr_freq_sync(i)
+            async               =>  hpsdr_cmd_data_in_fab(i),
+            sync                =>  hpsdr_cmd_data_in_sync(i)
+          );
+    end generate;
+
+    generate_sync_hpsdr_cmd_op : for i in hpsdr_cmd_op_fab'range generate
+        U_sync_hpsdr_cmd_op : entity work.synchronizer
+          generic map (
+            RESET_LEVEL         =>  '0'
+          ) port map (
+            reset               =>  '0',
+            clock               =>  sys_clock,
+            async               =>  hpsdr_cmd_op_fab(i),
+            sync                =>  hpsdr_cmd_op_sync(i)
+          );
+    end generate;
+
+    generate_sync_hpsdr_cmd_data_lo : for i in hpsdr_cmd_data_lo_nios'range generate
+        U_sync_hpsdr_cmd_data_lo : entity work.synchronizer
+          generic map (
+            RESET_LEVEL         =>  '0'
+          ) port map (
+            reset               =>  '0',
+            clock               =>  fx3_pclk_pll,
+            async               =>  hpsdr_cmd_data_lo_nios(i),
+            sync                =>  hpsdr_cmd_data_lo_fab(i)
+          );
+    end generate;
+
+    generate_sync_hpsdr_cmd_data_hi : for i in hpsdr_cmd_data_hi_nios'range generate
+        U_sync_hpsdr_cmd_data_hi : entity work.synchronizer
+          generic map (
+            RESET_LEVEL         =>  '0'
+          ) port map (
+            reset               =>  '0',
+            clock               =>  fx3_pclk_pll,
+            async               =>  hpsdr_cmd_data_hi_nios(i),
+            sync                =>  hpsdr_cmd_data_hi_fab(i)
+          );
+    end generate;
+
+    generate_sync_hpsdr_cmd_status : for i in hpsdr_cmd_status_nios'range generate
+        U_sync_hpsdr_cmd_status : entity work.synchronizer
+          generic map (
+            RESET_LEVEL         =>  '0'
+          ) port map (
+            reset               =>  '0',
+            clock               =>  fx3_pclk_pll,
+            async               =>  hpsdr_cmd_status_nios(i),
+            sync                =>  hpsdr_cmd_status_fab(i)
           );
     end generate;
 
