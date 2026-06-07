@@ -573,8 +573,16 @@ int main(void)
                                               BLADERF_GAIN_MGC);
                 DBG("HPSDR:  GAINMODE   -> %s\n", ok ? "ok" : "FAIL");
 
+                /* Match the hpsdr_cmd_mux GAIN_ANCHOR_DB (anchor - atten):
+                 * Thetis defaults RX1 step-attenuator to 0 dB, which the mux
+                 * translates to GAIN=GAIN_ANCHOR_DB.  Park here at bring-up
+                 * so the radio matches the host slider's initial position
+                 * before the first HP Cmd carrying a non-zero atten arrives.
+                 * Anchor is 32 so the full 0..31 attenuator slider stays
+                 * within the AD9361 <=1.3 GHz floor (+1 dB, see ad9361.c
+                 * TBL_200_1300_MHZ starting_gain_db). */
                 ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAIN,
-                                              BLADERF_CHANNEL_RX(0), 40);
+                                              BLADERF_CHANNEL_RX(0), 32);
                 DBG("HPSDR:  GAIN       -> %s\n", ok ? "ok" : "FAIL");
 
                 ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_ENABLE,
@@ -618,10 +626,16 @@ int main(void)
                     uint8_t  status_byte;
 
                     if (!rw) {
+                        /* FREQUENCY is an unsigned 32b NCO phase word; the
+                         * helper expands it to Hz.  Everything else (GAIN in
+                         * dB, BANDWIDTH, ...) may legitimately be negative,
+                         * so reinterpret din as int32 and sign-extend to
+                         * int64 before handing it to rfic_command_write_immed
+                         * (which takes int64 by contract). */
                         uint64_t value = (op == BLADERF_RFIC_COMMAND_FREQUENCY)
                             ? hpsdr_phase_to_tune_hz(din,
                                                      (int32_t)HPSDR_LO_OFFSET_HZ)
-                            : (uint64_t)din;
+                            : (uint64_t)(int64_t)(int32_t)din;
                         ok = rfic_command_write_immed(
                                  (bladerf_rfic_command)op, bch, value);
                         DBG("HPSDR: W op=%x ch=%x din=%x val=%x:%x %s\n",

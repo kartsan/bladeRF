@@ -431,6 +431,11 @@ architecture hpsdr_bladerf of bladerf is
     -- the first command-mailbox source.
     signal host_rx0_freq          : std_logic_vector(31 downto 0);
 
+    -- HPSDR RX1 step attenuator in dB (HP Command byte 1443, 0..31).  Fed
+    -- into hpsdr_cmd_mux which converts it to BLADERF_RFIC_COMMAND_GAIN with
+    -- value = 60 - atten.
+    signal host_rx0_atten         : std_logic_vector(4 downto 0);
+
     -- HPSDR command mailbox -- generic surface for any libbladeRF RFIC
     -- command (FREQUENCY, GAIN, BANDWIDTH, GAINMODE, FILTER, TXMUTE, RSSI,
     -- ...) issued from fabric to NIOS via PIOs.  See nios_system.tcl's
@@ -1145,6 +1150,7 @@ begin
             host_ptt0        => hpsdr_host_ptt0,
             host_port        => hpsdr_hp_cmd_host_port,
             host_rx0_freq    => host_rx0_freq,
+            host_rx0_atten   => host_rx0_atten,
 
             hp_cmd_pulse     => hpsdr_hp_cmd_decode_pulse
         );
@@ -1186,6 +1192,8 @@ begin
             reset        => sys_reset_pclk,
 
             rx0_freq     => host_rx0_freq,
+            rx0_atten    => host_rx0_atten,
+            hp_cmd_pulse => hpsdr_hp_cmd_decode_pulse,
 
             cmd_op       => hpsdr_cmd_op_fab,
             cmd_data_in  => hpsdr_cmd_data_in_fab,

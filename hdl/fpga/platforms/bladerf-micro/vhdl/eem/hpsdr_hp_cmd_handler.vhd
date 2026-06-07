@@ -29,6 +29,12 @@
 --                    partial big-endian value is never published.  Crosses to
 --                    the Nios via hpsdr_cmd_mux + the hpsdr_cmd_* PIOs;
 --                    firmware retunes RX0.
+--   * host_rx0_atten (byte 1443, 0..31 dB) - 0-31dB step attenuator before
+--                    ADC0 (V4.4 spec p.35: Thetis "RX1 attenuator").
+--                    Single byte, low 5 bits = attenuation in dB.  Also
+--                    committed at rx_eop and republished as host_rx0_atten;
+--                    hpsdr_cmd_mux maps it to BLADERF_RFIC_COMMAND_GAIN with
+--                    value = 60 - atten.
 --   * host_port     (HP Command's UDP source ephemeral, latched at rx_sop) -
 --                    the dst port HP Status / DDC IQ replies must target.
 --                    Thetis binds its receive socket to its HP Command sendto()
@@ -86,6 +92,10 @@ entity hpsdr_hp_cmd_handler is
         -- committed at rx_eop.  Held across packets until the next command.
         host_rx0_freq    : out std_logic_vector(31 downto 0);
 
+        -- DDC0 step attenuator in dB (HP Command byte 1443, low 5 bits),
+        -- committed at rx_eop.  Held across packets until the next command.
+        host_rx0_atten   : out std_logic_vector(4 downto 0);
+
         -- One cycle per fully-consumed HP Command (~10 Hz once engaged).
         hp_cmd_pulse     : out std_logic
     );
@@ -106,29 +116,37 @@ architecture arch of hpsdr_hp_cmd_handler is
     signal freq_sr        : std_logic_vector(31 downto 0) := (others => '0');
     signal host_rx0_freq_r: std_logic_vector(31 downto 0) := (others => '0');
 
+    -- RX0 step attenuator: single-byte capture at byte 1443 (atten_latched);
+    -- committed to host_rx0_atten_r at rx_eop alongside the frequency.
+    signal atten_latched   : std_logic_vector(4 downto 0) := (others => '0');
+    signal host_rx0_atten_r: std_logic_vector(4 downto 0) := (others => '0');
+
     -- Watchdog (see RUN_TIMEOUT_CYCLES).
     signal wd_counter     : unsigned(27 downto 0) := (others => '0');
 
 begin
 
-    host_run      <= host_run_r;
-    host_ptt0     <= host_ptt0_r;
-    host_port     <= host_port_r;
-    host_rx0_freq <= host_rx0_freq_r;
-    hp_cmd_pulse  <= hp_cmd_pulse_r;
+    host_run       <= host_run_r;
+    host_ptt0      <= host_ptt0_r;
+    host_port      <= host_port_r;
+    host_rx0_freq  <= host_rx0_freq_r;
+    host_rx0_atten <= host_rx0_atten_r;
+    hp_cmd_pulse   <= hp_cmd_pulse_r;
 
     fsm : process(clock, reset)
         variable n_byte_idx : unsigned(10 downto 0);
     begin
         if reset = '1' then
-            byte_idx       <= (others => '0');
-            host_run_r     <= '0';
-            host_ptt0_r    <= '0';
-            host_port_r    <= (others => '0');
-            freq_sr        <= (others => '0');
-            host_rx0_freq_r<= (others => '0');
-            hp_cmd_pulse_r <= '0';
-            wd_counter     <= (others => '0');
+            byte_idx        <= (others => '0');
+            host_run_r      <= '0';
+            host_ptt0_r     <= '0';
+            host_port_r     <= (others => '0');
+            freq_sr         <= (others => '0');
+            host_rx0_freq_r <= (others => '0');
+            atten_latched   <= (others => '0');
+            host_rx0_atten_r<= (others => '0');
+            hp_cmd_pulse_r  <= '0';
+            wd_counter      <= (others => '0');
         elsif rising_edge(clock) then
             hp_cmd_pulse_r <= '0';
 
@@ -175,10 +193,17 @@ begin
                     freq_sr <= freq_sr(23 downto 0) & rx_data;
                 end if;
 
+                -- V4.4 spec p.35: byte 1443 = 0-31dB step attenuator before
+                -- ADC0 (Thetis "RX1").  Only low 5 bits are defined.
+                if n_byte_idx = to_unsigned(1443, n_byte_idx'length) then
+                    atten_latched <= rx_data(4 downto 0);
+                end if;
+
                 if rx_eop = '1' then
-                    host_rx0_freq_r <= freq_sr;           -- commit assembled value
-                    hp_cmd_pulse_r  <= '1';
-                    wd_counter      <= (others => '0');   -- refresh on each command
+                    host_rx0_freq_r  <= freq_sr;          -- commit assembled value
+                    host_rx0_atten_r <= atten_latched;    -- commit at packet boundary
+                    hp_cmd_pulse_r   <= '1';
+                    wd_counter       <= (others => '0');  -- refresh on each command
                     n_byte_idx := (others => '0');
                 else
                     n_byte_idx := n_byte_idx + 1;
