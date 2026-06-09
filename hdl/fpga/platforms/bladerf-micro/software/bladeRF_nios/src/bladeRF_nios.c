@@ -106,13 +106,16 @@ static inline uint64_t hpsdr_phase_to_tune_hz(uint32_t phase, int32_t lo_offset)
 
 /* HP Cmd byte 1401 bits [7:2] -> AD9361 LO offset in Hz.
  *   X = 0  -> 70 MHz (bladeRF RX floor; see feedback_bladerf_rx_70mhz_floor)
- *   X = 1  -> 220 MHz
- *   X = 39 -> 5920 MHz (highest useful before the 6 GHz AD9361 ceiling)
- * X >= 40 will be rejected by _modify_spdt_bits_by_freq inside the RFIC
- * call -- no fabric/NIOS clamp added; the dispatcher just prints FAIL. */
+ *   X = 1  -> 192 MHz
+ *   X = 48 -> 5926 MHz (highest useful before the 6 GHz AD9361 ceiling)
+ * Step is 122 MHz (NOT 150) so each band fits inside one full sweep of
+ * hpsdr_phase_to_tune_hz (122.88 MHz span); 150 MHz steps left a gap
+ * the host's phase word couldn't reach.  X >= 49 will be rejected by
+ * _modify_spdt_bits_by_freq inside the RFIC call -- no fabric/NIOS
+ * clamp added; the dispatcher just prints FAIL. */
 static inline int32_t hpsdr_band_to_lo_offset_hz(uint8_t band)
 {
-    return ((int32_t)70 + (int32_t)(band & 0x3F) * 150) * 1000000;
+    return ((int32_t)70 + (int32_t)(band & 0x3F) * 122) * 1000000;
 }
 /* Bring RX0 online with no host / bladeRF-cli session.  Set to 0 to revert to
  * purely host-driven bring-up for bench debugging.  The bring-up runs from the
@@ -690,25 +693,8 @@ int main(void)
              * in the RFFE control register (the same bit libbladeRF's
              * bladerf_set_bias_tee writes through the host backend). */
             {
-                uint32_t biastee_raw =
-                    IORD_ALTERA_AVALON_PIO_DATA(HPSDR_RX_BIASTEE_BASE);
-                uint8_t biastee = (uint8_t)(biastee_raw & 0x1);
-
-                /* TEMPORARY DIAGNOSTIC: dump the raw PIO read + mask + RFFE
-                 * register once per ~500k iterations so we can see what the
-                 * fabric is actually presenting on hpsdr_rx_biastee.  Remove
-                 * once the bias-tee path is verified. */
-                {
-                    static uint32_t poll_count = 0;
-                    if (++poll_count >= 500000) {
-                        DBG("HPSDR: biastee raw=%x masked=%x prev=%x rffe=%x\n",
-                            (unsigned)biastee_raw,
-                            biastee,
-                            hpsdr_rx_biastee_prev,
-                            (unsigned)rffe_csr_read());
-                        poll_count = 0;
-                    }
-                }
+                uint8_t biastee = (uint8_t)(
+                    IORD_ALTERA_AVALON_PIO_DATA(HPSDR_RX_BIASTEE_BASE) & 0x1);
 
                 if (biastee != hpsdr_rx_biastee_prev) {
                     uint32_t reg = rffe_csr_read();
