@@ -57,6 +57,7 @@ set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/hpsdr_hp_cmd_handler.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/hpsdr_ddc_spec_handler.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/hpsdr_cmd_mux.vhd]]
+set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/hpsdr_dc_blocker.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/hpsdr_ddc_iq_sender.vhd]]
 set_global_assignment -name VHDL_FILE [file normalize [file join $here vhdl/eem/tx_arbiter.vhd]]
 set_global_assignment -name VERILOG_FILE [file normalize [file join $here vhdl/eem/cic_integrator.v]]

@@ -128,7 +128,7 @@ static inline uint64_t hpsdr_phase_to_tune_hz(uint32_t phase, int32_t lo_offset)
  * The post-offset frequency still has to land in the AD9361's 70 MHz..6 GHz
  * range or _modify_spdt_bits_by_freq() returns BLADERF_ERR_INVAL. */
 #  ifndef HPSDR_LO_OFFSET_HZ
-#    define HPSDR_LO_OFFSET_HZ 400000000
+#    define HPSDR_LO_OFFSET_HZ 830000000
 #  endif
 #endif
 

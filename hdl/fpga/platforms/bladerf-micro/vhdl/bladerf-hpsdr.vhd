@@ -284,10 +284,15 @@ architecture hpsdr_bladerf of bladerf is
     signal hpsdr_ddc_tx_ready     : std_logic;
     signal hpsdr_ddc_send_pulse   : std_logic;
 
-    -- HPSDR DDC RX path: hpsdr_ddc (rx_clock) -> async FIFO -> ddc_iq_sender.
+    -- HPSDR DDC RX path: hpsdr_ddc (rx_clock) -> dc_blocker -> async FIFO ->
+    -- ddc_iq_sender.  The dc_blocker kills the AD9361 zero-IF DC/LO-leakage
+    -- spike at the panadapter centre bin.
     signal ddc_out_i              : signed(23 downto 0);
     signal ddc_out_q              : signed(23 downto 0);
     signal ddc_out_valid          : std_logic;
+    signal ddc_dc_i               : signed(23 downto 0);
+    signal ddc_dc_q               : signed(23 downto 0);
+    signal ddc_dc_valid           : std_logic;
     signal ddc_fifo_wrdata        : std_logic_vector(47 downto 0);
     signal ddc_fifo_wrfull        : std_logic;
     signal ddc_fifo_rddata        : std_logic_vector(47 downto 0);
@@ -1840,7 +1845,32 @@ begin
             out_valid    => ddc_out_valid
         );
 
-    ddc_fifo_wrdata <= std_logic_vector(ddc_out_i) & std_logic_vector(ddc_out_q);
+    -- ------------------------------------------------------------------------
+    -- DC blocker: one-pole IIR per channel, R = 1 - 2^-13 -> ~0.93 Hz corner
+    -- at 48 kHz.  Removes the AD9361 zero-IF DC / LO-leakage spike from the
+    -- panadapter centre bin without disturbing anything human-audible.  Not
+    -- reset by ddc_fifo_aclr / host_run so the IIR stays converged between
+    -- Thetis reconnects -- first IQ packet after engagement is already
+    -- DC-clean.  K bumped from 11 -> 13 to deepen the notch against the
+    -- residual high-gain DC seen on the panadapter; ~0.8 s settling time.
+    -- ------------------------------------------------------------------------
+    U_hpsdr_dc_blocker : entity work.hpsdr_dc_blocker
+        generic map (
+            WIDTH => 24,
+            K     => 13
+        )
+        port map (
+            clock     => rx_clock,
+            reset     => rx_reset,
+            in_i      => ddc_out_i,
+            in_q      => ddc_out_q,
+            in_valid  => ddc_out_valid,
+            out_i     => ddc_dc_i,
+            out_q     => ddc_dc_q,
+            out_valid => ddc_dc_valid
+        );
+
+    ddc_fifo_wrdata <= std_logic_vector(ddc_dc_i) & std_logic_vector(ddc_dc_q);
     ddc_fifo_aclr   <= not hpsdr_host_run;   -- clear FIFO unless engaged
 
     U_hpsdr_ddc_iq_fifo : entity work.common_dcfifo
@@ -1856,7 +1886,7 @@ begin
             aclr    => ddc_fifo_aclr,
             data    => ddc_fifo_wrdata,
             wrclk   => rx_clock,
-            wrreq   => ddc_out_valid and (not ddc_fifo_wrfull),
+            wrreq   => ddc_dc_valid and (not ddc_fifo_wrfull),
             wrempty => open,
             wrfull  => ddc_fifo_wrfull,
             wrusedw => open,
