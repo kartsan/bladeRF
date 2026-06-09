@@ -35,6 +35,16 @@
 --                    committed at rx_eop and republished as host_rx0_atten;
 --                    hpsdr_cmd_mux maps it to BLADERF_RFIC_COMMAND_GAIN with
 --                    value = 60 - atten.
+--   * host_band_index (byte 1401 bits [7:2], 0..63) - virtual-band selector
+--                    repurposed from V4.4 spec p.34's open-collector enables.
+--                    NIOS derives the LO offset as (70 + X*150) MHz so each
+--                    band sits in the AD9361's 70 MHz..6 GHz range; X=0 -> 70
+--                    MHz, the bladeRF RX floor.  Committed at rx_eop with the
+--                    other fields, exposed via its own PIO (NIOS reads it
+--                    inside the FREQUENCY dispatch).  hpsdr_cmd_mux also
+--                    re-issues a FREQUENCY op when only this byte changes, so
+--                    a band switch retunes the radio even if the Thetis dial
+--                    didn't move.
 --   * host_port     (HP Command's UDP source ephemeral, latched at rx_sop) -
 --                    the dst port HP Status / DDC IQ replies must target.
 --                    Thetis binds its receive socket to its HP Command sendto()
@@ -96,6 +106,10 @@ entity hpsdr_hp_cmd_handler is
         -- committed at rx_eop.  Held across packets until the next command.
         host_rx0_atten   : out std_logic_vector(4 downto 0);
 
+        -- Virtual-band index (HP Command byte 1401 bits [7:2], 0..63).  NIOS
+        -- converts to LO offset (70 + X*150) MHz.  Committed at rx_eop.
+        host_band_index  : out std_logic_vector(5 downto 0);
+
         -- One cycle per fully-consumed HP Command (~10 Hz once engaged).
         hp_cmd_pulse     : out std_logic
     );
@@ -121,32 +135,40 @@ architecture arch of hpsdr_hp_cmd_handler is
     signal atten_latched   : std_logic_vector(4 downto 0) := (others => '0');
     signal host_rx0_atten_r: std_logic_vector(4 downto 0) := (others => '0');
 
+    -- Virtual-band index: byte 1401 bits [7:2], captured mid-packet and
+    -- committed to host_band_index_r at rx_eop.
+    signal band_latched     : std_logic_vector(5 downto 0) := (others => '0');
+    signal host_band_index_r: std_logic_vector(5 downto 0) := (others => '0');
+
     -- Watchdog (see RUN_TIMEOUT_CYCLES).
     signal wd_counter     : unsigned(27 downto 0) := (others => '0');
 
 begin
 
-    host_run       <= host_run_r;
-    host_ptt0      <= host_ptt0_r;
-    host_port      <= host_port_r;
-    host_rx0_freq  <= host_rx0_freq_r;
-    host_rx0_atten <= host_rx0_atten_r;
-    hp_cmd_pulse   <= hp_cmd_pulse_r;
+    host_run        <= host_run_r;
+    host_ptt0       <= host_ptt0_r;
+    host_port       <= host_port_r;
+    host_rx0_freq   <= host_rx0_freq_r;
+    host_rx0_atten  <= host_rx0_atten_r;
+    host_band_index <= host_band_index_r;
+    hp_cmd_pulse    <= hp_cmd_pulse_r;
 
     fsm : process(clock, reset)
         variable n_byte_idx : unsigned(10 downto 0);
     begin
         if reset = '1' then
-            byte_idx        <= (others => '0');
-            host_run_r      <= '0';
-            host_ptt0_r     <= '0';
-            host_port_r     <= (others => '0');
-            freq_sr         <= (others => '0');
-            host_rx0_freq_r <= (others => '0');
-            atten_latched   <= (others => '0');
-            host_rx0_atten_r<= (others => '0');
-            hp_cmd_pulse_r  <= '0';
-            wd_counter      <= (others => '0');
+            byte_idx         <= (others => '0');
+            host_run_r       <= '0';
+            host_ptt0_r      <= '0';
+            host_port_r      <= (others => '0');
+            freq_sr          <= (others => '0');
+            host_rx0_freq_r  <= (others => '0');
+            atten_latched    <= (others => '0');
+            host_rx0_atten_r <= (others => '0');
+            band_latched     <= (others => '0');
+            host_band_index_r<= (others => '0');
+            hp_cmd_pulse_r   <= '0';
+            wd_counter       <= (others => '0');
         elsif rising_edge(clock) then
             hp_cmd_pulse_r <= '0';
 
@@ -199,11 +221,20 @@ begin
                     atten_latched <= rx_data(4 downto 0);
                 end if;
 
+                -- V4.4 spec p.34: byte 1401 = open-collector enables.  We
+                -- repurpose bits [7:2] as a 6-bit virtual-band index that
+                -- NIOS converts into an AD9361 LO offset.  Bit [0] (PA enable)
+                -- and bit [1] (audio mute) are out of scope here.
+                if n_byte_idx = to_unsigned(1401, n_byte_idx'length) then
+                    band_latched <= rx_data(7 downto 2);
+                end if;
+
                 if rx_eop = '1' then
-                    host_rx0_freq_r  <= freq_sr;          -- commit assembled value
-                    host_rx0_atten_r <= atten_latched;    -- commit at packet boundary
-                    hp_cmd_pulse_r   <= '1';
-                    wd_counter       <= (others => '0');  -- refresh on each command
+                    host_rx0_freq_r   <= freq_sr;          -- commit assembled value
+                    host_rx0_atten_r  <= atten_latched;    -- commit at packet boundary
+                    host_band_index_r <= band_latched;
+                    hp_cmd_pulse_r    <= '1';
+                    wd_counter        <= (others => '0');  -- refresh on each command
                     n_byte_idx := (others => '0');
                 else
                     n_byte_idx := n_byte_idx + 1;

@@ -445,6 +445,14 @@ architecture hpsdr_bladerf of bladerf is
     -- value = 60 - atten.
     signal host_rx0_atten         : std_logic_vector(4 downto 0);
 
+    -- HPSDR virtual-band index (HP Command byte 1401 bits [7:2], 0..63).
+    -- Same-domain copy feeds hpsdr_cmd_mux's FREQUENCY trigger; the
+    -- per-bit synchronised copy below crosses to sys_clock for the NIOS
+    -- dispatcher to read inside its FREQUENCY handler (LO offset =
+    -- (70 + X*150) MHz).
+    signal host_band_index        : std_logic_vector(5 downto 0);
+    signal host_band_index_sync   : std_logic_vector(5 downto 0) := (others => '0');
+
     -- HPSDR command mailbox -- generic surface for any libbladeRF RFIC
     -- command (FREQUENCY, GAIN, BANDWIDTH, GAINMODE, FILTER, TXMUTE, RSSI,
     -- ...) issued from fabric to NIOS via PIOs.  See nios_system.tcl's
@@ -583,7 +591,8 @@ architecture hpsdr_bladerf of bladerf is
         hpsdr_cmd_op_export            :   in  std_logic_vector(15 downto 0) := (others => '0');
         hpsdr_cmd_data_lo_export       :   out std_logic_vector(31 downto 0);
         hpsdr_cmd_data_hi_export       :   out std_logic_vector(31 downto 0);
-        hpsdr_cmd_status_export        :   out std_logic_vector(7  downto 0)
+        hpsdr_cmd_status_export        :   out std_logic_vector(7  downto 0);
+        hpsdr_band_index_export        :   in  std_logic_vector(5  downto 0) := (others => '0')
       );
     end component;
 begin
@@ -1160,6 +1169,7 @@ begin
             host_port        => hpsdr_hp_cmd_host_port,
             host_rx0_freq    => host_rx0_freq,
             host_rx0_atten   => host_rx0_atten,
+            host_band_index  => host_band_index,
 
             hp_cmd_pulse     => hpsdr_hp_cmd_decode_pulse
         );
@@ -1197,12 +1207,13 @@ begin
     -- ========================================================================
     U_hpsdr_cmd_mux : entity work.hpsdr_cmd_mux
         port map (
-            clock        => fx3_pclk_pll,
-            reset        => sys_reset_pclk,
+            clock          => fx3_pclk_pll,
+            reset          => sys_reset_pclk,
 
-            rx0_freq     => host_rx0_freq,
-            rx0_atten    => host_rx0_atten,
-            hp_cmd_pulse => hpsdr_hp_cmd_decode_pulse,
+            rx0_freq       => host_rx0_freq,
+            rx0_band_index => host_band_index,
+            rx0_atten      => host_rx0_atten,
+            hp_cmd_pulse   => hpsdr_hp_cmd_decode_pulse,
 
             cmd_op       => hpsdr_cmd_op_fab,
             cmd_data_in  => hpsdr_cmd_data_in_fab,
@@ -1569,7 +1580,8 @@ begin
             hpsdr_cmd_op_export            => hpsdr_cmd_op_sync,
             hpsdr_cmd_data_lo_export       => hpsdr_cmd_data_lo_nios,
             hpsdr_cmd_data_hi_export       => hpsdr_cmd_data_hi_nios,
-            hpsdr_cmd_status_export        => hpsdr_cmd_status_nios
+            hpsdr_cmd_status_export        => hpsdr_cmd_status_nios,
+            hpsdr_band_index_export        => host_band_index_sync
         );
 
     -- FX3 UART
@@ -2232,6 +2244,23 @@ begin
             clock               =>  sys_clock,
             async               =>  hpsdr_cmd_op_fab(i),
             sync                =>  hpsdr_cmd_op_sync(i)
+          );
+    end generate;
+
+    -- Virtual-band index CDC (fx3_pclk_pll -> sys_clock).  NIOS reads this
+    -- after the mailbox 2-poll stability check has already settled cmd_op
+    -- for many sys_clock cycles, so per-bit sync without gray coding is
+    -- safe -- the band PIO has long since reached its final value before
+    -- the FREQUENCY dispatch actually fires.
+    generate_sync_host_band_index : for i in host_band_index'range generate
+        U_sync_host_band_index : entity work.synchronizer
+          generic map (
+            RESET_LEVEL         =>  '0'
+          ) port map (
+            reset               =>  '0',
+            clock               =>  sys_clock,
+            async               =>  host_band_index(i),
+            sync                =>  host_band_index_sync(i)
           );
     end generate;
 

@@ -24,14 +24,20 @@
 -- consistency check, so we don't need a separate hold timer in fabric.
 --
 -- Sources today:
---   * rx0_freq  (32b NCO phase word, from hp_cmd_handler bytes 9..12) ->
---               (FREQUENCY, RX0, W, phase).  Skipped while 0 so the
---               pre-engagement default doesn't issue a bogus retune.
---   * rx0_atten (5b step attenuator, from hp_cmd_handler byte 1443) ->
---               (GAIN, RX0, W, 60 - atten).  Issued whenever the latest
---               HP Cmd value differs from the value we last issued, so the
---               first packet after engagement that carries atten=0 won't
---               fire (matches the bring-up GAIN=60 default).
+--   * rx0_freq       (32b NCO phase word, from hp_cmd_handler bytes 9..12)
+--                    -> (FREQUENCY, RX0, W, phase).  Skipped while 0 so the
+--                    pre-engagement default doesn't issue a bogus retune.
+--   * rx0_band_index (6b virtual-band index, from byte 1401 bits [7:2])
+--                    -> also gates (FREQUENCY, RX0, W, phase) so a band
+--                    switch with an unchanged Thetis dial still retunes the
+--                    AD9361.  NIOS reads the band PIO directly to derive the
+--                    LO offset; the mailbox payload is still just the phase.
+--   * rx0_atten      (5b step attenuator, from byte 1443)
+--                    -> (GAIN, RX0, W, 60 - atten).  Issued whenever the
+--                    latest HP Cmd value differs from the value we last
+--                    issued, so the first packet after engagement that
+--                    carries atten=0 won't fire (matches the bring-up
+--                    GAIN=60 default).
 --
 -- Read-back ports (cmd_data_lo/_hi, cmd_status) come in synchronised to
 -- this clock but aren't yet consumed -- they're exposed so the wiring
@@ -49,6 +55,12 @@ entity hpsdr_cmd_mux is
 
         -- Source A: RX0 frequency (NCO phase word from hp_cmd_handler).
         rx0_freq        : in  std_logic_vector(31 downto 0);
+
+        -- Source A': virtual-band index (HP Cmd byte 1401 bits [7:2]).
+        -- A change here re-fires a FREQUENCY op even if rx0_freq is
+        -- unchanged, so a band switch retunes the AD9361.  The value is
+        -- consumed by NIOS via its own PIO, not via the mailbox payload.
+        rx0_band_index  : in  std_logic_vector(5 downto 0);
 
         -- Source B: RX0 step attenuator in dB, 0..31 (hp_cmd_handler
         -- byte 1443).  Mux issues GAIN = 60 - atten.
@@ -93,9 +105,10 @@ architecture rtl of hpsdr_cmd_mux is
 
     -- "Last issued" snapshots; we only fire if the latest HP Cmd value
     -- differs from what NIOS already knows.  Initialised to 0 so the first
-    -- HP Cmd carrying atten=0 / freq=0 is a no-op.
-    signal rx0_freq_issued  : std_logic_vector(31 downto 0) := (others => '0');
-    signal rx0_atten_issued : std_logic_vector(4 downto 0)  := (others => '0');
+    -- HP Cmd carrying atten=0 / freq=0 / band=0 is a no-op.
+    signal rx0_freq_issued       : std_logic_vector(31 downto 0) := (others => '0');
+    signal rx0_band_index_issued : std_logic_vector(5 downto 0)  := (others => '0');
+    signal rx0_atten_issued      : std_logic_vector(4 downto 0)  := (others => '0');
 
     signal seq_r          : unsigned(3 downto 0) := (others => '0');
     signal cmd_op_r       : std_logic_vector(15 downto 0) := (others => '0');
@@ -124,26 +137,34 @@ begin
         variable next_seq_v  : unsigned(3 downto 0);
     begin
         if (reset = '1') then
-            rx0_freq_issued  <= (others => '0');
-            rx0_atten_issued <= (others => '0');
-            seq_r            <= (others => '0');
-            cmd_op_r         <= (others => '0');
-            cmd_data_in_r    <= (others => '0');
+            rx0_freq_issued       <= (others => '0');
+            rx0_band_index_issued <= (others => '0');
+            rx0_atten_issued      <= (others => '0');
+            seq_r                 <= (others => '0');
+            cmd_op_r              <= (others => '0');
+            cmd_data_in_r         <= (others => '0');
         elsif rising_edge(clock) then
             -- One issue per HP Cmd, freq before gain.  Source B's deferred
             -- write catches up on the very next pulse.
             if hp_cmd_pulse = '1' then
                 next_seq_v := seq_r + 1;
 
-                if (rx0_freq /= rx0_freq_issued) and
+                -- FREQUENCY re-fires when the Thetis phase OR the virtual
+                -- band changes, since both feed the AD9361 tune (NIOS reads
+                -- the band PIO inside its FREQUENCY dispatch to derive the
+                -- LO offset).  Still gated on a non-zero phase so the
+                -- pre-engagement boot state never issues a bogus retune.
+                if ((rx0_freq /= rx0_freq_issued) or
+                    (rx0_band_index /= rx0_band_index_issued)) and
                    (rx0_freq /= x"00000000") then
-                    seq_r           <= next_seq_v;
-                    cmd_data_in_r   <= rx0_freq;
-                    cmd_op_r        <= std_logic_vector(next_seq_v) &
-                                       RW_WRITE                     &
-                                       CH_RX0                       &
-                                       OP_FREQUENCY;
-                    rx0_freq_issued <= rx0_freq;
+                    seq_r                 <= next_seq_v;
+                    cmd_data_in_r         <= rx0_freq;
+                    cmd_op_r              <= std_logic_vector(next_seq_v) &
+                                             RW_WRITE                    &
+                                             CH_RX0                      &
+                                             OP_FREQUENCY;
+                    rx0_freq_issued       <= rx0_freq;
+                    rx0_band_index_issued <= rx0_band_index;
                 elsif rx0_atten /= rx0_atten_issued then
                     gain_dB_v        := GAIN_ANCHOR_DB -
                                         to_integer(unsigned(rx0_atten));

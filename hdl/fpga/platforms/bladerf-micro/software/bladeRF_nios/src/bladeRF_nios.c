@@ -85,17 +85,34 @@ static inline bladerf_channel hpsdr_decode_channel(uint8_t ch)
     }
 }
 
-/* Virtual-transverter LO offset applied to FREQUENCY writes (see
- * HPSDR_LO_OFFSET_HZ below).  Discovery advertises FREQ_PHASE=0x01 (Orion
- * MkII), so cmd_data_in is a 32-bit NCO phase word, NOT Hz.  Convert with
- * freq_Hz = phase * 122.88e6 / 2^32 (122.88 MHz = Orion MkII DSP clock),
- * then add the transverter LO.  Clamp negative results to 0; the RFIC
- * layer rejects sub-70 MHz anyway via _modify_spdt_bits_by_freq. */
+/* Virtual-transverter LO offset applied to FREQUENCY writes.  The LO offset
+ * is derived at runtime from HP Cmd byte 1401 bits [7:2] (see
+ * HPSDR_BAND_INDEX_BASE below): the fabric publishes that 6-bit index on the
+ * hpsdr_band_index PIO, and the FREQUENCY dispatcher computes
+ *   lo_offset_Hz = (70 + X * 150) * 1e6
+ * before calling this helper, so each band sits in the AD9361's 70 MHz..
+ * 6 GHz window (X = 0 lands exactly on the 70 MHz RX floor).  Discovery
+ * advertises FREQ_PHASE = 0x01 (Orion MkII), so cmd_data_in is a 32-bit NCO
+ * phase word, NOT Hz; convert with freq_Hz = phase * 122.88e6 / 2^32
+ * (122.88 MHz = Orion MkII DSP clock), then add the LO offset.  Clamp
+ * negative results to 0; the RFIC layer rejects sub-70 MHz anyway via
+ * _modify_spdt_bits_by_freq. */
 static inline uint64_t hpsdr_phase_to_tune_hz(uint32_t phase, int32_t lo_offset)
 {
     uint32_t if_hz       = (uint32_t)(((uint64_t)phase * 122880000ULL) >> 32);
     int64_t  signed_tune = (int64_t)if_hz + (int64_t)lo_offset;
     return (signed_tune < 0) ? 0u : (uint64_t)signed_tune;
+}
+
+/* HP Cmd byte 1401 bits [7:2] -> AD9361 LO offset in Hz.
+ *   X = 0  -> 70 MHz (bladeRF RX floor; see feedback_bladerf_rx_70mhz_floor)
+ *   X = 1  -> 220 MHz
+ *   X = 39 -> 5920 MHz (highest useful before the 6 GHz AD9361 ceiling)
+ * X >= 40 will be rejected by _modify_spdt_bits_by_freq inside the RFIC
+ * call -- no fabric/NIOS clamp added; the dispatcher just prints FAIL. */
+static inline int32_t hpsdr_band_to_lo_offset_hz(uint8_t band)
+{
+    return ((int32_t)70 + (int32_t)(band & 0x3F) * 150) * 1000000;
 }
 /* Bring RX0 online with no host / bladeRF-cli session.  Set to 0 to revert to
  * purely host-driven bring-up for bench debugging.  The bring-up runs from the
@@ -113,23 +130,6 @@ static inline uint64_t hpsdr_phase_to_tune_hz(uint32_t phase, int32_t lo_offset)
 /* Native AD9361 RX rate: matches U_hpsdr_ddc DECIMATION=256 -> 48 kHz, and is
  * above the AD9361 decimation-FIR floor so a single SAMPLERATE command works. */
 #  define HPSDR_RX_SAMPLERATE 12288000u
-/* Virtual-transverter LO offset (Hz, signed).  Added to the IF frequency Thetis
- * sends in the HP Command before commanding the AD9361, so the radio behaves as
- * if a transverter sits between it and the antenna.  Lets one work above the
- * 61.44 MHz Thetis NCO half-Nyquist cap, and around the 70 MHz bladeRF RX
- * floor.  Thetis's own Setup -> Transverter dialog must be set to the same LO
- * so its dial display reads the true RF frequency.  Set to 0 to disable.
- *
- * Examples (Thetis dial range 0..61.43 MHz):
- *   HPSDR_LO_OFFSET_HZ =  100000000 -> covers 100..161.44 MHz (2 m band)
- *   HPSDR_LO_OFFSET_HZ =  400000000 -> covers 400..461.44 MHz (70 cm band)
- *   HPSDR_LO_OFFSET_HZ = 1090000000 -> covers 1090..1151.44 MHz (ADS-B / 23 cm)
- *
- * The post-offset frequency still has to land in the AD9361's 70 MHz..6 GHz
- * range or _modify_spdt_bits_by_freq() returns BLADERF_ERR_INVAL. */
-#  ifndef HPSDR_LO_OFFSET_HZ
-#    define HPSDR_LO_OFFSET_HZ 830000000
-#  endif
 #endif
 
 #define BLADERF_DEVICE_NAME "Nuand bladeRF 2.0 Micro"
@@ -627,15 +627,24 @@ int main(void)
 
                     if (!rw) {
                         /* FREQUENCY is an unsigned 32b NCO phase word; the
-                         * helper expands it to Hz.  Everything else (GAIN in
-                         * dB, BANDWIDTH, ...) may legitimately be negative,
-                         * so reinterpret din as int32 and sign-extend to
-                         * int64 before handing it to rfic_command_write_immed
-                         * (which takes int64 by contract). */
-                        uint64_t value = (op == BLADERF_RFIC_COMMAND_FREQUENCY)
-                            ? hpsdr_phase_to_tune_hz(din,
-                                                     (int32_t)HPSDR_LO_OFFSET_HZ)
-                            : (uint64_t)(int64_t)(int32_t)din;
+                         * helper expands it to Hz and adds the LO offset
+                         * derived from HP Cmd byte 1401 (read here so a band
+                         * switch between two FREQUENCY ops is picked up).
+                         * Everything else (GAIN in dB, BANDWIDTH, ...) may
+                         * legitimately be negative, so reinterpret din as
+                         * int32 and sign-extend to int64 before handing it to
+                         * rfic_command_write_immed (which takes int64). */
+                        uint64_t value;
+                        if (op == BLADERF_RFIC_COMMAND_FREQUENCY) {
+                            uint8_t band = (uint8_t)
+                                IORD_ALTERA_AVALON_PIO_DATA(
+                                    HPSDR_BAND_INDEX_BASE);
+                            value = hpsdr_phase_to_tune_hz(
+                                        din,
+                                        hpsdr_band_to_lo_offset_hz(band));
+                        } else {
+                            value = (uint64_t)(int64_t)(int32_t)din;
+                        }
                         ok = rfic_command_write_immed(
                                  (bladerf_rfic_command)op, bch, value);
                         DBG("HPSDR: W op=%x ch=%x din=%x val=%x:%x %s\n",

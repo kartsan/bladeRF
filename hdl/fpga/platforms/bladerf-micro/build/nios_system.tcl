@@ -731,6 +731,14 @@ if { $platform_revision == "hpsdr" } {
     #
     # hpsdr_status (engagement state, bit0=host_valid, bit1=host_run) stays a
     # separate Input PIO -- conceptually unrelated to command response status.
+    #
+    # hpsdr_band_index (6b, Input, fabric -> NIOS) is a sibling PIO: it carries
+    # HP Cmd byte 1401 bits [7:2] (a virtual-band selector repurposed from the
+    # V4.4 open-collector enables).  NIOS reads it inside the FREQUENCY
+    # dispatch and derives LO offset = (70 + X*150) MHz before handing the
+    # final Hz to the AD9361.  Lives outside the mailbox because the cmd_op
+    # 2-poll-stability check gives the band CDC plenty of settle time before
+    # NIOS acts on the matching FREQUENCY entry.
 
     add_instance hpsdr_cmd_data_in altera_avalon_pio
     set_instance_parameter_value hpsdr_cmd_data_in {bitClearingEdgeCapReg} {0}
@@ -869,6 +877,29 @@ if { $platform_revision == "hpsdr" } {
     set_connection_parameter_value nios2.data_master/hpsdr_cmd_status.s1 arbitrationPriority {1}
     set_connection_parameter_value nios2.data_master/hpsdr_cmd_status.s1 baseAddress {0x91c0}
     set_connection_parameter_value nios2.data_master/hpsdr_cmd_status.s1 defaultConnection {0}
+
+    add_instance hpsdr_band_index altera_avalon_pio
+    set_instance_parameter_value hpsdr_band_index {bitClearingEdgeCapReg} {0}
+    set_instance_parameter_value hpsdr_band_index {bitModifyingOutReg} {0}
+    set_instance_parameter_value hpsdr_band_index {captureEdge} {0}
+    set_instance_parameter_value hpsdr_band_index {direction} {Input}
+    set_instance_parameter_value hpsdr_band_index {edgeType} {RISING}
+    set_instance_parameter_value hpsdr_band_index {generateIRQ} {0}
+    set_instance_parameter_value hpsdr_band_index {irqType} {LEVEL}
+    set_instance_parameter_value hpsdr_band_index {resetValue} {0.0}
+    set_instance_parameter_value hpsdr_band_index {simDoTestBenchWiring} {0}
+    set_instance_parameter_value hpsdr_band_index {simDrivenValue} {0.0}
+    set_instance_parameter_value hpsdr_band_index {width} {6}
+
+    add_interface hpsdr_band_index conduit end
+    set_interface_property hpsdr_band_index EXPORT_OF hpsdr_band_index.external_connection
+
+    add_connection system_clock.clk hpsdr_band_index.clk
+    add_connection system_clock.clk_reset hpsdr_band_index.reset
+    add_connection nios2.data_master hpsdr_band_index.s1
+    set_connection_parameter_value nios2.data_master/hpsdr_band_index.s1 arbitrationPriority {1}
+    set_connection_parameter_value nios2.data_master/hpsdr_band_index.s1 baseAddress {0x91d0}
+    set_connection_parameter_value nios2.data_master/hpsdr_band_index.s1 defaultConnection {0}
 }
 
 save_system {nios_system.qsys}
