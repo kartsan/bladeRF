@@ -284,15 +284,19 @@ architecture hpsdr_bladerf of bladerf is
     signal hpsdr_ddc_tx_ready     : std_logic;
     signal hpsdr_ddc_send_pulse   : std_logic;
 
-    -- HPSDR DDC RX path: hpsdr_ddc (rx_clock) -> dc_blocker -> async FIFO ->
-    -- ddc_iq_sender.  The dc_blocker kills the AD9361 zero-IF DC/LO-leakage
-    -- spike at the panadapter centre bin.
+    -- HPSDR DDC RX path: hpsdr_ddc (rx_clock) -> dc_blocker -> cfir
+    -- -> async FIFO -> ddc_iq_sender.  The dc_blocker kills the AD9361
+    -- zero-IF DC/LO-leakage spike at the panadapter centre bin; the cfir
+    -- flattens the 5-stage CIC sinc^5 droop across the displayed band.
     signal ddc_out_i              : signed(23 downto 0);
     signal ddc_out_q              : signed(23 downto 0);
     signal ddc_out_valid          : std_logic;
     signal ddc_dc_i               : signed(23 downto 0);
     signal ddc_dc_q               : signed(23 downto 0);
     signal ddc_dc_valid           : std_logic;
+    signal ddc_cfir_i             : signed(23 downto 0);
+    signal ddc_cfir_q             : signed(23 downto 0);
+    signal ddc_cfir_valid         : std_logic;
     signal ddc_fifo_wrdata        : std_logic_vector(47 downto 0);
     signal ddc_fifo_wrfull        : std_logic;
     signal ddc_fifo_rddata        : std_logic_vector(47 downto 0);
@@ -1870,7 +1874,28 @@ begin
             out_valid => ddc_dc_valid
         );
 
-    ddc_fifo_wrdata <= std_logic_vector(ddc_dc_i) & std_logic_vector(ddc_dc_q);
+    -- ------------------------------------------------------------------------
+    -- CIC sinc^5 compensation FIR: 5-tap symmetric, analytical inverse-sinc
+    -- design.  Flattens the panadapter noise floor across ~+/- 30% of the
+    -- DDC output Nyquist (within ~1 dB).  Reset rules match the dc_blocker;
+    -- runs at the CIC output rate (variable, follows hpsdr_rate_id_gray).
+    -- ------------------------------------------------------------------------
+    U_hpsdr_cfir : entity work.hpsdr_cfir
+        generic map (
+            WIDTH => 24
+        )
+        port map (
+            clock     => rx_clock,
+            reset     => rx_reset,
+            in_i      => ddc_dc_i,
+            in_q      => ddc_dc_q,
+            in_valid  => ddc_dc_valid,
+            out_i     => ddc_cfir_i,
+            out_q     => ddc_cfir_q,
+            out_valid => ddc_cfir_valid
+        );
+
+    ddc_fifo_wrdata <= std_logic_vector(ddc_cfir_i) & std_logic_vector(ddc_cfir_q);
     ddc_fifo_aclr   <= not hpsdr_host_run;   -- clear FIFO unless engaged
 
     U_hpsdr_ddc_iq_fifo : entity work.common_dcfifo
@@ -1886,7 +1911,7 @@ begin
             aclr    => ddc_fifo_aclr,
             data    => ddc_fifo_wrdata,
             wrclk   => rx_clock,
-            wrreq   => ddc_dc_valid and (not ddc_fifo_wrfull),
+            wrreq   => ddc_cfir_valid and (not ddc_fifo_wrfull),
             wrempty => open,
             wrfull  => ddc_fifo_wrfull,
             wrusedw => open,
