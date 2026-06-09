@@ -453,6 +453,14 @@ architecture hpsdr_bladerf of bladerf is
     signal host_band_index        : std_logic_vector(5 downto 0);
     signal host_band_index_sync   : std_logic_vector(5 downto 0) := (others => '0');
 
+    -- HPSDR RX1 bias-tee enable (HP Command byte 1401 bit [1]).  No same-
+    -- domain consumer in fabric -- NIOS reads the synced copy each idle
+    -- iteration and writes RFFE_CONTROL_RX_BIAS_EN to match.  Stays scalar
+    -- because qsys emits the 1-bit PIO export as std_logic (a 1-vector
+    -- here would silently bind to a floating port).
+    signal host_rx_biastee        : std_logic;
+    signal host_rx_biastee_sync   : std_logic := '0';
+
     -- HPSDR command mailbox -- generic surface for any libbladeRF RFIC
     -- command (FREQUENCY, GAIN, BANDWIDTH, GAINMODE, FILTER, TXMUTE, RSSI,
     -- ...) issued from fabric to NIOS via PIOs.  See nios_system.tcl's
@@ -592,7 +600,11 @@ architecture hpsdr_bladerf of bladerf is
         hpsdr_cmd_data_lo_export       :   out std_logic_vector(31 downto 0);
         hpsdr_cmd_data_hi_export       :   out std_logic_vector(31 downto 0);
         hpsdr_cmd_status_export        :   out std_logic_vector(7  downto 0);
-        hpsdr_band_index_export        :   in  std_logic_vector(5  downto 0) := (others => '0')
+        hpsdr_band_index_export        :   in  std_logic_vector(5  downto 0) := (others => '0');
+        -- qsys emits single-bit PIO exports as std_logic (NOT a 1-vector);
+        -- declaring this as std_logic_vector(0 downto 0) compiles but binds
+        -- to a floating port -> NIOS reads 0 always.
+        hpsdr_rx_biastee_export        :   in  std_logic                     := '0'
       );
     end component;
 begin
@@ -1170,6 +1182,7 @@ begin
             host_rx0_freq    => host_rx0_freq,
             host_rx0_atten   => host_rx0_atten,
             host_band_index  => host_band_index,
+            host_rx_biastee  => host_rx_biastee,
 
             hp_cmd_pulse     => hpsdr_hp_cmd_decode_pulse
         );
@@ -1581,7 +1594,8 @@ begin
             hpsdr_cmd_data_lo_export       => hpsdr_cmd_data_lo_nios,
             hpsdr_cmd_data_hi_export       => hpsdr_cmd_data_hi_nios,
             hpsdr_cmd_status_export        => hpsdr_cmd_status_nios,
-            hpsdr_band_index_export        => host_band_index_sync
+            hpsdr_band_index_export        => host_band_index_sync,
+            hpsdr_rx_biastee_export        => host_rx_biastee_sync
         );
 
     -- FX3 UART
@@ -2263,6 +2277,19 @@ begin
             sync                =>  host_band_index_sync(i)
           );
     end generate;
+
+    -- RX bias-tee enable CDC (fx3_pclk_pll -> sys_clock).  Single-bit poll
+    -- in the NIOS idle loop; metastability on the boundary clock is the
+    -- only concern.
+    U_sync_host_rx_biastee : entity work.synchronizer
+      generic map (
+        RESET_LEVEL         =>  '0'
+      ) port map (
+        reset               =>  '0',
+        clock               =>  sys_clock,
+        async               =>  host_rx_biastee,
+        sync                =>  host_rx_biastee_sync
+      );
 
     generate_sync_hpsdr_cmd_data_lo : for i in hpsdr_cmd_data_lo_nios'range generate
         U_sync_hpsdr_cmd_data_lo : entity work.synchronizer

@@ -27,7 +27,7 @@
 
 /* Will send debug alt_printf info to JTAG console while running on NIOS.
  * This can slow performance and cause timing issues... be careful. */
-//#define BLADERF_NIOS_DEBUG
+#define BLADERF_NIOS_DEBUG
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -234,6 +234,11 @@ int main(void)
 #  if HPSDR_AUTONOMOUS_RX_INIT
     bool     hpsdr_brought_up   = false;  /* autonomous bring-up done (one-shot) */
 #  endif
+    /* RX bias-tee track-and-mirror.  Initialised to 0xFF so the first loop
+     * iteration always pushes an explicit value to the RFFE register (rather
+     * than inheriting whatever bit-5 state libbladeRF or a previous boot
+     * left behind). */
+    uint8_t  hpsdr_rx_biastee_prev = 0xFF;
 #endif
 
 #ifdef BLADERF_NIOS_DEBUG
@@ -678,6 +683,45 @@ int main(void)
                 }
 
                 hpsdr_cmd_prev_op = op_word;
+            }
+
+            /* RX1 bias-tee mirror: HP Cmd byte 1401 bit [1] arrives on
+             * hpsdr_rx_biastee.  On any change, flip RFFE_CONTROL_RX_BIAS_EN
+             * in the RFFE control register (the same bit libbladeRF's
+             * bladerf_set_bias_tee writes through the host backend). */
+            {
+                uint32_t biastee_raw =
+                    IORD_ALTERA_AVALON_PIO_DATA(HPSDR_RX_BIASTEE_BASE);
+                uint8_t biastee = (uint8_t)(biastee_raw & 0x1);
+
+                /* TEMPORARY DIAGNOSTIC: dump the raw PIO read + mask + RFFE
+                 * register once per ~500k iterations so we can see what the
+                 * fabric is actually presenting on hpsdr_rx_biastee.  Remove
+                 * once the bias-tee path is verified. */
+                {
+                    static uint32_t poll_count = 0;
+                    if (++poll_count >= 500000) {
+                        DBG("HPSDR: biastee raw=%x masked=%x prev=%x rffe=%x\n",
+                            (unsigned)biastee_raw,
+                            biastee,
+                            hpsdr_rx_biastee_prev,
+                            (unsigned)rffe_csr_read());
+                        poll_count = 0;
+                    }
+                }
+
+                if (biastee != hpsdr_rx_biastee_prev) {
+                    uint32_t reg = rffe_csr_read();
+                    if (biastee) {
+                        reg |=  (1u << RFFE_CONTROL_RX_BIAS_EN);
+                    } else {
+                        reg &= ~(1u << RFFE_CONTROL_RX_BIAS_EN);
+                    }
+                    rffe_csr_write(reg);
+                    DBG("HPSDR: RX biastee -> %s\n",
+                        biastee ? "ON" : "OFF");
+                    hpsdr_rx_biastee_prev = biastee;
+                }
             }
 #endif
         }

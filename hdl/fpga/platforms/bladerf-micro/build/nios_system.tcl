@@ -739,6 +739,14 @@ if { $platform_revision == "hpsdr" } {
     # final Hz to the AD9361.  Lives outside the mailbox because the cmd_op
     # 2-poll-stability check gives the band CDC plenty of settle time before
     # NIOS acts on the matching FREQUENCY entry.
+    #
+    # hpsdr_rx_biastee (1b, Input, fabric -> NIOS) is another sibling: it
+    # carries HP Cmd byte 1401 bit [1], repurposed as RX1 bias-tee power
+    # enable.  NIOS polls it each idle iteration and writes
+    # RFFE_CONTROL_RX_BIAS_EN (=5) of the RFFE control register to match.
+    # Not routed through the mailbox because bias-tee is a plain GPIO bit
+    # rather than an RFIC API command -- it has no BLADERF_RFIC_COMMAND_*
+    # equivalent (libbladeRF exposes it as bladerf_set_bias_tee).
 
     add_instance hpsdr_cmd_data_in altera_avalon_pio
     set_instance_parameter_value hpsdr_cmd_data_in {bitClearingEdgeCapReg} {0}
@@ -900,6 +908,29 @@ if { $platform_revision == "hpsdr" } {
     set_connection_parameter_value nios2.data_master/hpsdr_band_index.s1 arbitrationPriority {1}
     set_connection_parameter_value nios2.data_master/hpsdr_band_index.s1 baseAddress {0x91d0}
     set_connection_parameter_value nios2.data_master/hpsdr_band_index.s1 defaultConnection {0}
+
+    add_instance hpsdr_rx_biastee altera_avalon_pio
+    set_instance_parameter_value hpsdr_rx_biastee {bitClearingEdgeCapReg} {0}
+    set_instance_parameter_value hpsdr_rx_biastee {bitModifyingOutReg} {0}
+    set_instance_parameter_value hpsdr_rx_biastee {captureEdge} {0}
+    set_instance_parameter_value hpsdr_rx_biastee {direction} {Input}
+    set_instance_parameter_value hpsdr_rx_biastee {edgeType} {RISING}
+    set_instance_parameter_value hpsdr_rx_biastee {generateIRQ} {0}
+    set_instance_parameter_value hpsdr_rx_biastee {irqType} {LEVEL}
+    set_instance_parameter_value hpsdr_rx_biastee {resetValue} {0.0}
+    set_instance_parameter_value hpsdr_rx_biastee {simDoTestBenchWiring} {0}
+    set_instance_parameter_value hpsdr_rx_biastee {simDrivenValue} {0.0}
+    set_instance_parameter_value hpsdr_rx_biastee {width} {1}
+
+    add_interface hpsdr_rx_biastee conduit end
+    set_interface_property hpsdr_rx_biastee EXPORT_OF hpsdr_rx_biastee.external_connection
+
+    add_connection system_clock.clk hpsdr_rx_biastee.clk
+    add_connection system_clock.clk_reset hpsdr_rx_biastee.reset
+    add_connection nios2.data_master hpsdr_rx_biastee.s1
+    set_connection_parameter_value nios2.data_master/hpsdr_rx_biastee.s1 arbitrationPriority {1}
+    set_connection_parameter_value nios2.data_master/hpsdr_rx_biastee.s1 baseAddress {0x91e0}
+    set_connection_parameter_value nios2.data_master/hpsdr_rx_biastee.s1 defaultConnection {0}
 }
 
 save_system {nios_system.qsys}
