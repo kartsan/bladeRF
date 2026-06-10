@@ -317,6 +317,67 @@ architecture hpsdr_bladerf of bladerf is
     signal ddc_fifo_rdusedw       : std_logic_vector(8 downto 0);
     signal ddc_fifo_aclr          : std_logic;
 
+    -- ------------------------------------------------------------------------
+    -- HPSDR DUC TX path (host -> radio).  UDP/1029 DUC0 I&Q -> tx_iq_handler ->
+    -- async FIFO (pclk -> tx_clock) -> hpsdr_duc (CIC interpolator) ->
+    -- dac_streams(0) mux, gated by PTT.  TX sample rate comes from UDP/1026
+    -- (duc_spec_handler).  No CORDIC: the AD9361 upconverts internally.
+    -- ------------------------------------------------------------------------
+    -- udp_rx_handler -> hpsdr_duc_spec_handler (UDP/1026 DUC Specific payload)
+    signal hpsdr_duc_spec_rx_data   : std_logic_vector(7 downto 0);
+    signal hpsdr_duc_spec_rx_valid  : std_logic;
+    signal hpsdr_duc_spec_rx_sop    : std_logic;
+    signal hpsdr_duc_spec_rx_eop    : std_logic;
+    signal hpsdr_duc_spec_rx_length : std_logic_vector(13 downto 0);
+    signal hpsdr_duc_spec_pulse     : std_logic;
+
+    -- udp_rx_handler -> hpsdr_tx_iq_handler (UDP/1029 DUC0 I&Q payload)
+    signal hpsdr_duc_iq_rx_data     : std_logic_vector(7 downto 0);
+    signal hpsdr_duc_iq_rx_valid    : std_logic;
+    signal hpsdr_duc_iq_rx_sop      : std_logic;
+    signal hpsdr_duc_iq_rx_eop      : std_logic;
+    signal hpsdr_duc_iq_rx_length   : std_logic_vector(13 downto 0);
+    signal hpsdr_duc_iq_pulse       : std_logic;
+
+    -- Gray-coded DUC0 TX-rate selector from hpsdr_duc_spec_handler
+    -- (fx3_pclk_pll domain); synced + decoded to an interpolation factor
+    -- inside hpsdr_duc on tx_clock.  Boot default "011" = 192 kHz (interp 64).
+    signal hpsdr_duc_rate_id_gray   : std_logic_vector(2 downto 0);
+
+    -- TX engagement gate = host_run AND host_ptt0.  Pclk-domain copy gates the
+    -- IQ FIFO write/clear; the synced copy gates the DUC strobe in tx_clock.
+    signal hpsdr_tx_active_pclk     : std_logic;
+    signal hpsdr_tx_active_tx       : std_logic;
+
+    -- DUC IQ FIFO: hpsdr_tx_iq_handler (fx3_pclk_pll) -> hpsdr_duc (tx_clock).
+    -- 48-bit { I[23:0], Q[23:0] }; show-ahead; held in aclr unless transmitting.
+    signal duc_iq_fifo_wrdata       : std_logic_vector(47 downto 0);
+    signal duc_iq_fifo_wrreq        : std_logic;
+    signal duc_iq_fifo_wrfull       : std_logic;
+    signal duc_iq_fifo_rddata       : std_logic_vector(47 downto 0);
+    signal duc_iq_fifo_rdreq        : std_logic;
+    signal duc_iq_fifo_rdempty      : std_logic;
+    signal duc_iq_fifo_aclr         : std_logic;
+
+    -- tx_iq_handler sequence-error counter (SignalTap observability only).
+    signal duc_seq_errors           : std_logic_vector(31 downto 0);
+    attribute keep of duc_seq_errors : signal is true;
+
+    -- hpsdr_duc interpolated baseband -> dac_streams(0) mux (tx_clock domain).
+    signal duc_out_i                : signed(15 downto 0);
+    signal duc_out_q                : signed(15 downto 0);
+    signal duc_out_valid            : std_logic;
+
+    -- AD9361 DAC sample-request strobe (native 12.288 MSPS), PTT-gated:
+    -- paces the interpolator's output rate.
+    signal duc_tx_strobe            : std_logic;
+
+    -- DUC0 transmit frequency (NCO phase word) from hpsdr_hp_cmd_handler (HP
+    -- Command bytes 329..332).  Fed into hpsdr_cmd_mux as the TX0 FREQUENCY
+    -- source; NIOS expands it to Hz + band LO offset and tunes the AD9361 TX
+    -- synth.
+    signal host_duc0_freq           : std_logic_vector(31 downto 0);
+
     -- icmp_responder -> tx_arbiter byte stream
     signal icmp_tx_data           : std_logic_vector(7 downto 0);
     signal icmp_tx_valid          : std_logic;
@@ -494,9 +555,10 @@ architecture hpsdr_bladerf of bladerf is
     signal hpsdr_cmd_status_nios  : std_logic_vector(7  downto 0);
 
     -- HPSDR engagement status -> Nios (sys_clock).  bit0 = host_valid (Thetis
-    -- discovery committed a client; NIOS uses this to trigger RX bring-up
-    -- "during discovery"), bit1 = host_run (reserved for future ENABLE gating).
-    signal hpsdr_status_sync      : std_logic_vector(1 downto 0) := (others => '0');
+    -- discovery committed a client; NIOS uses this to trigger RX/TX bring-up
+    -- "during discovery"), bit1 = host_run, bit2 = host_ptt0 (PTT0 from HP
+    -- Command byte 4 bit 1; lets NIOS monitor / gate the TX path).
+    signal hpsdr_status_sync      : std_logic_vector(2 downto 0) := (others => '0');
 
     -- Local override of the nios_system component from work.bladerf_p: this
     -- hpsdr revision's Qsys (nios_system.tcl, platform_revision==hpsdr) adds
@@ -607,7 +669,7 @@ architecture hpsdr_bladerf of bladerf is
         wbm_wb_ack_i                    :   in  std_logic                     := 'X';
         wbm_wb_cyc_o                    :   out std_logic;
         hpsdr_cmd_data_in_export       :   in  std_logic_vector(31 downto 0) := (others => '0');
-        hpsdr_status_export            :   in  std_logic_vector(1 downto 0)  := (others => '0');
+        hpsdr_status_export            :   in  std_logic_vector(2 downto 0)  := (others => '0');
         hpsdr_cmd_op_export            :   in  std_logic_vector(15 downto 0) := (others => '0');
         hpsdr_cmd_data_lo_export       :   out std_logic_vector(31 downto 0);
         hpsdr_cmd_data_hi_export       :   out std_logic_vector(31 downto 0);
@@ -1041,6 +1103,18 @@ begin
             hpsdr_ddc_spec_eop    => hpsdr_ddc_spec_rx_eop,
             hpsdr_ddc_spec_length => hpsdr_ddc_spec_rx_length,
 
+            hpsdr_duc_spec_data   => hpsdr_duc_spec_rx_data,
+            hpsdr_duc_spec_valid  => hpsdr_duc_spec_rx_valid,
+            hpsdr_duc_spec_sop    => hpsdr_duc_spec_rx_sop,
+            hpsdr_duc_spec_eop    => hpsdr_duc_spec_rx_eop,
+            hpsdr_duc_spec_length => hpsdr_duc_spec_rx_length,
+
+            hpsdr_duc_iq_data     => hpsdr_duc_iq_rx_data,
+            hpsdr_duc_iq_valid    => hpsdr_duc_iq_rx_valid,
+            hpsdr_duc_iq_sop      => hpsdr_duc_iq_rx_sop,
+            hpsdr_duc_iq_eop      => hpsdr_duc_iq_rx_eop,
+            hpsdr_duc_iq_length   => hpsdr_duc_iq_rx_length,
+
             dhcp_data          => dhcp_rx_data,
             dhcp_valid         => dhcp_rx_valid,
             dhcp_sop           => dhcp_rx_sop,
@@ -1053,6 +1127,8 @@ begin
             hpsdr_pulse          => hpsdr_pulse,
             hpsdr_hp_cmd_pulse   => hpsdr_hp_cmd_pulse,
             hpsdr_ddc_spec_pulse => hpsdr_ddc_spec_pulse,
+            hpsdr_duc_spec_pulse => hpsdr_duc_spec_pulse,
+            hpsdr_duc_iq_pulse   => hpsdr_duc_iq_pulse,
             dhcp_pulse           => dhcp_rx_pulse,
 
             hpsdr_cc_pulse     => hpsdr_cc_pulse
@@ -1192,6 +1268,7 @@ begin
             host_ptt0        => hpsdr_host_ptt0,
             host_port        => hpsdr_hp_cmd_host_port,
             host_rx0_freq    => host_rx0_freq,
+            host_duc0_freq   => host_duc0_freq,
             host_rx0_atten   => host_rx0_atten,
             host_band_index  => host_band_index,
             host_rx_biastee  => host_rx_biastee,
@@ -1222,6 +1299,114 @@ begin
         );
 
     -- ========================================================================
+    -- HPSDR P2 DUC TX path (host -> radio).  Mirror of the DDC RX path,
+    -- reversed: host transmit IQ on UDP/1029 is interpolated from the DUC0
+    -- sample rate up to the 12.288 MSPS native rate and injected into
+    -- dac_streams(0) while PTT is asserted.  No CORDIC -- the AD9361 performs
+    -- RF upconversion with its own TX LO (set in a later NIOS bring-up phase
+    -- from host_duc0_freq).
+    -- ------------------------------------------------------------------------
+    -- DUC Specific (UDP/1026): extract DUC0 TX sample rate -> gray selector.
+    -- ========================================================================
+    U_hpsdr_duc_spec_handler : entity work.hpsdr_duc_spec_handler
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            rx_data      => hpsdr_duc_spec_rx_data,
+            rx_valid     => hpsdr_duc_spec_rx_valid,
+            rx_sop       => hpsdr_duc_spec_rx_sop,
+            rx_eop       => hpsdr_duc_spec_rx_eop,
+
+            rate_id_gray => hpsdr_duc_rate_id_gray
+        );
+
+    -- TX engagement gate: fill / drain the DUC IQ FIFO and run the DAC mux
+    -- only while the host is engaged AND keying (host_run AND host_ptt0).
+    hpsdr_tx_active_pclk <= hpsdr_host_run and hpsdr_host_ptt0;
+    duc_iq_fifo_aclr     <= not hpsdr_tx_active_pclk;
+
+    -- ========================================================================
+    -- DUC0 I&Q (UDP/1029): unpack 24-bit I&Q host samples into the DUC IQ
+    -- FIFO.  Writes gated by PTT; FIFO-full drops samples (orion2 behaviour).
+    -- ========================================================================
+    U_hpsdr_tx_iq_handler : entity work.hpsdr_tx_iq_handler
+        port map (
+            clock           => fx3_pclk_pll,
+            reset           => sys_reset_pclk,
+
+            enable          => hpsdr_tx_active_pclk,
+
+            rx_data         => hpsdr_duc_iq_rx_data,
+            rx_valid        => hpsdr_duc_iq_rx_valid,
+            rx_sop          => hpsdr_duc_iq_rx_sop,
+            rx_eop          => hpsdr_duc_iq_rx_eop,
+
+            fifo_wrdata     => duc_iq_fifo_wrdata,
+            fifo_wrreq      => duc_iq_fifo_wrreq,
+            fifo_full       => duc_iq_fifo_wrfull,
+
+            sequence_errors => duc_seq_errors
+        );
+
+    -- DUC IQ async FIFO: fx3_pclk_pll (write) -> tx_clock (read).  Held in
+    -- aclr unless transmitting so each PTT starts empty.  Show-ahead so
+    -- hpsdr_duc/cic_interp can sample the head on its req cycle.
+    U_hpsdr_duc_iq_fifo : entity work.common_dcfifo
+        generic map (
+            LPM_NUMWORDS     => 4096,
+            LPM_WIDTH        => 48,
+            LPM_WIDTH_R      => 48,
+            LPM_SHOWAHEAD    => "ON",
+            RDSYNC_DELAYPIPE => 5,
+            WRSYNC_DELAYPIPE => 5
+        )
+        port map (
+            aclr    => duc_iq_fifo_aclr,
+            data    => duc_iq_fifo_wrdata,
+            wrclk   => fx3_pclk_pll,
+            wrreq   => duc_iq_fifo_wrreq,
+            wrempty => open,
+            wrfull  => duc_iq_fifo_wrfull,
+            wrusedw => open,
+            rdclk   => tx_clock,
+            rdreq   => duc_iq_fifo_rdreq,
+            q       => duc_iq_fifo_rddata,
+            rdempty => duc_iq_fifo_rdempty,
+            rdfull  => open,
+            rdusedw => open
+        );
+
+    -- DUC strobe: one pulse per AD9361 DAC sample request, PTT-gated.  Paces
+    -- the interpolator output to the native rate.  (Until the NIOS TX
+    -- bring-up enables the AD9361 transmit interface this strobe stays low,
+    -- so the datapath is wired but idle -- by design for this phase.)
+    duc_tx_strobe <= (ad9361.ch(0).dac.i.valid or ad9361.ch(0).dac.q.valid)
+                     and hpsdr_tx_active_tx;
+
+    -- CIC interpolator: DUC0 rate -> 12.288 MSPS complex baseband.
+    U_hpsdr_duc : entity work.hpsdr_duc
+        generic map (
+            IN_WIDTH   => 24,
+            OUT_WIDTH  => 16,
+            STAGES     => 5,
+            MIN_INTERP => 8,            -- 12.288 MHz / 1536 kHz
+            MAX_INTERP => 256           -- 12.288 MHz / 48 kHz
+        )
+        port map (
+            clock        => tx_clock,
+            reset        => tx_reset,
+            rate_id_gray => hpsdr_duc_rate_id_gray,  -- async; synced internally
+            strobe       => duc_tx_strobe,
+            fifo_q       => duc_iq_fifo_rddata,
+            fifo_rdempty => duc_iq_fifo_rdempty,
+            fifo_rdreq   => duc_iq_fifo_rdreq,
+            out_i        => duc_out_i,
+            out_q        => duc_out_q,
+            out_valid    => duc_out_valid
+        );
+
+    -- ========================================================================
     -- HPSDR command-mailbox multiplexer.  Funnels per-knob fabric request
     -- streams (initially just RX0 FREQUENCY from hp_cmd_handler; future:
     -- GAIN / GAINMODE / BANDWIDTH / RSSI poll for HP Status / ...) into the
@@ -1238,6 +1423,7 @@ begin
             rx0_freq       => host_rx0_freq,
             rx0_band_index => host_band_index,
             rx0_atten      => host_rx0_atten,
+            tx0_freq       => host_duc0_freq,
             hp_cmd_pulse   => hpsdr_hp_cmd_decode_pulse,
 
             cmd_op       => hpsdr_cmd_op_fab,
@@ -1490,6 +1676,7 @@ begin
                 hpsdr_hp_cmd_pulse     = '1' or
                 hpsdr_disc_reply_pulse = '1' or
                 hpsdr_ddc_send_pulse   = '1' or
+                hpsdr_duc_iq_pulse     = '1' or
                 dhcp_rx_pulse          = '1') then
                 eem_dma_req_led <= '0';
                 count := 25_000_000;
@@ -1791,6 +1978,13 @@ begin
             dac_streams          => dac_streams
         );
 
+    -- DAC source mux.  In the HPSDR build the DUC owns channel 0: while the
+    -- host is keying (hpsdr_tx_active_tx) it is fed the interpolated DUC IQ;
+    -- between DAC requests it holds, and whenever NOT keying it is forced to
+    -- zero so the always-on (FDD) AD9361 TX emits no carrier during receive.
+    -- The DUC's 16-bit interpolated sample is full-scale, so its TOP 12 bits
+    -- map to the AD9361's 12-bit DAC field (low 4 pinned 0).  All other
+    -- channels keep the stock host-TX-FIFO path (dac_streams, low-12 mapping).
     dac_assignment_proc : process( all )
     begin
         for i in dac_controls'range loop
@@ -1799,9 +1993,20 @@ begin
             dac_controls(i).data_req <= (ad9361.ch(i).dac.i.valid  or ad9361.ch(i).dac.q.valid  or tx_loopback_enabled) and
                                         mimo_tx_enables(i);
 
-            if (rising_edge(tx_clock) and dac_streams(i).data_v = '1') then
-                ad9361.ch(i).dac.i.data  <= std_logic_vector(dac_streams(i).data_i(11 downto 0)) & "0000";
-                ad9361.ch(i).dac.q.data  <= std_logic_vector(dac_streams(i).data_q(11 downto 0)) & "0000";
+            if (rising_edge(tx_clock)) then
+                if (i = 0) then
+                    -- HPSDR DUC-owned TX channel.
+                    if (hpsdr_tx_active_tx = '0') then
+                        ad9361.ch(0).dac.i.data <= (others => '0');
+                        ad9361.ch(0).dac.q.data <= (others => '0');
+                    elsif (duc_out_valid = '1') then
+                        ad9361.ch(0).dac.i.data <= std_logic_vector(duc_out_i(15 downto 4)) & "0000";
+                        ad9361.ch(0).dac.q.data <= std_logic_vector(duc_out_q(15 downto 4)) & "0000";
+                    end if;
+                elsif (dac_streams(i).data_v = '1') then
+                    ad9361.ch(i).dac.i.data  <= std_logic_vector(dac_streams(i).data_i(11 downto 0)) & "0000";
+                    ad9361.ch(i).dac.q.data  <= std_logic_vector(dac_streams(i).data_q(11 downto 0)) & "0000";
+                end if;
             end if;
         end loop;
     end process;
@@ -2381,6 +2586,19 @@ begin
         sync                =>  hpsdr_status_sync(1)
       );
 
+    -- bit2 = host_ptt0 (PTT0 from HP Command byte 4 bit 1).  NIOS reads this
+    -- to monitor / debug the TX path; the actual IQ-to-DAC gating is done in
+    -- the tx_clock domain (hpsdr_tx_active_tx), this is the sys_clock view.
+    U_sync_hpsdr_host_ptt0 : entity work.synchronizer
+      generic map (
+        RESET_LEVEL         =>  '0'
+      ) port map (
+        reset               =>  '0',
+        clock               =>  sys_clock,
+        async               =>  hpsdr_host_ptt0,
+        sync                =>  hpsdr_status_sync(2)
+      );
+
     U_sync_rx_enable : entity work.synchronizer
         generic map (
             RESET_LEVEL =>  '0'
@@ -2401,6 +2619,20 @@ begin
             clock       =>  tx_clock,
             async       =>  tx_enable_pclk,
             sync        =>  tx_enable
+        );
+
+    -- HPSDR TX-active gate (host_run AND host_ptt0) crossed fx3_pclk_pll ->
+    -- tx_clock for the DUC strobe and the dac_streams(0) source mux.  Single
+    -- level bit; a 2-FF synchroniser handles the boundary metastability.
+    U_sync_hpsdr_tx_active : entity work.synchronizer
+        generic map (
+            RESET_LEVEL =>  '0'
+        )
+        port map (
+            reset       =>  tx_reset,
+            clock       =>  tx_clock,
+            async       =>  hpsdr_tx_active_pclk,
+            sync        =>  hpsdr_tx_active_tx
         );
 
 

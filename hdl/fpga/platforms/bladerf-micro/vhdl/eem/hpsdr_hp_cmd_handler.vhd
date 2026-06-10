@@ -109,6 +109,13 @@ entity hpsdr_hp_cmd_handler is
         -- committed at rx_eop.  Held across packets until the next command.
         host_rx0_freq    : out std_logic_vector(31 downto 0);
 
+        -- DUC0 transmit frequency in Hz (HP Command bytes 329..332,
+        -- big-endian), committed at rx_eop.  Orion2 High_Priority_CC.v:
+        -- Tx0_frequency = byte329[31:24]..byte332[7:0].  Held across packets
+        -- until the next command.  Decoded + exposed for the (deferred) NIOS
+        -- TX LO bring-up; no fabric consumer in the TX datapath phase.
+        host_duc0_freq   : out std_logic_vector(31 downto 0);
+
         -- DDC0 step attenuator in dB (HP Command byte 1443, low 5 bits),
         -- committed at rx_eop.  Held across packets until the next command.
         host_rx0_atten   : out std_logic_vector(4 downto 0);
@@ -141,6 +148,11 @@ architecture arch of hpsdr_hp_cmd_handler is
     signal freq_sr        : std_logic_vector(31 downto 0) := (others => '0');
     signal host_rx0_freq_r: std_logic_vector(31 downto 0) := (others => '0');
 
+    -- DUC0 (TX) frequency: shift register assembles bytes 329..332 big-endian
+    -- (duc0_freq_sr); committed to host_duc0_freq_r at rx_eop.
+    signal duc0_freq_sr    : std_logic_vector(31 downto 0) := (others => '0');
+    signal host_duc0_freq_r: std_logic_vector(31 downto 0) := (others => '0');
+
     -- RX0 step attenuator: single-byte capture at byte 1443 (atten_latched);
     -- committed to host_rx0_atten_r at rx_eop alongside the frequency.
     signal atten_latched   : std_logic_vector(4 downto 0) := (others => '0');
@@ -165,6 +177,7 @@ begin
     host_ptt0       <= host_ptt0_r;
     host_port       <= host_port_r;
     host_rx0_freq   <= host_rx0_freq_r;
+    host_duc0_freq  <= host_duc0_freq_r;
     host_rx0_atten  <= host_rx0_atten_r;
     host_band_index <= host_band_index_r;
     host_rx_biastee <= host_rx_biastee_r;
@@ -180,6 +193,8 @@ begin
             host_port_r       <= (others => '0');
             freq_sr           <= (others => '0');
             host_rx0_freq_r   <= (others => '0');
+            duc0_freq_sr      <= (others => '0');
+            host_duc0_freq_r  <= (others => '0');
             atten_latched     <= (others => '0');
             host_rx0_atten_r  <= (others => '0');
             band_latched      <= (others => '0');
@@ -234,6 +249,13 @@ begin
                     freq_sr <= freq_sr(23 downto 0) & rx_data;
                 end if;
 
+                -- Orion2 High_Priority_CC.v: DUC0 (Tx0) frequency bytes
+                -- 329..332, big-endian (byte 329 = [31:24] MSB).
+                if (n_byte_idx >= to_unsigned(329, n_byte_idx'length)) and
+                   (n_byte_idx <= to_unsigned(332, n_byte_idx'length)) then
+                    duc0_freq_sr <= duc0_freq_sr(23 downto 0) & rx_data;
+                end if;
+
                 -- V4.4 spec p.35: byte 1443 = 0-31dB step attenuator before
                 -- ADC0 (Thetis "RX1").  Only low 5 bits are defined.
                 if n_byte_idx = to_unsigned(1443, n_byte_idx'length) then
@@ -252,6 +274,7 @@ begin
 
                 if rx_eop = '1' then
                     host_rx0_freq_r   <= freq_sr;          -- commit assembled value
+                    host_duc0_freq_r  <= duc0_freq_sr;     -- commit TX freq too
                     host_rx0_atten_r  <= atten_latched;    -- commit at packet boundary
                     host_band_index_r <= band_latched;
                     host_rx_biastee_r <= biastee_latched;

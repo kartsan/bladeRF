@@ -142,6 +142,24 @@ entity udp_rx_handler is
         hpsdr_ddc_spec_eop    : out std_logic;
         hpsdr_ddc_spec_length : out std_logic_vector(13 downto 0); -- payload bytes
 
+        -- HPSDR DUC Specific byte stream output (UDP/1026 payload only).
+        -- Consumed by hpsdr_duc_spec_handler to extract DUC0's TX sample
+        -- rate (bytes 14..15).
+        hpsdr_duc_spec_data   : out std_logic_vector(7 downto 0);
+        hpsdr_duc_spec_valid  : out std_logic;
+        hpsdr_duc_spec_sop    : out std_logic;
+        hpsdr_duc_spec_eop    : out std_logic;
+        hpsdr_duc_spec_length : out std_logic_vector(13 downto 0); -- payload bytes
+
+        -- HPSDR DUC0 I&Q byte stream output (UDP/1029 payload only).
+        -- Consumed by hpsdr_tx_iq_handler, which unpacks the host's 24-bit
+        -- I&Q samples into the DUC IQ FIFO.
+        hpsdr_duc_iq_data     : out std_logic_vector(7 downto 0);
+        hpsdr_duc_iq_valid    : out std_logic;
+        hpsdr_duc_iq_sop      : out std_logic;
+        hpsdr_duc_iq_eop      : out std_logic;
+        hpsdr_duc_iq_length   : out std_logic_vector(13 downto 0); -- payload bytes
+
         -- DHCP byte stream output (UDP payload only).
         dhcp_data         : out std_logic_vector(7 downto 0);
         dhcp_valid        : out std_logic;
@@ -158,6 +176,8 @@ entity udp_rx_handler is
         hpsdr_pulse         : out std_logic;
         hpsdr_hp_cmd_pulse  : out std_logic;
         hpsdr_ddc_spec_pulse: out std_logic;
+        hpsdr_duc_spec_pulse: out std_logic;
+        hpsdr_duc_iq_pulse  : out std_logic;
         dhcp_pulse          : out std_logic;
 
         -- One-cycle pulse on any recognised HPSDR C&C dst port
@@ -187,15 +207,16 @@ architecture arch of udp_rx_handler is
         := std_logic_vector(to_unsigned(DHCP_PORT,           16));
 
     -- Classified destination of the in-flight packet.  K_HPSDR_CC is the
-    -- catch-all for HPSDR C&C dst ports without a dedicated forward
-    -- channel (1026/1029): we emit hpsdr_cc_pulse and discard.  1025 has
-    -- its own K_HPSDR_DDC_SPEC + S_FWD_HPSDR_DDC_SPEC pair.
+    -- catch-all for HPSDR C&C dst ports without a dedicated forward channel;
+    -- the DUC TX ports now have their own pairs (K_HPSDR_DUC_SPEC for 1026,
+    -- K_HPSDR_DUC_IQ for 1029), as 1025 does for the DDC.
     type kind_t is (K_NONE, K_HPSDR, K_HPSDR_HP_CMD, K_HPSDR_DDC_SPEC,
-                    K_HPSDR_CC, K_DHCP);
+                    K_HPSDR_DUC_SPEC, K_HPSDR_DUC_IQ, K_HPSDR_CC, K_DHCP);
     signal kind        : kind_t := K_NONE;
 
     type state_t is (S_HDR, S_FWD_HPSDR, S_FWD_HPSDR_HP_CMD,
-                     S_FWD_HPSDR_DDC_SPEC, S_FWD_DHCP, S_DISCARD);
+                     S_FWD_HPSDR_DDC_SPEC, S_FWD_HPSDR_DUC_SPEC,
+                     S_FWD_HPSDR_DUC_IQ, S_FWD_DHCP, S_DISCARD);
     signal state : state_t := S_HDR;
 
     -- 4 bits cover hdr_byte_idx 0..7 plus margin.
@@ -233,6 +254,20 @@ architecture arch of udp_rx_handler is
     signal ddc_spec_eop_r   : std_logic                    := '0';
     signal ddc_spec_pulse_r : std_logic                    := '0';
 
+    -- Registered outputs (HPSDR DUC Specific / port 1026)
+    signal duc_spec_data_r  : std_logic_vector(7 downto 0) := (others => '0');
+    signal duc_spec_valid_r : std_logic                    := '0';
+    signal duc_spec_sop_r   : std_logic                    := '0';
+    signal duc_spec_eop_r   : std_logic                    := '0';
+    signal duc_spec_pulse_r : std_logic                    := '0';
+
+    -- Registered outputs (HPSDR DUC0 I&Q / port 1029)
+    signal duc_iq_data_r    : std_logic_vector(7 downto 0) := (others => '0');
+    signal duc_iq_valid_r   : std_logic                    := '0';
+    signal duc_iq_sop_r     : std_logic                    := '0';
+    signal duc_iq_eop_r     : std_logic                    := '0';
+    signal duc_iq_pulse_r   : std_logic                    := '0';
+
     -- Registered outputs (DHCP)
     signal dhcp_data_r   : std_logic_vector(7 downto 0)  := (others => '0');
     signal dhcp_valid_r  : std_logic                     := '0';
@@ -267,6 +302,20 @@ begin
     hpsdr_ddc_spec_eop    <= ddc_spec_eop_r;
     hpsdr_ddc_spec_length <= pay_len_r;
     hpsdr_ddc_spec_pulse  <= ddc_spec_pulse_r;
+
+    hpsdr_duc_spec_data   <= duc_spec_data_r;
+    hpsdr_duc_spec_valid  <= duc_spec_valid_r;
+    hpsdr_duc_spec_sop    <= duc_spec_sop_r;
+    hpsdr_duc_spec_eop    <= duc_spec_eop_r;
+    hpsdr_duc_spec_length <= pay_len_r;
+    hpsdr_duc_spec_pulse  <= duc_spec_pulse_r;
+
+    hpsdr_duc_iq_data     <= duc_iq_data_r;
+    hpsdr_duc_iq_valid    <= duc_iq_valid_r;
+    hpsdr_duc_iq_sop      <= duc_iq_sop_r;
+    hpsdr_duc_iq_eop      <= duc_iq_eop_r;
+    hpsdr_duc_iq_length   <= pay_len_r;
+    hpsdr_duc_iq_pulse    <= duc_iq_pulse_r;
 
     dhcp_data          <= dhcp_data_r;
     dhcp_valid         <= dhcp_valid_r;
@@ -310,6 +359,16 @@ begin
             ddc_spec_sop_r   <= '0';
             ddc_spec_eop_r   <= '0';
             ddc_spec_pulse_r <= '0';
+            duc_spec_data_r  <= (others => '0');
+            duc_spec_valid_r <= '0';
+            duc_spec_sop_r   <= '0';
+            duc_spec_eop_r   <= '0';
+            duc_spec_pulse_r <= '0';
+            duc_iq_data_r    <= (others => '0');
+            duc_iq_valid_r   <= '0';
+            duc_iq_sop_r     <= '0';
+            duc_iq_eop_r     <= '0';
+            duc_iq_pulse_r   <= '0';
             dhcp_data_r    <= (others => '0');
             dhcp_valid_r   <= '0';
             dhcp_sop_r     <= '0';
@@ -330,6 +389,14 @@ begin
             ddc_spec_sop_r   <= '0';
             ddc_spec_eop_r   <= '0';
             ddc_spec_pulse_r <= '0';
+            duc_spec_valid_r <= '0';
+            duc_spec_sop_r   <= '0';
+            duc_spec_eop_r   <= '0';
+            duc_spec_pulse_r <= '0';
+            duc_iq_valid_r   <= '0';
+            duc_iq_sop_r     <= '0';
+            duc_iq_eop_r     <= '0';
+            duc_iq_pulse_r   <= '0';
             dhcp_valid_r   <= '0';
             dhcp_sop_r     <= '0';
             dhcp_eop_r     <= '0';
@@ -377,9 +444,10 @@ begin
                                 n_kind := K_HPSDR_HP_CMD;
                             elsif n_dst_port = HPSDR_DDC_SPEC_PORT_VEC then
                                 n_kind := K_HPSDR_DDC_SPEC;
-                            elsif n_dst_port = HPSDR_DUC_SPEC_PORT_VEC or
-                                  n_dst_port = HPSDR_DUC_IQ_PORT_VEC then
-                                n_kind := K_HPSDR_CC;
+                            elsif n_dst_port = HPSDR_DUC_SPEC_PORT_VEC then
+                                n_kind := K_HPSDR_DUC_SPEC;
+                            elsif n_dst_port = HPSDR_DUC_IQ_PORT_VEC then
+                                n_kind := K_HPSDR_DUC_IQ;
                             elsif n_dst_port = DHCP_PORT_VEC then
                                 n_kind := K_DHCP;
                             else
@@ -407,6 +475,12 @@ begin
                                 when K_HPSDR_DDC_SPEC =>
                                     ddc_spec_pulse_r <= '1';
                                     hpsdr_cc_pulse_r <= '1';
+                                when K_HPSDR_DUC_SPEC =>
+                                    duc_spec_pulse_r <= '1';
+                                    hpsdr_cc_pulse_r <= '1';
+                                when K_HPSDR_DUC_IQ   =>
+                                    duc_iq_pulse_r   <= '1';
+                                    hpsdr_cc_pulse_r <= '1';
                                 when K_HPSDR_CC       =>
                                     hpsdr_cc_pulse_r <= '1';
                                 when K_DHCP           =>
@@ -417,6 +491,8 @@ begin
                             n_byte_idx := (others => '0');
                         elsif n_kind = K_HPSDR or n_kind = K_HPSDR_HP_CMD or
                               n_kind = K_HPSDR_DDC_SPEC or
+                              n_kind = K_HPSDR_DUC_SPEC or
+                              n_kind = K_HPSDR_DUC_IQ or
                               n_kind = K_HPSDR_CC or n_kind = K_DHCP then
                             -- Compute payload length = IP payload bytes - 8.
                             if unsigned(rx_length) >= to_unsigned(UDP_HDR_BYTES, rx_length'length) then
@@ -444,9 +520,19 @@ begin
                                 ddc_spec_pulse_r <= '1';
                                 hpsdr_cc_pulse_r <= '1';
                                 state            <= S_FWD_HPSDR_DDC_SPEC;
+                            when K_HPSDR_DUC_SPEC =>
+                                -- DUC Specific (1026): TX sample rate etc.
+                                duc_spec_pulse_r <= '1';
+                                hpsdr_cc_pulse_r <= '1';
+                                state            <= S_FWD_HPSDR_DUC_SPEC;
+                            when K_HPSDR_DUC_IQ =>
+                                -- DUC0 I&Q (1029): host transmit samples.
+                                duc_iq_pulse_r   <= '1';
+                                hpsdr_cc_pulse_r <= '1';
+                                state            <= S_FWD_HPSDR_DUC_IQ;
                             when K_HPSDR_CC =>
-                                -- No dedicated forward channel for the
-                                -- remaining DUC C&C ports (1026, 1029);
+                                -- Catch-all for any recognised HPSDR C&C dst
+                                -- port without a dedicated forward channel;
                                 -- pulse for the watchdog and drop.
                                 hpsdr_cc_pulse_r <= '1';
                                 state            <= S_DISCARD;
@@ -528,6 +614,44 @@ begin
                     if rx_eop = '1' then
                         ddc_spec_eop_r <= '1';
                         state          <= S_HDR;
+                    end if;
+                end if;
+
+            -- --------------------------------------------------------------
+            -- Forward bytes to HPSDR DUC Specific channel (UDP/1026).
+            -- Mirror of S_FWD_HPSDR_DDC_SPEC; payload is the DUC Specific
+            -- command (TX sample rate, CW/keyer config, ...).
+            -- --------------------------------------------------------------
+            when S_FWD_HPSDR_DUC_SPEC =>
+                if rx_valid = '1' then
+                    duc_spec_data_r  <= rx_data;
+                    duc_spec_valid_r <= '1';
+                    if sop_pending = '1' then
+                        duc_spec_sop_r <= '1';
+                        sop_pending    <= '0';
+                    end if;
+                    if rx_eop = '1' then
+                        duc_spec_eop_r <= '1';
+                        state          <= S_HDR;
+                    end if;
+                end if;
+
+            -- --------------------------------------------------------------
+            -- Forward bytes to HPSDR DUC0 I&Q channel (UDP/1029).  Payload
+            -- is the host's transmit samples (4-byte seq + 240 x 6-byte
+            -- 24-bit I&Q), unpacked downstream by hpsdr_tx_iq_handler.
+            -- --------------------------------------------------------------
+            when S_FWD_HPSDR_DUC_IQ =>
+                if rx_valid = '1' then
+                    duc_iq_data_r  <= rx_data;
+                    duc_iq_valid_r <= '1';
+                    if sop_pending = '1' then
+                        duc_iq_sop_r <= '1';
+                        sop_pending  <= '0';
+                    end if;
+                    if rx_eop = '1' then
+                        duc_iq_eop_r <= '1';
+                        state        <= S_HDR;
                     end if;
                 end if;
 

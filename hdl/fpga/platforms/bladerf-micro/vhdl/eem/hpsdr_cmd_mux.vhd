@@ -66,6 +66,12 @@ entity hpsdr_cmd_mux is
         -- byte 1443).  Mux issues GAIN = 60 - atten.
         rx0_atten       : in  std_logic_vector(4 downto 0);
 
+        -- Source C: DUC0 (TX0) frequency (NCO phase word from hp_cmd_handler
+        -- bytes 329..332).  Mux issues (FREQUENCY, TX0, W, phase); NIOS
+        -- expands the phase to Hz and adds the shared band LO offset exactly
+        -- as for RX0, so transceive tracks.  Skipped while 0 (pre-engagement).
+        tx0_freq        : in  std_logic_vector(31 downto 0);
+
         -- One-cycle pulse at the end of every fully-decoded HP Command
         -- (hpsdr_hp_cmd_handler.hp_cmd_pulse).  Drives the issue cadence.
         hp_cmd_pulse    : in  std_logic;
@@ -92,6 +98,7 @@ architecture rtl of hpsdr_cmd_mux is
     -- Channel codes for the 3-bit channel field.  Matches the decoder in
     -- bladeRF_nios.c's HPSDR dispatcher (hpsdr_decode_channel).
     constant CH_RX0       : std_logic_vector(2 downto 0) := "000";
+    constant CH_TX0       : std_logic_vector(2 downto 0) := "010";
 
     constant RW_WRITE     : std_logic := '0';
 
@@ -109,6 +116,7 @@ architecture rtl of hpsdr_cmd_mux is
     signal rx0_freq_issued       : std_logic_vector(31 downto 0) := (others => '0');
     signal rx0_band_index_issued : std_logic_vector(5 downto 0)  := (others => '0');
     signal rx0_atten_issued      : std_logic_vector(4 downto 0)  := (others => '0');
+    signal tx0_freq_issued       : std_logic_vector(31 downto 0) := (others => '0');
 
     signal seq_r          : unsigned(3 downto 0) := (others => '0');
     signal cmd_op_r       : std_logic_vector(15 downto 0) := (others => '0');
@@ -140,6 +148,7 @@ begin
             rx0_freq_issued       <= (others => '0');
             rx0_band_index_issued <= (others => '0');
             rx0_atten_issued      <= (others => '0');
+            tx0_freq_issued       <= (others => '0');
             seq_r                 <= (others => '0');
             cmd_op_r              <= (others => '0');
             cmd_data_in_r         <= (others => '0');
@@ -165,6 +174,19 @@ begin
                                              OP_FREQUENCY;
                     rx0_freq_issued       <= rx0_freq;
                     rx0_band_index_issued <= rx0_band_index;
+                -- DUC0 (TX0) frequency.  Same phase-word payload + shared band
+                -- LO offset as RX0; NIOS tunes the AD9361 TX synth.  In
+                -- transceive Thetis moves rx0_freq and tx0_freq together, so
+                -- this fires on the pulse after the RX0 retune (~100 ms).
+                elsif (tx0_freq /= tx0_freq_issued) and
+                      (tx0_freq /= x"00000000") then
+                    seq_r           <= next_seq_v;
+                    cmd_data_in_r   <= tx0_freq;
+                    cmd_op_r        <= std_logic_vector(next_seq_v) &
+                                       RW_WRITE                     &
+                                       CH_TX0                       &
+                                       OP_FREQUENCY;
+                    tx0_freq_issued <= tx0_freq;
                 elsif rx0_atten /= rx0_atten_issued then
                     gain_dB_v        := GAIN_ANCHOR_DB -
                                         to_integer(unsigned(rx0_atten));

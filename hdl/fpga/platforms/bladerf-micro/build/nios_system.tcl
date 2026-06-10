@@ -782,7 +782,8 @@ if { $platform_revision == "hpsdr" } {
     set_instance_parameter_value hpsdr_status {resetValue} {0.0}
     set_instance_parameter_value hpsdr_status {simDoTestBenchWiring} {0}
     set_instance_parameter_value hpsdr_status {simDrivenValue} {0.0}
-    set_instance_parameter_value hpsdr_status {width} {2}
+    # bit0=host_valid, bit1=host_run, bit2=host_ptt0 (PTT0 from HP Cmd byte 4).
+    set_instance_parameter_value hpsdr_status {width} {3}
 
     add_interface hpsdr_status conduit end
     set_interface_property hpsdr_status EXPORT_OF hpsdr_status.external_connection

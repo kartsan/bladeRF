@@ -129,10 +129,15 @@ static inline int32_t hpsdr_band_to_lo_offset_hz(uint8_t band)
 #  endif
 /* hpsdr_status PIO bits (engagement state from the FPGA fabric). */
 #  define HPSDR_STATUS_HOST_VALID (1u << 0)  /* a Thetis discovery committed */
-#  define HPSDR_STATUS_HOST_RUN   (1u << 1)  /* HP Command run=1 (reserved) */
+#  define HPSDR_STATUS_HOST_RUN   (1u << 1)  /* HP Command run=1 */
+#  define HPSDR_STATUS_HOST_PTT   (1u << 2)  /* PTT0 (HP Command byte 4 bit 1) */
 /* Native AD9361 RX rate: matches U_hpsdr_ddc DECIMATION=256 -> 48 kHz, and is
  * above the AD9361 decimation-FIR floor so a single SAMPLERATE command works. */
 #  define HPSDR_RX_SAMPLERATE 12288000u
+/* Native AD9361 TX rate: the fabric DUC (U_hpsdr_duc / cic_interp) interpolates
+ * the host DUC0 rate (default 192 kHz) up to this fixed native rate, so the
+ * AD9361 TX always runs at 12.288 MSPS regardless of the Thetis transmit rate. */
+#  define HPSDR_TX_SAMPLERATE 12288000u
 #endif
 
 #define BLADERF_DEVICE_NAME "Nuand bladeRF 2.0 Micro"
@@ -242,6 +247,10 @@ int main(void)
      * than inheriting whatever bit-5 state libbladeRF or a previous boot
      * left behind). */
     uint8_t  hpsdr_rx_biastee_prev = 0xFF;
+    /* PTT0 edge tracker (hpsdr_status bit2) for TX-path monitoring.  0xFF so
+     * the first loop iteration logs the initial state.  Pure observability
+     * today -- the IQ-to-DAC gating lives in the fabric (hpsdr_tx_active). */
+    uint8_t  hpsdr_ptt_prev = 0xFF;
 #endif
 
 #ifdef BLADERF_NIOS_DEBUG
@@ -602,6 +611,21 @@ int main(void)
                 BRINGUP_CALL("ENABLE    ", BLADERF_RFIC_COMMAND_ENABLE,
                              BLADERF_CHANNEL_RX(0), 1);
 
+                /* TX0 bring-up: set the native rate only and leave TX
+                 * DISABLED.  This is a half-duplex radio -- enabling the
+                 * AD9361 TX continuously would leak its LO (a carrier spur at
+                 * the RX centre in transceive) and raise the RX noise floor,
+                 * so TX is keyed on/off per-PTT in the PTT handler below
+                 * (option A).  The fabric DUC interpolates the host DUC0 rate
+                 * up to 12.288 MSPS; the dac_streams(0) mux already zeroes the
+                 * DAC while not keying.  No FREQUENCY here -- the TX synth is
+                 * tuned by the (FREQUENCY, TX0) mailbox op once Thetis sends
+                 * its first HP Command.  The first key-down pays the AD9361 TX
+                 * calibration cost; subsequent keys are quick ENSM toggles. */
+                BRINGUP_CALL("TX SAMPLE ", BLADERF_RFIC_COMMAND_SAMPLERATE,
+                             BLADERF_CHANNEL_TX(0),
+                             HPSDR_TX_SAMPLERATE);
+
                 hpsdr_brought_up = true;
                 DBG("HPSDR: bring-up done\n");
             }
@@ -713,6 +737,39 @@ int main(void)
                     DBG("HPSDR: RX biastee -> %s\n",
                         biastee ? "ON" : "OFF");
                     hpsdr_rx_biastee_prev = biastee;
+                }
+            }
+
+            /* PTT0 -> AD9361 TX enable (option A: half-duplex T/R keying).
+             * hpsdr_status bit2 mirrors HP Command byte 4 bit 1 (PTT0).  On
+             * key-down we enable the AD9361 TX0 channel; on key-up we disable
+             * it, so the TX chain (and its LO leakage / noise) is off during
+             * receive -- a carrier spur at the RX centre in transceive
+             * otherwise.  The fabric (hpsdr_tx_active) independently gates the
+             * IQ-to-DAC path and zeroes the DAC while not keying, so the brief
+             * window between PTT assert and TX-enable completing just drops
+             * samples rather than emitting anything stale.  This is also the
+             * hook point for a future PTT-driven PA bias / TX-LED action. */
+            {
+                uint32_t status =
+                    IORD_ALTERA_AVALON_PIO_DATA(HPSDR_STATUS_BASE);
+                uint8_t  ptt     = (status & HPSDR_STATUS_HOST_PTT) ? 1u : 0u;
+                bool     engaged = (status & HPSDR_STATUS_HOST_VALID) != 0;
+
+                /* Only key TX once a client is engaged (and thus the radio is
+                 * brought up): PTT can't legitimately arrive before discovery,
+                 * and gating here keeps the boot-time hpsdr_ptt_prev=0xFF edge
+                 * from issuing an ENABLE before INIT/SAMPLERATE have run. */
+                if (engaged && ptt != hpsdr_ptt_prev) {
+                    bool ok = rfic_command_write_immed(
+                                  BLADERF_RFIC_COMMAND_ENABLE,
+                                  BLADERF_CHANNEL_TX(0),
+                                  ptt ? 1 : 0);
+                    DBG("HPSDR: PTT0 -> %s, TX0 %s -> %s\n",
+                        ptt ? "TX" : "RX",
+                        ptt ? "ENABLE" : "DISABLE",
+                        ok ? "ok" : "FAIL");
+                    hpsdr_ptt_prev = ptt;
                 }
             }
 #endif
