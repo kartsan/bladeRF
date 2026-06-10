@@ -31,6 +31,7 @@ vcom -work nuand -2008 ../vhdl/eem/hpsdr_cmd_mux.vhd
 vcom -work nuand -2008 ../vhdl/eem/hpsdr_dc_blocker.vhd
 vcom -work nuand -2008 ../vhdl/eem/hpsdr_cfir.vhd
 vcom -work nuand -2008 ../vhdl/eem/hpsdr_ddc_iq_sender.vhd
+vcom -work nuand -2008 ../vhdl/eem/hpsdr_mic_sender.vhd
 vcom -work nuand -2008 ../vhdl/eem/tx_arbiter.vhd
 vcom -work nuand -2008 ../vhdl/bladerf-hosted.vhd
 

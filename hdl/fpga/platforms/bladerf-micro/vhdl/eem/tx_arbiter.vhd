@@ -17,13 +17,13 @@
 -- =============================================================================
 -- tx_arbiter
 --
--- Six-input mux + arbiter sitting in front of eem_tx_framer's byte-stream
+-- Seven-input mux + arbiter sitting in front of eem_tx_framer's byte-stream
 -- input.  Producers compete for the framer; once a producer wins, it owns
 -- the framer until the framer's pkt_done_pulse fires (= the host has
 -- drained the last word over USB), then the arbiter returns to IDLE and
 -- the next producer can be selected.
 --
--- Priority: A > B > C > D > E > F.  In the typical wiring:
+-- Priority: A > B > C > D > E > F > G.  In the typical wiring:
 --   A = arp_responder              (NUD-timed; strictest deadline)
 --   B = icmp_responder             (ping reply; loose deadline but user-visible)
 --   C = dhcp_client                (4 s retransmit; very loose)
@@ -32,6 +32,9 @@
 --   F = hpsdr_ddc_iq_sender        (~200 Hz, 1486-byte; high volume but the
 --                                   most loss-tolerant -- Thetis only needs
 --                                   the stream to *exist*, not to be lossless)
+--   G = hpsdr_mic_sender           (~750 Hz, 174-byte zero-mic keep-alive;
+--                                   Thetis demands the mic stream exists or
+--                                   it silences the RX1 audio path)
 --
 -- Strict priority is adequate today because every producer's deadline is
 -- comfortable compared to the framer's drain rate.  If a future TX producer
@@ -93,13 +96,21 @@ entity tx_arbiter is
         e_length   : in  unsigned(13 downto 0);
         e_ready    : out std_logic;
 
-        -- Producer F (lowest priority).  Typical wiring: hpsdr_ddc_iq_sender.
+        -- Producer F.  Typical wiring: hpsdr_ddc_iq_sender.
         f_data     : in  std_logic_vector(7 downto 0);
         f_valid    : in  std_logic;
         f_sop      : in  std_logic;
         f_eop      : in  std_logic;
         f_length   : in  unsigned(13 downto 0);
         f_ready    : out std_logic;
+
+        -- Producer G (lowest priority).  Typical wiring: hpsdr_mic_sender.
+        g_data     : in  std_logic_vector(7 downto 0);
+        g_valid    : in  std_logic;
+        g_sop      : in  std_logic;
+        g_eop      : in  std_logic;
+        g_length   : in  unsigned(13 downto 0);
+        g_ready    : out std_logic;
 
         -- To framer's frame_in_* port
         tx_data    : out std_logic_vector(7 downto 0);
@@ -120,7 +131,7 @@ end entity;
 architecture arch of tx_arbiter is
 
     type state_t is (S_IDLE, S_A_ACTIVE, S_B_ACTIVE, S_C_ACTIVE,
-                     S_D_ACTIVE, S_E_ACTIVE, S_F_ACTIVE);
+                     S_D_ACTIVE, S_E_ACTIVE, S_F_ACTIVE, S_G_ACTIVE);
     signal state : state_t := S_IDLE;
 
 begin
@@ -133,6 +144,7 @@ begin
                  d_data   when state = S_D_ACTIVE else
                  e_data   when state = S_E_ACTIVE else
                  f_data   when state = S_F_ACTIVE else
+                 g_data   when state = S_G_ACTIVE else
                  (others => '0');
     tx_valid  <= a_valid  when state = S_A_ACTIVE else
                  b_valid  when state = S_B_ACTIVE else
@@ -140,6 +152,7 @@ begin
                  d_valid  when state = S_D_ACTIVE else
                  e_valid  when state = S_E_ACTIVE else
                  f_valid  when state = S_F_ACTIVE else
+                 g_valid  when state = S_G_ACTIVE else
                  '0';
     tx_sop    <= a_sop    when state = S_A_ACTIVE else
                  b_sop    when state = S_B_ACTIVE else
@@ -147,6 +160,7 @@ begin
                  d_sop    when state = S_D_ACTIVE else
                  e_sop    when state = S_E_ACTIVE else
                  f_sop    when state = S_F_ACTIVE else
+                 g_sop    when state = S_G_ACTIVE else
                  '0';
     tx_eop    <= a_eop    when state = S_A_ACTIVE else
                  b_eop    when state = S_B_ACTIVE else
@@ -154,6 +168,7 @@ begin
                  d_eop    when state = S_D_ACTIVE else
                  e_eop    when state = S_E_ACTIVE else
                  f_eop    when state = S_F_ACTIVE else
+                 g_eop    when state = S_G_ACTIVE else
                  '0';
     tx_length <= a_length when state = S_A_ACTIVE else
                  b_length when state = S_B_ACTIVE else
@@ -161,6 +176,7 @@ begin
                  d_length when state = S_D_ACTIVE else
                  e_length when state = S_E_ACTIVE else
                  f_length when state = S_F_ACTIVE else
+                 g_length when state = S_G_ACTIVE else
                  (others => '0');
 
     a_ready <= tx_ready when state = S_A_ACTIVE else '0';
@@ -169,6 +185,7 @@ begin
     d_ready <= tx_ready when state = S_D_ACTIVE else '0';
     e_ready <= tx_ready when state = S_E_ACTIVE else '0';
     f_ready <= tx_ready when state = S_F_ACTIVE else '0';
+    g_ready <= tx_ready when state = S_G_ACTIVE else '0';
 
     fsm : process(clock, reset)
     begin
@@ -177,7 +194,7 @@ begin
         elsif rising_edge(clock) then
             case state is
             when S_IDLE =>
-                -- Priority A > B > C > D > E > F.
+                -- Priority A > B > C > D > E > F > G.
                 if a_valid = '1' and a_sop = '1' then
                     state <= S_A_ACTIVE;
                 elsif b_valid = '1' and b_sop = '1' then
@@ -190,9 +207,11 @@ begin
                     state <= S_E_ACTIVE;
                 elsif f_valid = '1' and f_sop = '1' then
                     state <= S_F_ACTIVE;
+                elsif g_valid = '1' and g_sop = '1' then
+                    state <= S_G_ACTIVE;
                 end if;
             when S_A_ACTIVE | S_B_ACTIVE | S_C_ACTIVE |
-                 S_D_ACTIVE | S_E_ACTIVE | S_F_ACTIVE =>
+                 S_D_ACTIVE | S_E_ACTIVE | S_F_ACTIVE | S_G_ACTIVE =>
                 -- Hold the producer through the framer's full processing
                 -- pipeline (S_HDR, S_ETH, S_FCS, S_DUMMY, S_DRIVE); release
                 -- on pkt_done so the framer is back in S_IDLE and the next

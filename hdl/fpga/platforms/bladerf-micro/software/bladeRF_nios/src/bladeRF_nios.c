@@ -27,7 +27,7 @@
 
 /* Will send debug alt_printf info to JTAG console while running on NIOS.
  * This can slow performance and cause timing issues... be careful. */
-#define BLADERF_NIOS_DEBUG
+//#define BLADERF_NIOS_DEBUG
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -560,26 +560,33 @@ int main(void)
              * trips this and we never fight its RFIC init.  No FREQUENCY: the
              * radio parks at the AD9361 init default until Thetis's first HP
              * Command, which the dispatcher below then applies. */
+/* Issue an RFIC immed write and (when DBG is on) log its ok/FAIL result.
+ * The function call always happens; the bool capture only exists in the
+ * DBG-on path, so DBG-off builds don't leave an unused-but-set local. */
+#ifdef BLADERF_NIOS_DEBUG
+#  define BRINGUP_CALL(label, ...)                                            \
+       do { bool _ok = rfic_command_write_immed(__VA_ARGS__);                 \
+            DBG("HPSDR:  " label " -> %s\n", _ok ? "ok" : "FAIL"); } while (0)
+#else
+#  define BRINGUP_CALL(label, ...)                                            \
+       ((void)rfic_command_write_immed(__VA_ARGS__))
+#endif
             if (!hpsdr_brought_up &&
                 (IORD_ALTERA_AVALON_PIO_DATA(HPSDR_STATUS_BASE) &
                  HPSDR_STATUS_HOST_VALID)) {
-                bool ok;
                 DBG("HPSDR: discovery seen, RX0 bring-up start\n");
 
-                ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_INIT,
-                                              RFIC_SYSTEM_CHANNEL,
-                                              BLADERF_RFIC_INIT_STATE_ON);
-                DBG("HPSDR:  INIT       -> %s\n", ok ? "ok" : "FAIL");
+                BRINGUP_CALL("INIT      ", BLADERF_RFIC_COMMAND_INIT,
+                             RFIC_SYSTEM_CHANNEL,
+                             BLADERF_RFIC_INIT_STATE_ON);
 
-                ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_SAMPLERATE,
-                                              BLADERF_CHANNEL_RX(0),
-                                              HPSDR_RX_SAMPLERATE);
-                DBG("HPSDR:  SAMPLERATE -> %s\n", ok ? "ok" : "FAIL");
+                BRINGUP_CALL("SAMPLERATE", BLADERF_RFIC_COMMAND_SAMPLERATE,
+                             BLADERF_CHANNEL_RX(0),
+                             HPSDR_RX_SAMPLERATE);
 
-                ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAINMODE,
-                                              BLADERF_CHANNEL_RX(0),
-                                              BLADERF_GAIN_MGC);
-                DBG("HPSDR:  GAINMODE   -> %s\n", ok ? "ok" : "FAIL");
+                BRINGUP_CALL("GAINMODE  ", BLADERF_RFIC_COMMAND_GAINMODE,
+                             BLADERF_CHANNEL_RX(0),
+                             BLADERF_GAIN_MGC);
 
                 /* Match the hpsdr_cmd_mux GAIN_ANCHOR_DB (anchor - atten):
                  * Thetis defaults RX1 step-attenuator to 0 dB, which the mux
@@ -589,17 +596,16 @@ int main(void)
                  * Anchor is 32 so the full 0..31 attenuator slider stays
                  * within the AD9361 <=1.3 GHz floor (+1 dB, see ad9361.c
                  * TBL_200_1300_MHZ starting_gain_db). */
-                ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_GAIN,
-                                              BLADERF_CHANNEL_RX(0), 32);
-                DBG("HPSDR:  GAIN       -> %s\n", ok ? "ok" : "FAIL");
+                BRINGUP_CALL("GAIN      ", BLADERF_RFIC_COMMAND_GAIN,
+                             BLADERF_CHANNEL_RX(0), 32);
 
-                ok = rfic_command_write_immed(BLADERF_RFIC_COMMAND_ENABLE,
-                                              BLADERF_CHANNEL_RX(0), 1);
-                DBG("HPSDR:  ENABLE     -> %s\n", ok ? "ok" : "FAIL");
+                BRINGUP_CALL("ENABLE    ", BLADERF_RFIC_COMMAND_ENABLE,
+                             BLADERF_CHANNEL_RX(0), 1);
 
                 hpsdr_brought_up = true;
                 DBG("HPSDR: bring-up done\n");
             }
+#undef BRINGUP_CALL
 #endif
 
 #if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_CMD_OP_BASE)

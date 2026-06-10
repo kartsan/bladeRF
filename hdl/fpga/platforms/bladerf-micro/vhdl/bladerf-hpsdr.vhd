@@ -284,16 +284,28 @@ architecture hpsdr_bladerf of bladerf is
     signal hpsdr_ddc_tx_ready     : std_logic;
     signal hpsdr_ddc_send_pulse   : std_logic;
 
-    -- HPSDR DDC RX path: hpsdr_ddc (rx_clock) -> dc_blocker -> cfir
-    -- -> async FIFO -> ddc_iq_sender.  The dc_blocker kills the AD9361
-    -- zero-IF DC/LO-leakage spike at the panadapter centre bin; the cfir
-    -- flattens the 5-stage CIC sinc^5 droop across the displayed band.
+    -- hpsdr_mic_sender -> tx_arbiter (port G).  174-byte zero-mic keep-alive
+    -- on UDP/1026 at ~750 Hz while host_run='1'.  Thetis silences the RX1
+    -- audio demodulator if the mic stream isn't present even though DDC IQ
+    -- on UDP/1037 is flowing, so this stream HAS to exist for receive audio
+    -- to work -- the bytes themselves don't have to be anything in
+    -- particular (we ship all zero).
+    signal hpsdr_mic_tx_data      : std_logic_vector(7 downto 0);
+    signal hpsdr_mic_tx_valid     : std_logic;
+    signal hpsdr_mic_tx_sop       : std_logic;
+    signal hpsdr_mic_tx_eop       : std_logic;
+    signal hpsdr_mic_tx_length    : unsigned(13 downto 0);
+    signal hpsdr_mic_tx_ready     : std_logic;
+    signal hpsdr_mic_send_pulse   : std_logic;
+
+    -- HPSDR DDC RX path: hpsdr_ddc (rx_clock) -> cfir -> async FIFO ->
+    -- ddc_iq_sender.  The cfir flattens the 5-stage CIC sinc^5 droop across
+    -- the displayed band.  DC blocker is temporarily out of the chain pending
+    -- the CFIR overflow-wrap fix (CFIR has peak gain 2.64x and only resizes,
+    -- not saturates -- wrap injects DC that defeats the blocker).
     signal ddc_out_i              : signed(23 downto 0);
     signal ddc_out_q              : signed(23 downto 0);
     signal ddc_out_valid          : std_logic;
-    signal ddc_dc_i               : signed(23 downto 0);
-    signal ddc_dc_q               : signed(23 downto 0);
-    signal ddc_dc_valid           : std_logic;
     signal ddc_cfir_i             : signed(23 downto 0);
     signal ddc_cfir_q             : signed(23 downto 0);
     signal ddc_cfir_valid         : std_logic;
@@ -1307,12 +1319,47 @@ begin
         );
 
     -- ========================================================================
+    -- HPSDR P2 Mic-samples keep-alive.  ~750 Hz, 174-byte all-zero mic
+    -- packets on UDP/1026 to the HP Command's source ephemeral; same gate as
+    -- HP Status and DDC IQ.  Required for RX audio: without this stream
+    -- Thetis silences the RX1 demodulator output to the soundcard even
+    -- though the DDC IQ stream on 1037 keeps the panadapter drawing.  We
+    -- ship zero mic data (Orion2's MIC_SEND structure with the FIFO emitting
+    -- silence).  Drives tx_arbiter port G (lowest priority).
+    -- ========================================================================
+    U_hpsdr_mic_sender : entity work.hpsdr_mic_sender
+        port map (
+            clock        => fx3_pclk_pll,
+            reset        => sys_reset_pclk,
+
+            our_mac      => local_mac,
+            our_ip       => effective_ip,
+
+            host_mac     => hpsdr_host_mac,
+            host_ip      => hpsdr_host_ip,
+            host_port    => hpsdr_hp_cmd_host_port,
+            host_valid   => hpsdr_host_valid,
+
+            host_run     => hpsdr_host_run,
+
+            tx_data      => hpsdr_mic_tx_data,
+            tx_valid     => hpsdr_mic_tx_valid,
+            tx_sop       => hpsdr_mic_tx_sop,
+            tx_eop       => hpsdr_mic_tx_eop,
+            tx_length    => hpsdr_mic_tx_length,
+            tx_ready     => hpsdr_mic_tx_ready,
+
+            send_pulse   => hpsdr_mic_send_pulse
+        );
+
+    -- ========================================================================
     -- TX arbiter: multiplexes arp_responder (port A, highest priority),
     -- icmp_responder (port B), dhcp_client (port C),
-    -- hpsdr_discovery_responder (port D), hpsdr_hp_status_sender (port E)
-    -- and hpsdr_ddc_iq_sender (port F, lowest priority) onto the single
-    -- eem_tx_framer input.  Holds the active producer until the framer's
-    -- pkt_done_pulse fires, then releases for the next.
+    -- hpsdr_discovery_responder (port D), hpsdr_hp_status_sender (port E),
+    -- hpsdr_ddc_iq_sender (port F) and hpsdr_mic_sender (port G, lowest
+    -- priority) onto the single eem_tx_framer input.  Holds the active
+    -- producer until the framer's pkt_done_pulse fires, then releases for
+    -- the next.
     -- ========================================================================
     U_tx_arbiter : entity work.tx_arbiter
         port map (
@@ -1360,6 +1407,13 @@ begin
             f_eop     => hpsdr_ddc_tx_eop,
             f_length  => hpsdr_ddc_tx_length,
             f_ready   => hpsdr_ddc_tx_ready,
+
+            g_data    => hpsdr_mic_tx_data,
+            g_valid   => hpsdr_mic_tx_valid,
+            g_sop     => hpsdr_mic_tx_sop,
+            g_eop     => hpsdr_mic_tx_eop,
+            g_length  => hpsdr_mic_tx_length,
+            g_ready   => hpsdr_mic_tx_ready,
 
             tx_data   => mux_tx_data,
             tx_valid  => mux_tx_valid,
@@ -1876,35 +1930,11 @@ begin
         );
 
     -- ------------------------------------------------------------------------
-    -- DC blocker: one-pole IIR per channel, R = 1 - 2^-13 -> ~0.93 Hz corner
-    -- at 48 kHz.  Removes the AD9361 zero-IF DC / LO-leakage spike from the
-    -- panadapter centre bin without disturbing anything human-audible.  Not
-    -- reset by ddc_fifo_aclr / host_run so the IIR stays converged between
-    -- Thetis reconnects -- first IQ packet after engagement is already
-    -- DC-clean.  K bumped from 11 -> 13 to deepen the notch against the
-    -- residual high-gain DC seen on the panadapter; ~0.8 s settling time.
-    -- ------------------------------------------------------------------------
-    U_hpsdr_dc_blocker : entity work.hpsdr_dc_blocker
-        generic map (
-            WIDTH => 24,
-            K     => 13
-        )
-        port map (
-            clock     => rx_clock,
-            reset     => rx_reset,
-            in_i      => ddc_out_i,
-            in_q      => ddc_out_q,
-            in_valid  => ddc_out_valid,
-            out_i     => ddc_dc_i,
-            out_q     => ddc_dc_q,
-            out_valid => ddc_dc_valid
-        );
-
-    -- ------------------------------------------------------------------------
     -- CIC sinc^5 compensation FIR: 5-tap symmetric, analytical inverse-sinc
     -- design.  Flattens the panadapter noise floor across ~+/- 30% of the
-    -- DDC output Nyquist (within ~1 dB).  Reset rules match the dc_blocker;
-    -- runs at the CIC output rate (variable, follows hpsdr_rate_id_gray).
+    -- DDC output Nyquist (within ~1 dB).  Runs at the CIC output rate
+    -- (variable, follows hpsdr_rate_id_gray).  DC blocker temporarily
+    -- removed from this chain -- see signal-declaration comment above.
     -- ------------------------------------------------------------------------
     U_hpsdr_cfir : entity work.hpsdr_cfir
         generic map (
@@ -1913,9 +1943,9 @@ begin
         port map (
             clock     => rx_clock,
             reset     => rx_reset,
-            in_i      => ddc_dc_i,
-            in_q      => ddc_dc_q,
-            in_valid  => ddc_dc_valid,
+            in_i      => ddc_out_i,
+            in_q      => ddc_out_q,
+            in_valid  => ddc_out_valid,
             out_i     => ddc_cfir_i,
             out_q     => ddc_cfir_q,
             out_valid => ddc_cfir_valid
