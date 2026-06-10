@@ -85,6 +85,15 @@ static inline bladerf_channel hpsdr_decode_channel(uint8_t ch)
     }
 }
 
+/* NOTE: disable CTUN (Click-Tune) in Thetis with this radio.  CTUN parks the
+ * RX DDC LO at the panadapter centre and tunes the VFO digitally in the host,
+ * while the TX DUC goes to the true VFO -- so DDC0 (RX) and DUC0 (TX) phase
+ * words diverge (observed as a ~12.5 kHz RX/TX split).  Real HPSDR hardware
+ * absorbs that in a wide DDC + host NCO; we instead tune the AD9361 analog LO
+ * and deliver a narrow zero-IF baseband centred on it, so the VFO must *be*
+ * the LO.  With CTUN off, Thetis sends matching phase words and RX/TX align.
+ */
+
 /* Virtual-transverter LO offset applied to FREQUENCY writes.  The LO offset
  * is derived at runtime from HP Cmd byte 1401 bits [7:2] (see
  * HPSDR_BAND_INDEX_BASE below): the fabric publishes that 6-bit index on the
@@ -138,6 +147,19 @@ static inline int32_t hpsdr_band_to_lo_offset_hz(uint8_t band)
  * the host DUC0 rate (default 192 kHz) up to this fixed native rate, so the
  * AD9361 TX always runs at 12.288 MSPS regardless of the Thetis transmit rate. */
 #  define HPSDR_TX_SAMPLERATE 12288000u
+
+/* Issue an RFIC immed write and, on DBG builds, log its ok/FAIL result under
+ * the given label.  The call always happens; the bool result is captured only
+ * in the DBG-on path, so DBG-off builds don't trip -Werror=unused-variable.
+ * Used by the autonomous bring-up and the PTT TX-enable toggle. */
+#  ifdef BLADERF_NIOS_DEBUG
+#    define HPSDR_DBG(label, ...)                                             \
+         do { bool _ok = rfic_command_write_immed(__VA_ARGS__);              \
+              DBG("HPSDR:  " label " -> %s\n", _ok ? "ok" : "FAIL"); } while (0)
+#  else
+#    define HPSDR_DBG(label, ...)                                             \
+         ((void)rfic_command_write_immed(__VA_ARGS__))
+#  endif
 #endif
 
 #define BLADERF_DEVICE_NAME "Nuand bladeRF 2.0 Micro"
@@ -569,31 +591,20 @@ int main(void)
              * trips this and we never fight its RFIC init.  No FREQUENCY: the
              * radio parks at the AD9361 init default until Thetis's first HP
              * Command, which the dispatcher below then applies. */
-/* Issue an RFIC immed write and (when DBG is on) log its ok/FAIL result.
- * The function call always happens; the bool capture only exists in the
- * DBG-on path, so DBG-off builds don't leave an unused-but-set local. */
-#ifdef BLADERF_NIOS_DEBUG
-#  define BRINGUP_CALL(label, ...)                                            \
-       do { bool _ok = rfic_command_write_immed(__VA_ARGS__);                 \
-            DBG("HPSDR:  " label " -> %s\n", _ok ? "ok" : "FAIL"); } while (0)
-#else
-#  define BRINGUP_CALL(label, ...)                                            \
-       ((void)rfic_command_write_immed(__VA_ARGS__))
-#endif
             if (!hpsdr_brought_up &&
                 (IORD_ALTERA_AVALON_PIO_DATA(HPSDR_STATUS_BASE) &
                  HPSDR_STATUS_HOST_VALID)) {
                 DBG("HPSDR: discovery seen, RX0 bring-up start\n");
 
-                BRINGUP_CALL("INIT      ", BLADERF_RFIC_COMMAND_INIT,
+                HPSDR_DBG("INIT      ", BLADERF_RFIC_COMMAND_INIT,
                              RFIC_SYSTEM_CHANNEL,
                              BLADERF_RFIC_INIT_STATE_ON);
 
-                BRINGUP_CALL("SAMPLERATE", BLADERF_RFIC_COMMAND_SAMPLERATE,
+                HPSDR_DBG("SAMPLERATE", BLADERF_RFIC_COMMAND_SAMPLERATE,
                              BLADERF_CHANNEL_RX(0),
                              HPSDR_RX_SAMPLERATE);
 
-                BRINGUP_CALL("GAINMODE  ", BLADERF_RFIC_COMMAND_GAINMODE,
+                HPSDR_DBG("GAINMODE  ", BLADERF_RFIC_COMMAND_GAINMODE,
                              BLADERF_CHANNEL_RX(0),
                              BLADERF_GAIN_MGC);
 
@@ -605,10 +616,10 @@ int main(void)
                  * Anchor is 32 so the full 0..31 attenuator slider stays
                  * within the AD9361 <=1.3 GHz floor (+1 dB, see ad9361.c
                  * TBL_200_1300_MHZ starting_gain_db). */
-                BRINGUP_CALL("GAIN      ", BLADERF_RFIC_COMMAND_GAIN,
+                HPSDR_DBG("GAIN      ", BLADERF_RFIC_COMMAND_GAIN,
                              BLADERF_CHANNEL_RX(0), 32);
 
-                BRINGUP_CALL("ENABLE    ", BLADERF_RFIC_COMMAND_ENABLE,
+                HPSDR_DBG("ENABLE    ", BLADERF_RFIC_COMMAND_ENABLE,
                              BLADERF_CHANNEL_RX(0), 1);
 
                 /* TX0 bring-up: set the native rate only and leave TX
@@ -622,14 +633,13 @@ int main(void)
                  * tuned by the (FREQUENCY, TX0) mailbox op once Thetis sends
                  * its first HP Command.  The first key-down pays the AD9361 TX
                  * calibration cost; subsequent keys are quick ENSM toggles. */
-                BRINGUP_CALL("TX SAMPLE ", BLADERF_RFIC_COMMAND_SAMPLERATE,
+                HPSDR_DBG("TX SAMPLE ", BLADERF_RFIC_COMMAND_SAMPLERATE,
                              BLADERF_CHANNEL_TX(0),
                              HPSDR_TX_SAMPLERATE);
 
                 hpsdr_brought_up = true;
                 DBG("HPSDR: bring-up done\n");
             }
-#undef BRINGUP_CALL
 #endif
 
 #if defined(BLADERF_NIOS_LIBAD936X) && defined(HPSDR_CMD_OP_BASE)
@@ -761,14 +771,15 @@ int main(void)
                  * and gating here keeps the boot-time hpsdr_ptt_prev=0xFF edge
                  * from issuing an ENABLE before INIT/SAMPLERATE have run. */
                 if (engaged && ptt != hpsdr_ptt_prev) {
-                    bool ok = rfic_command_write_immed(
+                    if (ptt) {
+                        HPSDR_DBG("PTT0 TX0 ENABLE ",
                                   BLADERF_RFIC_COMMAND_ENABLE,
-                                  BLADERF_CHANNEL_TX(0),
-                                  ptt ? 1 : 0);
-                    DBG("HPSDR: PTT0 -> %s, TX0 %s -> %s\n",
-                        ptt ? "TX" : "RX",
-                        ptt ? "ENABLE" : "DISABLE",
-                        ok ? "ok" : "FAIL");
+                                  BLADERF_CHANNEL_TX(0), 1);
+                    } else {
+                        HPSDR_DBG("PTT0 TX0 DISABLE",
+                                  BLADERF_RFIC_COMMAND_ENABLE,
+                                  BLADERF_CHANNEL_TX(0), 0);
+                    }
                     hpsdr_ptt_prev = ptt;
                 }
             }
