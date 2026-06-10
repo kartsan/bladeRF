@@ -2000,8 +2000,13 @@ begin
                         ad9361.ch(0).dac.i.data <= (others => '0');
                         ad9361.ch(0).dac.q.data <= (others => '0');
                     elsif (duc_out_valid = '1') then
-                        ad9361.ch(0).dac.i.data <= std_logic_vector(duc_out_i(15 downto 4)) & "0000";
-                        ad9361.ch(0).dac.q.data <= std_logic_vector(duc_out_q(15 downto 4)) & "0000";
+                        -- I/Q swapped to match the RX conjugation (same AD9361
+                        -- I/Q sense): keeps the transmitted sideband consistent
+                        -- with the corrected RX spectrum.  VERIFY ON AIR -- if
+                        -- TX sideband is wrong, this swap (not the RX one) is
+                        -- what to revert.  See feedback_hpsdr_iq_spectrum_inversion.
+                        ad9361.ch(0).dac.i.data <= std_logic_vector(duc_out_q(15 downto 4)) & "0000";
+                        ad9361.ch(0).dac.q.data <= std_logic_vector(duc_out_i(15 downto 4)) & "0000";
                     end if;
                 elsif (dac_streams(i).data_v = '1') then
                     ad9361.ch(i).dac.i.data  <= std_logic_vector(dac_streams(i).data_i(11 downto 0)) & "0000";
@@ -2126,8 +2131,14 @@ begin
             clock        => rx_clock,
             reset        => rx_reset,
             rate_id_gray => hpsdr_rate_id_gray,  -- async; synced internally
-            in_i         => shift_left(adc_streams(0).data_i, 4),
-            in_q         => shift_left(adc_streams(0).data_q, 4),
+            -- I/Q swapped on purpose: conjugates the complex baseband to
+            -- correct the zero-IF spectrum inversion (panadapter mirrored
+            -- about centre -- a signal at LO+d showed up at LO-d).  The
+            -- AD9361 I/Q sense is opposite Thetis's convention; swapping
+            -- I<->Q mirrors the spectrum (= j*conj, overflow-safe vs negating
+            -- Q at full scale).  See feedback_hpsdr_iq_spectrum_inversion.
+            in_i         => shift_left(adc_streams(0).data_q, 4),
+            in_q         => shift_left(adc_streams(0).data_i, 4),
             in_valid     => adc_streams(0).data_v,
             out_i        => ddc_out_i,
             out_q        => ddc_out_q,
