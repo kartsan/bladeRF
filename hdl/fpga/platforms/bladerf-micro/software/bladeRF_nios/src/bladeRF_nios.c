@@ -147,6 +147,14 @@ static inline int32_t hpsdr_band_to_lo_offset_hz(uint8_t band)
  * the host DUC0 rate (default 192 kHz) up to this fixed native rate, so the
  * AD9361 TX always runs at 12.288 MSPS regardless of the Thetis transmit rate. */
 #  define HPSDR_TX_SAMPLERATE 12288000u
+/* AD9361 analog (BBLPF) bandwidth, set once at bring-up and held fixed.  It is
+ * matched to the 12.288 MSPS native pipe (~0.8 * Fs), NOT to the HPSDR DDC/DUC
+ * rate -- the fabric CIC does the actual channel selection, and the AD9361
+ * analog filter can't go as narrow as the HPSDR rates anyway.  Keeps the
+ * analog anti-alias/noise filter snug to the native span instead of the wide
+ * (~18 MHz) power-on default. */
+#  define HPSDR_RX_BANDWIDTH 10000000u
+#  define HPSDR_TX_BANDWIDTH 10000000u
 
 /* Issue an RFIC immed write and, on DBG builds, log its ok/FAIL result under
  * the given label.  The call always happens; the bool result is captured only
@@ -604,6 +612,14 @@ int main(void)
                              BLADERF_CHANNEL_RX(0),
                              HPSDR_RX_SAMPLERATE);
 
+                /* Analog BBLPF matched to the 12.288 MSPS native pipe, fixed.
+                 * Channel selectivity is the fabric CIC's job; this just keeps
+                 * the AD9361 anti-alias/noise filter snug vs the ~18 MHz
+                 * power-on default. */
+                HPSDR_DBG("BANDWIDTH ", BLADERF_RFIC_COMMAND_BANDWIDTH,
+                             BLADERF_CHANNEL_RX(0),
+                             HPSDR_RX_BANDWIDTH);
+
                 HPSDR_DBG("GAINMODE  ", BLADERF_RFIC_COMMAND_GAINMODE,
                              BLADERF_CHANNEL_RX(0),
                              BLADERF_GAIN_MGC);
@@ -636,6 +652,10 @@ int main(void)
                 HPSDR_DBG("TX SAMPLE ", BLADERF_RFIC_COMMAND_SAMPLERATE,
                              BLADERF_CHANNEL_TX(0),
                              HPSDR_TX_SAMPLERATE);
+
+                HPSDR_DBG("TX BW     ", BLADERF_RFIC_COMMAND_BANDWIDTH,
+                             BLADERF_CHANNEL_TX(0),
+                             HPSDR_TX_BANDWIDTH);
 
                 hpsdr_brought_up = true;
                 DBG("HPSDR: bring-up done\n");

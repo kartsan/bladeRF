@@ -111,6 +111,24 @@ architecture rtl of hpsdr_cfir is
     constant PROD_W : positive := WIDTH + COEF_W;
     constant ACC_W  : positive := PROD_W + 3;
 
+    -- Saturating cast to WIDTH-bit signed.  The cFIR's ~2.64x peak gain can
+    -- push a near-full-scale CIC sample past the 24-bit output range; a plain
+    -- resize() would two's-complement WRAP, turning a strong band-edge signal
+    -- into a violent sign-flipped spike (which also defeats a downstream DC
+    -- blocker).  Clip to full-scale instead -- benign vs a wrap.
+    function sat_width(v : signed) return signed is
+        constant HI : integer := 2**(WIDTH-1) - 1;
+        constant LO : integer := -(2**(WIDTH-1));
+    begin
+        if    v > to_signed(HI, v'length) then
+            return to_signed(HI, WIDTH);
+        elsif v < to_signed(LO, v'length) then
+            return to_signed(LO, WIDTH);
+        else
+            return resize(v, WIDTH);
+        end if;
+    end function;
+
 begin
 
     out_i     <= out_i_r;
@@ -156,18 +174,13 @@ begin
                     sr_q(k) <= sr_q(k-1);
                 end loop;
 
-                -- Drop the Q3.14 fractional bits to return to input scale.
-                -- |H(omega)| stays bounded by ~2.6 across all omega, so the
-                -- output never exceeds 2.6*max|input| -- the WIDTH-bit slice
-                -- has 1.4 bits of headroom under standard CIC operating
-                -- conditions (CIC output normally has 2-3 bits of unused
-                -- top in the 24-bit container).  Saturation is therefore
-                -- left out; if a future change saturates the CIC output
-                -- closer to full-scale, add a saturator here.
-                out_i_r     <= resize(
-                                  shift_right(acc_i, COEF_FRAC_BITS), WIDTH);
-                out_q_r     <= resize(
-                                  shift_right(acc_q, COEF_FRAC_BITS), WIDTH);
+                -- Drop the Q3.14 fractional bits to return to input scale,
+                -- then saturate: the ~2.64x peak gain on a full-scale CIC
+                -- sample can exceed 24-bit range, and we run the CIC at full
+                -- scale (shift_left(...,4) on a full 16-bit input), so the
+                -- old plain resize() could wrap.  sat_width() clips instead.
+                out_i_r     <= sat_width(shift_right(acc_i, COEF_FRAC_BITS));
+                out_q_r     <= sat_width(shift_right(acc_q, COEF_FRAC_BITS));
                 out_valid_r <= '1';
             end if;
         end if;

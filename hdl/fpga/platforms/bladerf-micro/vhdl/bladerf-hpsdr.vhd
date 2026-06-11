@@ -298,11 +298,13 @@ architecture hpsdr_bladerf of bladerf is
     signal hpsdr_mic_tx_ready     : std_logic;
     signal hpsdr_mic_send_pulse   : std_logic;
 
-    -- HPSDR DDC RX path: hpsdr_ddc (rx_clock) -> cfir -> async FIFO ->
-    -- ddc_iq_sender.  The cfir flattens the 5-stage CIC sinc^5 droop across
-    -- the displayed band.  DC blocker is temporarily out of the chain pending
-    -- the CFIR overflow-wrap fix (CFIR has peak gain 2.64x and only resizes,
-    -- not saturates -- wrap injects DC that defeats the blocker).
+    -- HPSDR DDC RX path: hpsdr_ddc (CIC) -> cfir -> async FIFO -> ddc_iq_sender.
+    -- The cfir flattens the 5-stage CIC sinc^5 droop across the displayed band.
+    -- NOTE: no fabric DC blocker -- a high-pass at either the DDC output rate or
+    -- the native rate could not null the AD9361 zero-IF DC spike without an
+    -- unacceptably wide centre notch (the leakage WANDERS over too broad a band;
+    -- see project_hpsdr_rx_chain_landed).  DC leakage is to be fixed at source
+    -- via AD9361 BB DC offset tracking instead.
     signal ddc_out_i              : signed(23 downto 0);
     signal ddc_out_q              : signed(23 downto 0);
     signal ddc_out_valid          : std_logic;
@@ -2156,8 +2158,7 @@ begin
     -- CIC sinc^5 compensation FIR: 5-tap symmetric, analytical inverse-sinc
     -- design.  Flattens the panadapter noise floor across ~+/- 30% of the
     -- DDC output Nyquist (within ~1 dB).  Runs at the CIC output rate
-    -- (variable, follows hpsdr_rate_id_gray).  DC blocker temporarily
-    -- removed from this chain -- see signal-declaration comment above.
+    -- (variable, follows hpsdr_rate_id_gray).  Output now saturates (no wrap).
     -- ------------------------------------------------------------------------
     U_hpsdr_cfir : entity work.hpsdr_cfir
         generic map (
@@ -2174,6 +2175,7 @@ begin
             out_valid => ddc_cfir_valid
         );
 
+    -- cfir output feeds the async FIFO directly (no fabric DC blocker).
     ddc_fifo_wrdata <= std_logic_vector(ddc_cfir_i) & std_logic_vector(ddc_cfir_q);
     ddc_fifo_aclr   <= not hpsdr_host_run;   -- clear FIFO unless engaged
 
