@@ -518,6 +518,11 @@ architecture hpsdr_bladerf of bladerf is
     -- value = 60 - atten.
     signal host_rx0_atten         : std_logic_vector(4 downto 0);
 
+    -- HPSDR DUC0 (TX0) drive level (HP Command byte 345, 0..255).  Fed into
+    -- hpsdr_cmd_mux which maps it to an AD9361 TX attenuation (GAIN op on the
+    -- TX0 channel).
+    signal host_tx_drive          : std_logic_vector(7 downto 0);
+
     -- HPSDR virtual-band index (HP Command byte 1401 bits [7:2], 0..63).
     -- Same-domain copy feeds hpsdr_cmd_mux's FREQUENCY trigger; the
     -- per-bit synchronised copy below crosses to sys_clock for the NIOS
@@ -1270,6 +1275,7 @@ begin
             host_rx0_freq    => host_rx0_freq,
             host_duc0_freq   => host_duc0_freq,
             host_rx0_atten   => host_rx0_atten,
+            host_tx_drive    => host_tx_drive,
             host_band_index  => host_band_index,
             host_rx_biastee  => host_rx_biastee,
 
@@ -1424,6 +1430,7 @@ begin
             rx0_band_index => host_band_index,
             rx0_atten      => host_rx0_atten,
             tx0_freq       => host_duc0_freq,
+            tx0_drive      => host_tx_drive,
             hp_cmd_pulse   => hpsdr_hp_cmd_decode_pulse,
 
             cmd_op       => hpsdr_cmd_op_fab,

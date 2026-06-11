@@ -120,6 +120,12 @@ entity hpsdr_hp_cmd_handler is
         -- committed at rx_eop.  Held across packets until the next command.
         host_rx0_atten   : out std_logic_vector(4 downto 0);
 
+        -- DUC0 (TX0) drive level (HP Command byte 345, 0..255; 255 = max
+        -- power).  Orion2 High_Priority_CC.v: drive_level <= byte 345.
+        -- Committed at rx_eop; hpsdr_cmd_mux maps it to an AD9361 TX
+        -- attenuation (GAIN op on the TX0 channel).
+        host_tx_drive    : out std_logic_vector(7 downto 0);
+
         -- Virtual-band index (HP Command byte 1401 bits [7:2], 0..63).  NIOS
         -- converts to LO offset (70 + X*150) MHz.  Committed at rx_eop.
         host_band_index  : out std_logic_vector(5 downto 0);
@@ -158,6 +164,11 @@ architecture arch of hpsdr_hp_cmd_handler is
     signal atten_latched   : std_logic_vector(4 downto 0) := (others => '0');
     signal host_rx0_atten_r: std_logic_vector(4 downto 0) := (others => '0');
 
+    -- DUC0 (TX0) drive level: single-byte capture at byte 345 (drive_latched);
+    -- committed to host_tx_drive_r at rx_eop alongside the other fields.
+    signal drive_latched   : std_logic_vector(7 downto 0) := (others => '0');
+    signal host_tx_drive_r : std_logic_vector(7 downto 0) := (others => '0');
+
     -- Virtual-band index: byte 1401 bits [7:2], captured mid-packet and
     -- committed to host_band_index_r at rx_eop.
     signal band_latched     : std_logic_vector(5 downto 0) := (others => '0');
@@ -179,6 +190,7 @@ begin
     host_rx0_freq   <= host_rx0_freq_r;
     host_duc0_freq  <= host_duc0_freq_r;
     host_rx0_atten  <= host_rx0_atten_r;
+    host_tx_drive   <= host_tx_drive_r;
     host_band_index <= host_band_index_r;
     host_rx_biastee <= host_rx_biastee_r;
     hp_cmd_pulse    <= hp_cmd_pulse_r;
@@ -197,6 +209,8 @@ begin
             host_duc0_freq_r  <= (others => '0');
             atten_latched     <= (others => '0');
             host_rx0_atten_r  <= (others => '0');
+            drive_latched     <= (others => '0');
+            host_tx_drive_r   <= (others => '0');
             band_latched      <= (others => '0');
             host_band_index_r <= (others => '0');
             biastee_latched   <= '0';
@@ -256,6 +270,12 @@ begin
                     duc0_freq_sr <= duc0_freq_sr(23 downto 0) & rx_data;
                 end if;
 
+                -- Orion2 High_Priority_CC.v / V4.4 spec p.34: byte 345 = DUC0
+                -- (Tx0) drive level, 0..255 (255 = max power).
+                if n_byte_idx = to_unsigned(345, n_byte_idx'length) then
+                    drive_latched <= rx_data;
+                end if;
+
                 -- V4.4 spec p.35: byte 1443 = 0-31dB step attenuator before
                 -- ADC0 (Thetis "RX1").  Only low 5 bits are defined.
                 if n_byte_idx = to_unsigned(1443, n_byte_idx'length) then
@@ -276,6 +296,7 @@ begin
                     host_rx0_freq_r   <= freq_sr;          -- commit assembled value
                     host_duc0_freq_r  <= duc0_freq_sr;     -- commit TX freq too
                     host_rx0_atten_r  <= atten_latched;    -- commit at packet boundary
+                    host_tx_drive_r   <= drive_latched;    -- commit TX drive level
                     host_band_index_r <= band_latched;
                     host_rx_biastee_r <= biastee_latched;
                     hp_cmd_pulse_r    <= '1';

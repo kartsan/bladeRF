@@ -72,6 +72,13 @@ entity hpsdr_cmd_mux is
         -- as for RX0, so transceive tracks.  Skipped while 0 (pre-engagement).
         tx0_freq        : in  std_logic_vector(31 downto 0);
 
+        -- Source D: DUC0 (TX0) drive level, 0..255 (hp_cmd_handler byte 345;
+        -- 255 = max power).  Mux maps it to an AD9361 TX attenuation in mdB
+        -- and issues (GAIN, TX0, W, atten_mdB).  For a TX channel the RFIC
+        -- GAIN command value IS the TX attenuation in millidB (devices_rfic:
+        -- ad9361_set_tx_attenuation), 0 = full output.
+        tx0_drive       : in  std_logic_vector(7 downto 0);
+
         -- One-cycle pulse at the end of every fully-decoded HP Command
         -- (hpsdr_hp_cmd_handler.hp_cmd_pulse).  Drives the issue cadence.
         hp_cmd_pulse    : in  std_logic;
@@ -118,6 +125,17 @@ architecture rtl of hpsdr_cmd_mux is
     signal rx0_atten_issued      : std_logic_vector(4 downto 0)  := (others => '0');
     signal tx0_freq_issued       : std_logic_vector(31 downto 0) := (others => '0');
 
+    -- 9-bit so the boot value (all ones = 511) can never equal an 8-bit drive
+    -- level (0..255): forces the FIRST drive Thetis sends to be applied,
+    -- whatever it is (no bring-up TX-gain default to keep in sync).
+    signal tx0_drive_issued      : unsigned(8 downto 0)          := (others => '1');
+
+    -- AD9361 TX attenuation per drive LSB, in millidB: 250 mdB = 0.25 dB, the
+    -- native AD9361 step.  drive 255 -> 0 mdB (max power), drive 0 -> 63750
+    -- mdB (63.75 dB, effectively off); full span stays within the AD9361
+    -- 0..89750 mdB range.
+    constant TX_ATTEN_STEP_MDB : integer := 250;
+
     signal seq_r          : unsigned(3 downto 0) := (others => '0');
     signal cmd_op_r       : std_logic_vector(15 downto 0) := (others => '0');
     signal cmd_data_in_r  : std_logic_vector(31 downto 0) := (others => '0');
@@ -142,6 +160,7 @@ begin
         -- NIOS dispatcher sign-extends din to int64 before handing it to
         -- rfic_command_write_immed.
         variable gain_dB_v   : integer range -31 to GAIN_ANCHOR_DB;
+        variable tx_atten_v  : integer range 0 to 255 * TX_ATTEN_STEP_MDB;
         variable next_seq_v  : unsigned(3 downto 0);
     begin
         if (reset = '1') then
@@ -149,6 +168,7 @@ begin
             rx0_band_index_issued <= (others => '0');
             rx0_atten_issued      <= (others => '0');
             tx0_freq_issued       <= (others => '0');
+            tx0_drive_issued      <= (others => '1');
             seq_r                 <= (others => '0');
             cmd_op_r              <= (others => '0');
             cmd_data_in_r         <= (others => '0');
@@ -198,6 +218,21 @@ begin
                                         CH_RX0                       &
                                         OP_GAIN;
                     rx0_atten_issued <= rx0_atten;
+                -- DUC0 (TX0) drive level -> AD9361 TX attenuation (mdB).  The
+                -- 9-bit sentinel forces the first drive to apply.  GAIN op on
+                -- the TX0 channel = TX attenuation in mdB (NIOS dispatcher
+                -- passes the value straight through).
+                elsif unsigned('0' & tx0_drive) /= tx0_drive_issued then
+                    tx_atten_v       := (255 - to_integer(unsigned(tx0_drive)))
+                                        * TX_ATTEN_STEP_MDB;
+                    seq_r            <= next_seq_v;
+                    cmd_data_in_r    <= std_logic_vector(
+                                            to_unsigned(tx_atten_v, 32));
+                    cmd_op_r         <= std_logic_vector(next_seq_v) &
+                                        RW_WRITE                     &
+                                        CH_TX0                       &
+                                        OP_GAIN;
+                    tx0_drive_issued <= unsigned('0' & tx0_drive);
                 end if;
             end if;
         end if;
