@@ -45,6 +45,36 @@ void rfic_invalidate_frequency(bladerf_module module)
     state.frequency_invalid[module] = true;
 }
 
+bool rfic_set_rx_dc_tracking(uint8_t event_mask, bool run_rfdc_cal)
+{
+    if (NULL == state.phy || NULL == state.phy->pdata) {
+        return false;
+    }
+
+    /* Controls WHEN the AD9361 applies its measured DC-offset tracking word
+     * (reg 0x18B[2:0]).  ad9361_tracking_control() writes this field, and it is
+     * preserved across the chip's auto-recalibrations (which re-call
+     * ad9361_tracking_control with the same pdata). */
+    state.phy->pdata->dc_offset_update_events = event_mask & 0x7;
+
+    /* Re-apply tracking control: BB DC, RF DC and RX-quadrature all enabled,
+     * pushing the new event mask to the chip immediately. */
+    if (ad9361_tracking_control(state.phy, true, true, true) != 0) {
+        return false;
+    }
+
+    /* Optionally force a fresh RF DC-offset calibration at the current LO and
+     * gain.  do_calib drops the ENSM to ALERT, calibrates, and restores the
+     * previous state -- a brief RX interruption. */
+    if (run_rfdc_cal) {
+        if (ad9361_do_calib(state.phy, RFDC_CAL, -1) != 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 
 /******************************************************************************/
 /* Dispatching */

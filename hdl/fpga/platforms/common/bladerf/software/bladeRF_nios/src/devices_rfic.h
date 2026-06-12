@@ -115,6 +115,28 @@ bool rfic_command_write_immed(bladerf_rfic_command command,
  */
 void rfic_invalidate_frequency(bladerf_module module);
 
+/**
+ * Reconfigure the AD9361 RX DC-offset tracking at runtime.
+ *
+ * Used by the HPSDR autonomous bring-up to fight the zero-IF LO-leakage DC
+ * spike that wanders at the panadapter centre.  The AD9361 init enables BB DC,
+ * RF DC and RX-quadrature tracking, but the DC-offset correction word is only
+ * (re)applied on the events in @p event_mask (AD9361 reg 0x18B[2:0]); the
+ * default mask (5 = gain change + Rx-state exit) never fires during continuous
+ * fixed-gain RX, so the correction freezes and then drifts.
+ *
+ * This re-applies ad9361_tracking_control() with the given event mask and all
+ * three RX tracking loops enabled, and optionally forces a fresh RF DC-offset
+ * calibration at the current LO/gain (briefly drops to ALERT).
+ *
+ * @param[in]  event_mask     AD9361 DC-offset update event mask (0..7)
+ * @param[in]  run_rfdc_cal   if true, also run an RF DC-offset calibration now
+ *
+ * @return     true on success, false if the RFIC is not initialized or a
+ *             chip operation failed
+ */
+bool rfic_set_rx_dc_tracking(uint8_t event_mask, bool run_rfdc_cal);
+
 
 /******************************************************************************/
 /* Helpers */
