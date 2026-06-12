@@ -22,35 +22,33 @@
 --
 -- Why this exists
 --   A 5-stage CIC has frequency response |H_CIC(u)| = sinc^5(u) where
---   u = f / fs_out.  Across a panadapter window that fills ~80% of the
---   output Nyquist the droop is visible as a ~10 dB centre-vs-edge "smile"
---   on the noise floor.  This filter is the inverse of that shape.
+--   u = f / fs_out.  Filling the panadapter to the band edge the droop is a
+--   ~10..20 dB centre-vs-edge "smile" on the noise floor.  This filter is the
+--   inverse of that shape, so CIC * cFIR is flat across the displayed span.
 --
--- Coefficient design (5-tap symmetric, fully parallel)
---   The frequency response of a 5-tap symmetric FIR is
---       H(omega) = a + 2 b cos(omega) + 2 c cos(2 omega)
---   Expand to Taylor order omega^4 and match the leading terms of
---   1 / sinc^5(omega/2pi):
---       1/sinc^5(u) ~= 1 + 0.208 omega^2 + 0.0332 omega^4 + ...
---   The match gives a = 1.719, b = -0.410, c = 0.0505.  DC gain is
---   exactly 1.000.  Passband lift:
---       u = 0.0  ->  0.00 dB    (centre, perfect)
---       u = 0.2  -> +2.83 dB    (target: +2.93 dB)
---       u = 0.3  -> +6.03 dB    (target: +6.63 dB)
---       u = 0.4  -> +7.66 dB    (target: +12.1 dB) -- under-compensates
---       u = 0.5  -> +8.43 dB    (Nyquist; doesn't matter, CIC kills it -19 dB)
---   Net visible-flatness: <1 dB across u = +/- 0.3 of the band; degrades
---   gracefully beyond that.  If you ever want true flatness all the way
---   to the edges, swap in a longer (21-tap) frequency-sampled set without
---   touching the surrounding wiring.
+-- Coefficient design (15-tap symmetric, least-squares)
+--   The earlier 5-tap set was a Taylor (maximally-flat-at-DC) match: flat to
+--   ~+/-0.3 of the band but ~10 dB short at the edges, leaving a centre hump
+--   on a full-span panadapter.  This 15-tap set is a weighted least-squares
+--   fit of the FIR magnitude to 1/sinc^5(u) over |u| <= 0.46, DC gain pinned
+--   to exactly 1.000 (sum of taps = 16384).  Result (CIC * cFIR):
+--       passband ripple ~= 0.42 dB out to u = 0.46 (92% of Nyquist)
+--       peak |H| ~= 7.1x (+17 dB) at the band edge
+--   The edge lift IS the flattening (the CIC drops the edge ~17 dB, the cFIR
+--   puts it back).  Coefficients were generated offline; see the project
+--   history for the design script (LS + DC-gain KKT constraint).  To re-flatten
+--   for a different passband or stage count, regenerate the table and the
+--   N_TAPS / ACC_W guard below -- the surrounding wiring is unchanged.
 --
 -- Implementation
 --   * Coefficients held as 18-bit signed Q3.14 (1 sign + 3 integer + 14
---     fractional, range +/- 4).  The largest |coef| is 1.719 -> fits.
---   * Per-channel: 5 sample-delay registers, 5 parallel 24x18 multipliers,
---     5-input adder tree, single arithmetic right shift by 14.
---   * Combinational FIR sum: ~5 multipliers + adder tree, fully within
---     one rx_clock at 12.288 MHz (worst-case path << 80 ns).
+--     fractional, range +/- 8).  Largest |coef| = 2.546 (centre tap) -> fits.
+--   * Per-channel: N_TAPS-1 sample-delay registers, N_TAPS 24x18 multipliers,
+--     adder tree, single arithmetic right shift by 14.  15 taps x I/Q = 30
+--     multipliers -- watch DSP-block usage in the fitter (fold the symmetric
+--     pairs into pre-adders to halve it if the device runs short).
+--   * Combinational FIR sum + adder tree, one rx_clock at 12.288 MHz (81 ns
+--     period -- very relaxed; pipeline only if timing ever fails).
 --   * Latency: 1 rx_clock from in_valid -> out_valid.
 --   * Reset is rx_reset only (NOT ddc_fifo_aclr / host_run), so the SR
 --     stays warm between Thetis reconnects.
@@ -82,17 +80,37 @@ architecture rtl of hpsdr_cfir is
 
     -- 5-tap symmetric, Q3.14 fixed-point.  See header comment for design.
     -- Values: [0.0505, -0.410, 1.719, -0.410, 0.0505] * 2^14, rounded.
-    constant N_TAPS         : positive := 5;
+    constant N_TAPS         : positive := 15;
     constant COEF_W         : positive := 18;
     constant COEF_FRAC_BITS : positive := 14;
 
+    -- 15-tap symmetric inverse-sinc^5 compensator, Q3.14 (scale = 2^14).
+    -- Designed by weighted least-squares fit of the FIR magnitude to
+    -- 1/sinc^5(u) over the passband |u| <= 0.46 (u = f/Fs_out), with the DC
+    -- gain constrained to exactly 1.000 (sum of taps = 16384).  Combined with
+    -- the CIC this is flat to within ~0.42 dB out to 92% of the output Nyquist
+    -- (vs the old 5-tap set, which under-compensated ~10 dB at the band edges
+    -- and left the panadapter floor humped at centre).  Peak |H| ~= 7.1x
+    -- (+17 dB) at the band edge -- that edge lift is what flattens the noise
+    -- floor; strong signals right at the edge clip via sat_width (benign).
+    -- Centre tap 41722/16384 = 2.546 fits the 3 integer bits of Q3.14.
     type coef_array_t is array (0 to N_TAPS-1) of signed(COEF_W-1 downto 0);
     constant COEFS : coef_array_t := (
-        0 => to_signed(   827, COEF_W),  --  0.0505
-        1 => to_signed( -6717, COEF_W),  -- -0.410
-        2 => to_signed( 28164, COEF_W),  --  1.719
-        3 => to_signed( -6717, COEF_W),  -- -0.410
-        4 => to_signed(   827, COEF_W)   --  0.0505
+         0 => to_signed(  -371, COEF_W),
+         1 => to_signed(   798, COEF_W),
+         2 => to_signed( -1429, COEF_W),
+         3 => to_signed(  2612, COEF_W),
+         4 => to_signed( -4699, COEF_W),
+         5 => to_signed(  8993, COEF_W),
+         6 => to_signed(-18573, COEF_W),
+         7 => to_signed( 41722, COEF_W),
+         8 => to_signed(-18573, COEF_W),
+         9 => to_signed(  8993, COEF_W),
+        10 => to_signed( -4699, COEF_W),
+        11 => to_signed(  2612, COEF_W),
+        12 => to_signed( -1429, COEF_W),
+        13 => to_signed(   798, COEF_W),
+        14 => to_signed(  -371, COEF_W)
     );
 
     -- Sample delay line.  sr(k) holds the sample from k cycles back; the
@@ -106,9 +124,18 @@ architecture rtl of hpsdr_cfir is
     signal out_q_r     : signed(WIDTH-1 downto 0) := (others => '0');
     signal out_valid_r : std_logic                := '0';
 
-    -- Product/accumulator widths.  Product: WIDTH + COEF_W = 24 + 18 = 42.
-    -- 5-way sum needs ceil(log2(5)) = 3 guard bits -> 45-bit accumulator.
-    constant PROD_W : positive := WIDTH + COEF_W;
+    -- Symmetric (folded) implementation: the FIR is linear-phase, so mirror
+    -- taps share a coefficient.  Pre-add each mirror pair, then one multiply per
+    -- pair -> HALF_TAPS+1 = 8 multiplies/channel instead of 15.  This both
+    -- halves the DSP-block count and, crucially, keeps the inferred DSP MAC
+    -- cascade at 8 (the device caps chains at 11; an unfolded 15-tap linear
+    -- accumulate forms a length-15 chain and fails to fit).
+    constant HALF_TAPS : natural := (N_TAPS - 1) / 2;   -- = 7 for N_TAPS=15
+
+    -- Product/accumulator widths.  Pre-add of two WIDTH-bit samples is WIDTH+1
+    -- bits; product = (WIDTH+1) + COEF_W = 25 + 18 = 43.  The 8-way sum needs
+    -- ceil(log2(8)) = 3 guard bits -> 46-bit accumulator.
+    constant PROD_W : positive := (WIDTH + 1) + COEF_W;
     constant ACC_W  : positive := PROD_W + 3;
 
     -- Saturating cast to WIDTH-bit signed.  The cFIR's ~2.64x peak gain can
@@ -136,8 +163,13 @@ begin
     out_valid <= out_valid_r;
 
     process(clock, reset)
-        variable acc_i, acc_q   : signed(ACC_W-1 downto 0);
+        -- Window of the N_TAPS samples convolved this cycle: w(0) = current
+        -- input, w(k) = sr(k-1) = sample from k cycles back.
+        type window_t is array (0 to N_TAPS-1) of signed(WIDTH-1 downto 0);
+        variable wi, wq         : window_t;
+        variable pre_i, pre_q   : signed(WIDTH downto 0);      -- WIDTH+1 bits
         variable prod_i, prod_q : signed(PROD_W-1 downto 0);
+        variable acc_i, acc_q   : signed(ACC_W-1 downto 0);
     begin
         if reset = '1' then
             sr_i        <= (others => (others => '0'));
@@ -149,22 +181,35 @@ begin
             out_valid_r <= '0';
 
             if in_valid = '1' then
+                -- Assemble the sample window: tap 0 is the current input, the
+                -- rest come from the delay line.
+                wi(0) := in_i;
+                wq(0) := in_q;
+                for k in 1 to N_TAPS-1 loop
+                    wi(k) := sr_i(k-1);
+                    wq(k) := sr_q(k-1);
+                end loop;
+
                 acc_i := (others => '0');
                 acc_q := (others => '0');
 
-                -- Tap 0: current input.
-                prod_i := in_i * COEFS(0);
-                prod_q := in_q * COEFS(0);
-                acc_i  := acc_i + resize(prod_i, ACC_W);
-                acc_q  := acc_q + resize(prod_q, ACC_W);
-
-                -- Taps 1..N_TAPS-1: delayed samples from the shift register.
-                for k in 1 to N_TAPS-1 loop
-                    prod_i := sr_i(k-1) * COEFS(k);
-                    prod_q := sr_q(k-1) * COEFS(k);
+                -- Folded symmetric pairs: w(j) and w(N-1-j) share COEFS(j).
+                -- Pre-add the pair, then one multiply -> 8 mul/channel, and an
+                -- 8-long MAC cascade (within the device's 11 limit).
+                for j in 0 to HALF_TAPS-1 loop
+                    pre_i  := resize(wi(j), WIDTH+1) + resize(wi(N_TAPS-1-j), WIDTH+1);
+                    pre_q  := resize(wq(j), WIDTH+1) + resize(wq(N_TAPS-1-j), WIDTH+1);
+                    prod_i := pre_i * COEFS(j);
+                    prod_q := pre_q * COEFS(j);
                     acc_i  := acc_i + resize(prod_i, ACC_W);
                     acc_q  := acc_q + resize(prod_q, ACC_W);
                 end loop;
+
+                -- Centre tap (no mirror): COEFS(HALF_TAPS) * w(HALF_TAPS).
+                prod_i := resize(wi(HALF_TAPS), WIDTH+1) * COEFS(HALF_TAPS);
+                prod_q := resize(wq(HALF_TAPS), WIDTH+1) * COEFS(HALF_TAPS);
+                acc_i  := acc_i + resize(prod_i, ACC_W);
+                acc_q  := acc_q + resize(prod_q, ACC_W);
 
                 -- Advance the delay line: sr(0) <= in, sr(k) <= sr(k-1).
                 sr_i(0) <= in_i;
@@ -175,10 +220,10 @@ begin
                 end loop;
 
                 -- Drop the Q3.14 fractional bits to return to input scale,
-                -- then saturate: the ~2.64x peak gain on a full-scale CIC
-                -- sample can exceed 24-bit range, and we run the CIC at full
-                -- scale (shift_left(...,4) on a full 16-bit input), so the
-                -- old plain resize() could wrap.  sat_width() clips instead.
+                -- then saturate: the ~7.1x peak gain on a full-scale CIC sample
+                -- can exceed 24-bit range, and we run the CIC at full scale
+                -- (shift_left(...,4) on a full 16-bit input), so a plain
+                -- resize() could wrap.  sat_width() clips instead.
                 out_i_r     <= sat_width(shift_right(acc_i, COEF_FRAC_BITS));
                 out_q_r     <= sat_width(shift_right(acc_q, COEF_FRAC_BITS));
                 out_valid_r <= '1';
