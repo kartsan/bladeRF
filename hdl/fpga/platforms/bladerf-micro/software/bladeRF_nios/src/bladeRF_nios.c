@@ -147,14 +147,39 @@ static inline int32_t hpsdr_band_to_lo_offset_hz(uint8_t band)
  * the host DUC0 rate (default 192 kHz) up to this fixed native rate, so the
  * AD9361 TX always runs at 12.288 MSPS regardless of the Thetis transmit rate. */
 #  define HPSDR_TX_SAMPLERATE 12288000u
-/* AD9361 analog (BBLPF) bandwidth, set once at bring-up and held fixed.  It is
- * matched to the 12.288 MSPS native pipe (~0.8 * Fs), NOT to the HPSDR DDC/DUC
- * rate -- the fabric CIC does the actual channel selection, and the AD9361
- * analog filter can't go as narrow as the HPSDR rates anyway.  Keeps the
- * analog anti-alias/noise filter snug to the native span instead of the wide
- * (~18 MHz) power-on default. */
-#  define HPSDR_RX_BANDWIDTH 10000000u
+/* AD9361 analog (BBLPF) bandwidth, set once at bring-up and held fixed.  NOT
+ * matched to the HPSDR DDC/DUC rate -- the fabric CIC does channel selection,
+ * and the AD9361's internal digital decimation keeps the 12.288 MSPS output
+ * alias-free regardless of the analog BW.  RX is deliberately WIDE (18 MHz):
+ * Fs/4 offset tuning (see HPSDR_RX_FS4_OFFSET_HZ) makes the panadapter view an
+ * off-centre slice of the chip baseband, ~2.3..3.8 MHz from the AD9361 LO for a
+ * 1536 kHz span.  A snug 10 MHz BBLPF rolls off across that slice and tilts the
+ * noise floor (peak toward the LO side); widening the corner to ~9 MHz keeps
+ * the slice in the flat region.  Raise further (24..28 MHz) if a residual tilt
+ * remains.  TX has no such offset, so it stays snug at 10 MHz. */
+#  define HPSDR_RX_BANDWIDTH 18000000u
 #  define HPSDR_TX_BANDWIDTH 10000000u
+
+/* Fs/4 offset-tuning constant.  The fabric hpsdr_fs4_mixer shifts the RX
+ * complex baseband up by Fs/4 (= native 12.288 MSPS / 4 = 3.072 MHz), so we
+ * park the AD9361 RX LO this far ABOVE the VFO; the mixer then re-centres the
+ * wanted signal and pushes the zero-IF LO-leakage DC spike to +Fs/4, onto a
+ * CIC null where it is rejected.  Applied to RX0 FREQUENCY writes only (the TX
+ * LO tunes straight to the VFO).  If the signal lands at +/-Fs/4 instead of
+ * centre, the inversion sense is opposite: negate this AND/OR flip the fabric
+ * mixer's MIX_UP generic -- either re-centres it. */
+#  define HPSDR_RX_FS4_OFFSET_HZ 3072000
+
+/* AD9361 RX DC-offset tracking update-event mask (reg 0x18B[2:0]), applied at
+ * bring-up via rfic_set_rx_dc_tracking().  SUPERSEDED by the Fs/4 offset-tuning
+ * above (HW-confirmed that no event mask nor a forced RFDC cal moved the spike,
+ * because it is LO leakage, not a correctable DC offset).  Kept as a harmless
+ * no-op-ish call -- mask 7 + all three RX tracking loops on is the chip's
+ * normal healthy state; leave it unless profiling the bring-up. */
+#  define HPSDR_DC_OFFSET_EVENTS 7u
+/* Forcing an RFDC cal at bring-up is pointless (runs at the init-default LO,
+ * before Thetis's first FREQUENCY) and adds an ALERT glitch -- leave false. */
+#  define HPSDR_DC_FORCE_CAL false
 
 /* Issue an RFIC immed write and, on DBG builds, log its ok/FAIL result under
  * the given label.  The call always happens; the bool result is captured only
@@ -638,6 +663,18 @@ int main(void)
                 HPSDR_DBG("ENABLE    ", BLADERF_RFIC_COMMAND_ENABLE,
                              BLADERF_CHANNEL_RX(0), 1);
 
+                /* Re-configure RX DC-offset tracking now that RX0 is up.
+                 * Widen the update-event mask so the AD9361 re-applies its
+                 * DC correction word during steady RX (default mask freezes it
+                 * -> wandering zero-IF centre spike).  EXPERIMENTAL knob; see
+                 * HPSDR_DC_OFFSET_EVENTS / HPSDR_DC_FORCE_CAL. */
+                if (!rfic_set_rx_dc_tracking(HPSDR_DC_OFFSET_EVENTS,
+                                             HPSDR_DC_FORCE_CAL)) {
+                    DBG("HPSDR: RX DC-tracking config FAILED\n");
+                } else {
+                    DBG("HPSDR: RX DC-tracking configured\n");
+                }
+
                 /* TX0 bring-up: set the native rate only and leave TX
                  * DISABLED.  This is a half-duplex radio -- enabling the
                  * AD9361 TX continuously would leak its LO (a carrier spur at
@@ -710,6 +747,15 @@ int main(void)
                             value = hpsdr_phase_to_tune_hz(
                                         din,
                                         hpsdr_band_to_lo_offset_hz(band));
+                            /* Fs/4 offset tuning (RX0 only): park the RX LO a
+                             * fixed Fs/4 above the VFO so the fabric
+                             * hpsdr_fs4_mixer can shift the signal back to
+                             * centre and bury the zero-IF DC spike at +Fs/4 on
+                             * a CIC null.  TX0 and any other channel tune
+                             * straight to the VFO. */
+                            if (BLADERF_CHANNEL_RX(0) == bch) {
+                                value += HPSDR_RX_FS4_OFFSET_HZ;
+                            }
                         } else {
                             value = (uint64_t)(int64_t)(int32_t)din;
                         }
