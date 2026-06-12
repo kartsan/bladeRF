@@ -298,15 +298,20 @@ architecture hpsdr_bladerf of bladerf is
     signal hpsdr_mic_tx_ready     : std_logic;
     signal hpsdr_mic_send_pulse   : std_logic;
 
-    -- HPSDR DDC RX path: fs4_mixer -> hpsdr_ddc (CIC) -> cfir -> async FIFO ->
-    -- ddc_iq_sender.  The fs4_mixer shifts the complex baseband up by Fs/4
+    -- HPSDR DDC RX path: passband_eq -> fs4_mixer -> hpsdr_ddc (CIC) -> cfir ->
+    -- async FIFO -> ddc_iq_sender.  passband_eq (native-rate real FIR) flattens
+    -- the AD9361 baseband rolloff that the Fs/4 offset exposes as a wide-span
+    -- noise-floor tilt.  fs4_mixer shifts the complex baseband down by Fs/4
     -- (native 12.288 MSPS / 4 = 3.072 MHz) so the zero-IF LO-leakage DC spike
-    -- moves off the tuned signal to +Fs/4, where it lands on a CIC null and is
+    -- moves off the tuned signal to -Fs/4, where it lands on a CIC null and is
     -- rejected (offset tuning -- the NIOS parks the RX LO +Fs/4 above the VFO;
     -- see hpsdr_fs4_mixer and HPSDR_RX_FS4_OFFSET_HZ).  This replaced the fabric
     -- DC blocker, which could only null the wandering spike with an unacceptably
     -- wide centre notch (see project_hpsdr_rx_chain_landed).  The cfir then
     -- flattens the 5-stage CIC sinc^5 droop across the displayed band.
+    signal eq_i                   : signed(15 downto 0);
+    signal eq_q                   : signed(15 downto 0);
+    signal eq_valid               : std_logic;
     signal fs4_i                  : signed(15 downto 0);
     signal fs4_q                  : signed(15 downto 0);
     signal fs4_valid              : std_logic;
@@ -2140,8 +2145,28 @@ begin
     -- AD9361 I/Q sense is opposite Thetis's convention; swapping I<->Q mirrors
     -- the spectrum (= j*conj, overflow-safe vs negating Q at full scale).  See
     -- feedback_hpsdr_iq_spectrum_inversion.  The swap is done here, on the
-    -- mixer input; the Fs/4 rotation that follows commutes with the harmless
-    -- constant j the swap introduces.
+    -- passband-EQ input; the real EQ FIR and the Fs/4 rotation that follow both
+    -- commute with the harmless constant j the swap introduces.
+    --
+    -- Passband EQ: flattens the AD9361 baseband rolloff that the Fs/4 offset
+    -- exposes as a noise-floor tilt on the widest panadapter span.  Real
+    -- symmetric FIR at the native rate, BEFORE the mixer (where the AD9361
+    -- response is symmetric about DC).  See hpsdr_passband_eq.
+    U_hpsdr_passband_eq : entity work.hpsdr_passband_eq
+        generic map (
+            WIDTH => 16
+        )
+        port map (
+            clock     => rx_clock,
+            reset     => rx_reset,
+            in_i      => shift_left(adc_streams(0).data_q, 4),
+            in_q      => shift_left(adc_streams(0).data_i, 4),
+            in_valid  => adc_streams(0).data_v,
+            out_i     => eq_i,
+            out_q     => eq_q,
+            out_valid => eq_valid
+        );
+
     U_hpsdr_fs4_mixer : entity work.hpsdr_fs4_mixer
         generic map (
             WIDTH  => 16,
@@ -2154,9 +2179,9 @@ begin
         port map (
             clock     => rx_clock,
             reset     => rx_reset,
-            in_i      => shift_left(adc_streams(0).data_q, 4),
-            in_q      => shift_left(adc_streams(0).data_i, 4),
-            in_valid  => adc_streams(0).data_v,
+            in_i      => eq_i,
+            in_q      => eq_q,
+            in_valid  => eq_valid,
             out_i     => fs4_i,
             out_q     => fs4_q,
             out_valid => fs4_valid
