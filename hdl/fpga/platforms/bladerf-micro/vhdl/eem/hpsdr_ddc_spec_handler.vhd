@@ -21,22 +21,27 @@
 -- UDP/1025 in Orion2 V4.0 / Hermes legacy port layout - the inverse of the
 -- V4.4 spec doc; see feedback_hpsdr_orion2_port_mapping memory note).
 -- Consumes udp_rx_handler's hpsdr_ddc_spec_* byte stream and extracts the
--- DDC2 sample-rate field for the wideband panadapter source.
+-- active DDC sample-rate field that drives the CIC decimation.
 --
--- The DDC Specific payload (1444 bytes per orion2 Rx_specific_C&C.v) carries
--- per-DDC enable bits and per-DDC config.  Layout this handler cares about:
+-- We emulate Hermes (single DDC0), so DDC0's rate is preferred; DDC2's rate
+-- is kept as a fallback for deskHPSDR's Orion2 personality (which carries the
+-- main RX on DDC2).  This mirrors the DDC0-preferred / DDC2-fallback choice in
+-- hpsdr_hp_cmd_handler for the RX frequency.
 --
---   byte 7   EnableRx[0..7]   bit n = '1' iff Thetis enabled Rx_n
---                              We only watch bit 2 (= DDC2, the wideband pan
---                              source per project_thetis_ddc_role_mapping).
---   byte 30  DDC2 rate [15:8] kHz, big-endian
+-- The DDC Specific payload (1444 bytes per Hermes/orion2 Rx_specific_C&C.v)
+-- carries per-DDC enable bits then per-DDC config in 6-byte entries starting
+-- at byte 17 (entry n: ADC# @17+6n, rate[15:8] @18+6n, rate[7:0] @19+6n,
+-- CIC1/2, sample size).  Layout this handler cares about:
+--
+--   byte 7   EnableRx[0..7]   bit n = '1' iff the host enabled Rx_n.  We watch
+--                              bit 0 (DDC0) and bit 2 (DDC2).
+--   byte 18  DDC0 rate [15:8] kHz, big-endian   (entry 0 = byte 17 + 6*0)
+--   byte 19  DDC0 rate [ 7:0]
+--   byte 30  DDC2 rate [15:8] kHz, big-endian   (entry 2 = byte 17 + 6*2)
 --   byte 31  DDC2 rate [ 7:0]
 --
--- DDC2 entry begins at payload byte 17 + 6*2 = 29 (6 bytes per DDC entry).
--- We skip every other field (ADC#, CIC1/2, sample size) since the only
--- variable that drives behaviour today is the CIC decimation, derived from
--- the rate.  The remaining bytes (sync bitmaps near byte 1363+, Mux byte
--- 1443) are also ignored.
+-- All other fields (ADC#, CIC1/2, sample size, sync bitmaps near byte 1363+,
+-- Mux byte 1443) are ignored.
 --
 -- Output: rate_id_gray, a 3-bit reflected-gray-coded selector that the
 -- consumer (hpsdr_ddc in rx_clock domain) syncs across the clock-domain
@@ -47,13 +52,13 @@
 -- power-on behaviour and the fall-back design decision (any unknown rate
 -- collapses to 48 kHz rather than holding a possibly-stale value).
 --
--- Latch policy: rate_id_gray updates at byte 31 of each command, but only
--- if EnableRx[2] was '1' in byte 7 of the SAME command.  This lets Thetis
--- send "Rx2 disabled" commands (e.g. during reconfiguration) without
--- clobbering the previously selected rate; the consumer keeps using the
--- last valid rate.  The CIC has no functional reset (see
--- feedback_orion2_cic_reset_port_unused) so it glitches through the
--- transition - acceptable per design.
+-- Latch policy: rate_id_gray updates at rx_eop of each command.  If
+-- EnableRx[0] was set, DDC0's rate wins; else if EnableRx[2] was set, DDC2's
+-- rate is used; if neither was enabled the previously selected rate is held
+-- (so a "Rx disabled" reconfiguration command does not clobber it).  An
+-- enabled-but-unrecognised rate falls back to 48 kHz.  The CIC has no
+-- functional reset (see feedback_orion2_cic_reset_port_unused) so it glitches
+-- through the transition - acceptable per design.
 -- =============================================================================
 
 library ieee;
@@ -72,10 +77,10 @@ entity hpsdr_ddc_spec_handler is
         rx_sop        : in  std_logic;
         rx_eop        : in  std_logic;
 
-        -- 3-bit reflected-gray-coded DDC2 sample-rate selector.  Stable
-        -- between commands; updates at most once per command (at byte 31
-        -- of the payload).  Cross to rx_clock with a per-bit 2-FF
-        -- synchroniser, then decode to a CIC decimation value.
+        -- 3-bit reflected-gray-coded active-DDC sample-rate selector (DDC0
+        -- preferred, DDC2 fallback).  Stable between commands; updates at
+        -- most once per command (at rx_eop).  Cross to rx_clock with a
+        -- per-bit 2-FF synchroniser, then decode to a CIC decimation value.
         --
         --   gray "000" -> 48   kHz (decim 256)  (default / fall-back)
         --        "001" -> 96   kHz (decim 128)
@@ -91,17 +96,24 @@ end entity;
 architecture arch of hpsdr_ddc_spec_handler is
 
     constant BYTE_ENABLE_RX0_7 : natural := 7;
+    constant BYTE_DDC0_RATE_HI : natural := 18;
+    constant BYTE_DDC0_RATE_LO : natural := 19;
     constant BYTE_DDC2_RATE_HI : natural := 30;
     constant BYTE_DDC2_RATE_LO : natural := 31;
 
     -- 11 bits cover the full 1444-byte payload index range (0..1443).
     signal byte_idx       : unsigned(10 downto 0) := (others => '0');
 
-    -- Per-command captures: EnableRx[2] from byte 7 and the high byte of
-    -- the DDC2 rate from byte 30.  Reset at SOP so a malformed prior
-    -- command can't bleed state into the next one.
+    -- Per-command captures, reset at SOP so a malformed prior command can't
+    -- bleed state into the next one: EnableRx[0]/[2] from byte 7, and the
+    -- DDC0 (bytes 18..19) and DDC2 (bytes 30..31) rate words.  The selection
+    -- (DDC0 preferred) is resolved at rx_eop.
+    signal en_rx0_r       : std_logic                    := '0';
     signal en_rx2_r       : std_logic                    := '0';
-    signal rate_hi_r      : std_logic_vector(7 downto 0) := (others => '0');
+    signal ddc0_hi_r      : std_logic_vector(7 downto 0) := (others => '0');
+    signal ddc0_lo_r      : std_logic_vector(7 downto 0) := (others => '0');
+    signal ddc2_hi_r      : std_logic_vector(7 downto 0) := (others => '0');
+    signal ddc2_lo_r      : std_logic_vector(7 downto 0) := (others => '0');
 
     -- Slow-changing output; default to 48 kHz at reset.
     signal rate_id_gray_r : std_logic_vector(2 downto 0) := "000";
@@ -147,8 +159,12 @@ begin
     begin
         if reset = '1' then
             byte_idx       <= (others => '0');
+            en_rx0_r       <= '0';
             en_rx2_r       <= '0';
-            rate_hi_r      <= (others => '0');
+            ddc0_hi_r      <= (others => '0');
+            ddc0_lo_r      <= (others => '0');
+            ddc2_hi_r      <= (others => '0');
+            ddc2_lo_r      <= (others => '0');
             rate_id_gray_r <= "000";
         elsif rising_edge(clock) then
             if rx_valid = '1' then
@@ -156,33 +172,51 @@ begin
 
                 if rx_sop = '1' then
                     n_byte_idx := (others => '0');
+                    en_rx0_r   <= '0';
                     en_rx2_r   <= '0';
-                    rate_hi_r  <= (others => '0');
+                    ddc0_hi_r  <= (others => '0');
+                    ddc0_lo_r  <= (others => '0');
+                    ddc2_hi_r  <= (others => '0');
+                    ddc2_lo_r  <= (others => '0');
                 end if;
 
                 case to_integer(n_byte_idx) is
                     when BYTE_ENABLE_RX0_7 =>
+                        en_rx0_r <= rx_data(0);
                         en_rx2_r <= rx_data(2);
 
-                    when BYTE_DDC2_RATE_HI =>
-                        rate_hi_r <= rx_data;
+                    when BYTE_DDC0_RATE_HI =>
+                        ddc0_hi_r <= rx_data;
+                    when BYTE_DDC0_RATE_LO =>
+                        ddc0_lo_r <= rx_data;
 
+                    when BYTE_DDC2_RATE_HI =>
+                        ddc2_hi_r <= rx_data;
                     when BYTE_DDC2_RATE_LO =>
-                        if en_rx2_r = '1' then
-                            lk := lookup_rate(rate_hi_r, rx_data);
-                            if lk.valid = '1' then
-                                rate_id_gray_r <= lk.gray;
-                            else
-                                -- Fall back to 48 kHz on unrecognised rate.
-                                rate_id_gray_r <= "000";
-                            end if;
-                        end if;
+                        ddc2_lo_r <= rx_data;
 
                     when others =>
                         null;
                 end case;
 
+                -- Resolve the active rate at end-of-command: DDC0 preferred,
+                -- DDC2 fallback, hold previous if neither DDC was enabled.
                 if rx_eop = '1' then
+                    if en_rx0_r = '1' then
+                        lk := lookup_rate(ddc0_hi_r, ddc0_lo_r);
+                        if lk.valid = '1' then
+                            rate_id_gray_r <= lk.gray;
+                        else
+                            rate_id_gray_r <= "000";  -- unrecognised -> 48 kHz
+                        end if;
+                    elsif en_rx2_r = '1' then
+                        lk := lookup_rate(ddc2_hi_r, ddc2_lo_r);
+                        if lk.valid = '1' then
+                            rate_id_gray_r <= lk.gray;
+                        else
+                            rate_id_gray_r <= "000";  -- unrecognised -> 48 kHz
+                        end if;
+                    end if;
                     n_byte_idx := (others => '0');
                 else
                     n_byte_idx := n_byte_idx + 1;

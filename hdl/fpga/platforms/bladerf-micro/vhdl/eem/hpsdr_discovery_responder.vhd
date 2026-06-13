@@ -36,9 +36,12 @@ library work;
 
 entity hpsdr_discovery_responder is
     generic (
-        -- Payload byte 11, board ID (V4.4 spec p.44).  0x05 = ORION Mk II
-        -- (ANAN-7/8000DLE) to match the Orion2 reference Thetis expects.
-        BOARD_TYPE       : std_logic_vector(7 downto 0) := x"05";
+        -- Payload byte 11, board ID (V4.4 spec p.44).  0x01 = HERMES.  We
+        -- emulate Hermes (single DDC0 receiver) rather than ORION Mk II
+        -- (0x05): Hermes is the simplest P2 personality and clients map the
+        -- main receiver to DDC0, matching hpsdr_hp_cmd_handler (RX from DDC0)
+        -- and hpsdr_ddc_iq_sender (IQ out on DDC0 src port 1035).
+        BOARD_TYPE       : std_logic_vector(7 downto 0) := x"01";
         -- Byte 12: protocol version, decimal (0x2C = 44 -> "v4.4").
         PROTOCOL_VERSION : std_logic_vector(7 downto 0) := x"2C";
         -- Byte 13: firmware version, decimal (0x16 = 22 -> Orion "v2.2").

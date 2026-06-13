@@ -23,12 +23,17 @@
 --   * host_run      (byte 4 bit 0) - engagement gate for every radio->host
 --                                    producer (Orion2 sdr_send.v:195)
 --   * host_ptt0     (byte 4 bit 1) - reserved for the Tx path
---   * host_rx0_freq (bytes 9..12, big-endian Hz) - DDC0 receive frequency
---                    (Orion2 High_Priority_CC.v: RX0 = byte9[31:24]..byte12[7:0]).
---                    Assembled in a shift register and committed at rx_eop so a
---                    partial big-endian value is never published.  Crosses to
---                    the Nios via hpsdr_cmd_mux + the hpsdr_cmd_* PIOs;
---                    firmware retunes RX0.
+--   * host_rx0_freq (NCO phase word) - the active receive frequency.  We
+--                    emulate Hermes (single DDC0 receiver), but different P2
+--                    clients put the main RX on different DDC slots: Hermes/
+--                    Thetis use DDC0 (bytes 9..12), while deskHPSDR's Orion2
+--                    personality uses DDC2 (bytes 17..20).  Each 4-byte slot is
+--                    assembled big-endian in its own shift register; at rx_eop
+--                    we publish DDC0 if it is non-zero, else DDC2 -- DDC0 wins
+--                    when both are present (the Hermes-preferred mapping).
+--                    Crosses to the Nios via hpsdr_cmd_mux + the hpsdr_cmd_*
+--                    PIOs (which expand the phase word to Hz); firmware
+--                    retunes RX0.
 --   * host_rx0_atten (byte 1443, 0..31 dB) - 0-31dB step attenuator before
 --                    ADC0 (V4.4 spec p.35: Thetis "RX1 attenuator").
 --                    Single byte, low 5 bits = attenuation in dB.  Also
@@ -149,9 +154,13 @@ architecture arch of hpsdr_hp_cmd_handler is
     signal host_port_r    : std_logic_vector(15 downto 0) := (others => '0');
     signal hp_cmd_pulse_r : std_logic                     := '0';
 
-    -- RX0 frequency: shift register assembles bytes 9..12 big-endian
-    -- (freq_sr); committed to host_rx0_freq_r at rx_eop.
-    signal freq_sr        : std_logic_vector(31 downto 0) := (others => '0');
+    -- RX0 frequency: two candidate shift registers assembled big-endian -
+    -- DDC0 (bytes 9..12, ddc0_sr) and DDC2 (bytes 17..20, ddc2_sr).  At rx_eop
+    -- host_rx0_freq_r takes DDC0 if non-zero, else DDC2 (DDC0 preferred when
+    -- both are sent).  Each window writes its full 4 bytes every packet, so
+    -- both registers always reflect the current command.
+    signal ddc0_sr        : std_logic_vector(31 downto 0) := (others => '0');
+    signal ddc2_sr        : std_logic_vector(31 downto 0) := (others => '0');
     signal host_rx0_freq_r: std_logic_vector(31 downto 0) := (others => '0');
 
     -- DUC0 (TX) frequency: shift register assembles bytes 329..332 big-endian
@@ -203,7 +212,8 @@ begin
             host_run_r        <= '0';
             host_ptt0_r       <= '0';
             host_port_r       <= (others => '0');
-            freq_sr           <= (others => '0');
+            ddc0_sr           <= (others => '0');
+            ddc2_sr           <= (others => '0');
             host_rx0_freq_r   <= (others => '0');
             duc0_freq_sr      <= (others => '0');
             host_duc0_freq_r  <= (others => '0');
@@ -254,13 +264,21 @@ begin
                     host_ptt0_r <= rx_data(1);
                 end if;
 
-                -- Orion2 High_Priority_CC.v: RX0 frequency bytes 9..12,
-                -- big-endian (byte 9 = [31:24] MSB).  Shift in MSB-first; a
-                -- byte-9..12 window leaves freq_sr holding the full 32-bit
-                -- value, committed below at rx_eop.
+                -- DDC0 frequency bytes 9..12, big-endian (byte 9 = [31:24]
+                -- MSB).  Shift in MSB-first; the byte-9..12 window leaves
+                -- ddc0_sr holding the full 32-bit value, selected below at
+                -- rx_eop.  (Hermes/Thetis main RX.)
                 if (n_byte_idx >= to_unsigned(9, n_byte_idx'length)) and
                    (n_byte_idx <= to_unsigned(12, n_byte_idx'length)) then
-                    freq_sr <= freq_sr(23 downto 0) & rx_data;
+                    ddc0_sr <= ddc0_sr(23 downto 0) & rx_data;
+                end if;
+
+                -- DDC2 frequency bytes 17..20, big-endian.  deskHPSDR's Orion2
+                -- personality carries the main RX here instead of DDC0; used
+                -- as the fallback when DDC0 is zero.
+                if (n_byte_idx >= to_unsigned(17, n_byte_idx'length)) and
+                   (n_byte_idx <= to_unsigned(20, n_byte_idx'length)) then
+                    ddc2_sr <= ddc2_sr(23 downto 0) & rx_data;
                 end if;
 
                 -- Orion2 High_Priority_CC.v: DUC0 (Tx0) frequency bytes
@@ -293,7 +311,12 @@ begin
                 end if;
 
                 if rx_eop = '1' then
-                    host_rx0_freq_r   <= freq_sr;          -- commit assembled value
+                    -- Prefer DDC0; fall back to DDC2 when DDC0 is zero.
+                    if ddc0_sr /= x"00000000" then
+                        host_rx0_freq_r <= ddc0_sr;
+                    else
+                        host_rx0_freq_r <= ddc2_sr;
+                    end if;
                     host_duc0_freq_r  <= duc0_freq_sr;     -- commit TX freq too
                     host_rx0_atten_r  <= atten_latched;    -- commit at packet boundary
                     host_tx_drive_r   <= drive_latched;    -- commit TX drive level
