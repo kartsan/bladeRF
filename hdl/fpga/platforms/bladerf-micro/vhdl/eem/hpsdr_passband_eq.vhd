@@ -37,14 +37,23 @@
 --
 -- Coefficient design (15-tap symmetric, attenuation-only)
 --   The AD9361 rolloff was measured off the panadapter noise floor (1536 kHz
---   span), the known CIC*cFIR shape removed, and the inverse fit by weighted
---   least-squares over the viewed band f_ad in [2.30, 3.84] MHz.  The target is
---   normalised so the filter only ever ATTENUATES (peak |H| ~= 1.03, ~0 dB):
---   it pulls the higher (LO-side) part of the slice DOWN to the level of the
---   far side rather than boosting -- no noise/alias amplification, no extra
---   saturation.  Residual floor flatness after correction: ~0.7 dB across the
---   widest span (down from ~12 dB).  Coefficients Q1.16 (scale 2^16); largest
---   |coef| = 0.668 (centre tap).  Generated offline (LS fit, host gcc).
+--   span) and the inverse fit as a truncated Fourier-cosine series over the
+--   full band, normalised so the filter only ever ATTENUATES (peak |H| = 1.0,
+--   0 dB): it pulls the higher part of the slice DOWN to the far side rather
+--   than boosting -- no noise/alias amplification, no extra saturation.
+--   Coefficients Q1.16 (scale 2^16); largest |coef| = 0.779 (centre tap).
+--   Generated offline (host gcc).
+--
+--   REFIT 2026-06-13 for the Hermes/band-3 (~446 MHz) setup: the prior table
+--   (centre 44090) was tuned for an earlier band and over-attenuated the
+--   high-native-f / left-display side there, leaving a ~5.4 dB tilt with the
+--   RIGHT side high.  This table backs that attenuation off; predicted floor
+--   flatness ~1.3 dB across the widest span (most of the residual is a single
+--   point at the extreme -700 kHz edge; 0..+700 kHz is flat to ~0.5 dB).  NOTE
+--   the correction is fit to ONE band's measured floor -- if the AD9361 slice
+--   shape turns out to vary with the tuned band, a different table is needed
+--   per band.  Re-run the host fit with fresh -700..+700 kHz floor readings to
+--   regenerate; the wiring/structure is unchanged.
 --
 --   ORIENTATION (HW-determined): the conjugating I/Q swap sits between this EQ
 --   and the panadapter, so the EQ's frequency axis is MIRRORED vs the display:
@@ -98,21 +107,21 @@ architecture rtl of hpsdr_passband_eq is
 
     type coef_array_t is array (0 to N_TAPS-1) of signed(COEF_W-1 downto 0);
     constant COEFS : coef_array_t := (
-         0 => to_signed(  -1053, COEF_W),
-         1 => to_signed(   -607, COEF_W),
-         2 => to_signed(   2065, COEF_W),
-         3 => to_signed(    724, COEF_W),
-         4 => to_signed(  -4201, COEF_W),
-         5 => to_signed(   -819, COEF_W),
-         6 => to_signed(  14007, COEF_W),
-         7 => to_signed(  44090, COEF_W),
-         8 => to_signed(  14007, COEF_W),
-         9 => to_signed(   -819, COEF_W),
-        10 => to_signed(  -4201, COEF_W),
-        11 => to_signed(    724, COEF_W),
-        12 => to_signed(   2065, COEF_W),
-        13 => to_signed(   -607, COEF_W),
-        14 => to_signed(  -1053, COEF_W)
+         0 => to_signed(    -80, COEF_W),
+         1 => to_signed(  -1083, COEF_W),
+         2 => to_signed(    898, COEF_W),
+         3 => to_signed(   1353, COEF_W),
+         4 => to_signed(  -2489, COEF_W),
+         5 => to_signed(  -1583, COEF_W),
+         6 => to_signed(   9389, COEF_W),
+         7 => to_signed(  51050, COEF_W),
+         8 => to_signed(   9389, COEF_W),
+         9 => to_signed(  -1583, COEF_W),
+        10 => to_signed(  -2489, COEF_W),
+        11 => to_signed(   1353, COEF_W),
+        12 => to_signed(    898, COEF_W),
+        13 => to_signed(  -1083, COEF_W),
+        14 => to_signed(    -80, COEF_W)
     );
 
     type sample_array_t is array (0 to N_TAPS-2) of signed(WIDTH-1 downto 0);
