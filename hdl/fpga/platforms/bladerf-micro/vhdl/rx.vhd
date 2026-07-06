@@ -25,10 +25,18 @@ library ieee;
 library work;
     use work.bladerf_p.all;
     use work.fifo_readwrite_p.all;
+    use work.common_dcfifo_p.all;
 
 entity rx is
     generic (
-        NUM_STREAMS          : natural := 2
+        NUM_STREAMS          : natural := 2;
+        -- Physical depth (write-side words) of the RX sample FIFO. Defaults to
+        -- the shared RX_FIFO_LENGTH; revisions tight on M10K (e.g. hpsdr on the
+        -- A4) can request a shallower FIFO. The rx_fifo_t record keeps its
+        -- default wused/rused widths, so this entity's ports and the downstream
+        -- fifo_writer are unchanged -- the narrower used-word buses are just
+        -- zero-extended into them.
+        SAMPLE_FIFO_NUMWORDS : positive := 2**(RX_FIFO_T_DEFAULT.wused'length)
     );
     port (
         rx_reset               : in    std_logic;
@@ -113,6 +121,15 @@ architecture arch of rx is
     signal loopback_fifo            : loopback_fifo_t     := LOOPBACK_FIFO_T_DEFAULT;
     signal meta_fifo                : meta_fifo_rx_t      := META_FIFO_RX_T_DEFAULT;
 
+    -- Used-word buses sized to the actual FIFO depth (SAMPLE_FIFO_NUMWORDS).
+    -- These match the rx_fifo wrapper's auto-sized ports and are resized into
+    -- the fixed-width rx_fifo_t fields / entity port below.
+    signal sample_fifo_wused_i      : std_logic_vector(
+        compute_wrusedw_high(SAMPLE_FIFO_NUMWORDS, "OFF") downto 0);
+    signal sample_fifo_rused_i      : std_logic_vector(
+        compute_rdusedw_high(SAMPLE_FIFO_NUMWORDS, RX_FIFO_WWIDTH,
+                             RX_FIFO_RWIDTH, "OFF") downto 0);
+
     signal loopback_streams         : sample_streams_t(adc_streams'range) := (others => ZERO_SAMPLE);
     signal loopback_enabled         : std_logic           := '0';
     signal loopback_fifo_wenabled_i : std_logic           := '0';
@@ -151,7 +168,7 @@ begin
     sample_fifo.wclock <= rx_clock;
     U_rx_sample_fifo : entity work.rx_fifo
         generic map (
-            LPM_NUMWORDS        => 2**(sample_fifo.wused'length)
+            LPM_NUMWORDS        => SAMPLE_FIFO_NUMWORDS
         ) port map (
             aclr                => sample_fifo.aclr,
 
@@ -160,15 +177,22 @@ begin
             data                => sample_fifo.wdata,
             wrempty             => sample_fifo.wempty,
             wrfull              => sample_fifo.wfull,
-            wrusedw             => sample_fifo.wused,
+            wrusedw             => sample_fifo_wused_i,
 
             rdclk               => sample_fifo_rclock,
             rdreq               => sample_fifo_rreq,
             q                   => sample_fifo_rdata,
             rdempty             => sample_fifo_rempty,
             rdfull              => sample_fifo_rfull,
-            rdusedw             => sample_fifo_rused
+            rdusedw             => sample_fifo_rused_i
         );
+
+    -- Zero-extend the depth-sized used-word buses into the record/port widths
+    -- (no-op when SAMPLE_FIFO_NUMWORDS is left at the RX_FIFO_LENGTH default).
+    sample_fifo.wused <= std_logic_vector(resize(unsigned(sample_fifo_wused_i),
+                                                 sample_fifo.wused'length));
+    sample_fifo_rused <= std_logic_vector(resize(unsigned(sample_fifo_rused_i),
+                                                 sample_fifo_rused'length));
 
 
     -- RX meta FIFO

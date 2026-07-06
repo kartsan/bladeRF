@@ -224,6 +224,14 @@ architecture hpsdr_bladerf of bladerf is
     -- rx_clock.  Boot default "000" = 48 kHz (decim 256).
     signal hpsdr_rate_id_gray       : std_logic_vector(2 downto 0);
 
+    -- PureSignal feedback-interleave request from hpsdr_ddc_spec_handler
+    -- (fx3_pclk_pll domain).  Set when the host's DDC Specific command marks
+    -- Rx0 muxed + Rx1 sourced from the TX DAC.  No functional consumer yet --
+    -- the PS-interleave DDC IQ sender + DAC-reference DDC land next; kept for
+    -- SignalTap so the trigger can be observed against a Thetis PS session.
+    signal hpsdr_ps_active          : std_logic;
+    attribute keep of hpsdr_ps_active : signal is true;
+
     -- Generic HPSDR C&C activity pulse from udp_rx_handler: fires for any
     -- recognised C&C dst port (1024/1025/1026/1027/1029).  Feeds the HP
     -- Command handler's watchdog so non-1027 traffic keeps host_run alive
@@ -1313,7 +1321,8 @@ begin
             rx_sop       => hpsdr_ddc_spec_rx_sop,
             rx_eop       => hpsdr_ddc_spec_rx_eop,
 
-            rate_id_gray => hpsdr_rate_id_gray
+            rate_id_gray => hpsdr_rate_id_gray,
+            ps_active    => hpsdr_ps_active
         );
 
     -- ========================================================================
@@ -1939,7 +1948,11 @@ begin
     -- TX Submodule
     U_tx : entity work.tx
         generic map (
-            NUM_STREAMS          => dac_controls'length
+            NUM_STREAMS          => dac_controls'length,
+            -- A4 is M10K-limited: halve the TX sample FIFO (8192 -> 4096) to
+            -- reclaim ~16 M10K. The HPSDR FX3/USB sample path runs well below
+            -- full rate, so the shallower elastic buffer is ample.
+            SAMPLE_FIFO_NUMWORDS => 4096
         )
         port map (
             tx_reset             => tx_reset,
@@ -2038,7 +2051,11 @@ begin
     -- RX Submodule
     U_rx : entity work.rx
         generic map (
-            NUM_STREAMS            => adc_controls'length
+            NUM_STREAMS            => adc_controls'length,
+            -- A4 is M10K-limited: halve the RX sample FIFO (8192 -> 4096) to
+            -- reclaim ~32 M10K (it is 64-bit wide, the costliest RAM on-chip).
+            -- The HPSDR FX3/USB sample path runs well below full rate.
+            SAMPLE_FIFO_NUMWORDS   => 4096
         )
         port map (
             rx_reset               => rx_reset,

@@ -59,6 +59,28 @@
 -- enabled-but-unrecognised rate falls back to 48 kHz.  The CIC has no
 -- functional reset (see feedback_orion2_cic_reset_port_unused) so it glitches
 -- through the transition - acceptable per design.
+--
+-- PureSignal (PS) detection (Hermes model, ref Y:\Ilkka\ham\bladerf\hpsdr):
+-- Hermes turns on the PS feedback interleave from two fields of this very
+-- packet (Hermes.v select_input_RX + Rx_fifo_ctrl0 .Sync(Mux)):
+--
+--   byte 23   RxADC[1] == 0x01 -> DDC1 is fed from the TX DAC (the reference
+--                                 stream), not a physical ADC.
+--   byte 1363 Mux      bit0='1' -> Rx0 is in multiplexed mode: the RF feedback
+--                                 (Rx0) and the DAC reference (Rx1) get
+--                                 interleaved onto the DDC0 / port-1035 stream.
+--
+-- We export ps_active = Mux[0] AND (RxADC[1] = 0x01), latched at rx_eop next to
+-- rate_id_gray.  The Hermes FIFO controller actually gates on Mux /= 0; we also
+-- require RxADC[1]=1 so a stray Mux bit can't be mistaken for the PS config.
+--
+-- CAVEAT: the Hermes RTL writes Mux from payload byte 1363, but the openHPSDR
+-- protocol doc lists the Mux byte at 1443.  BYTE_MUX below follows the RTL;
+-- confirm it against a Thetis tcpdump with PureSignal enabled before trusting
+-- it (same "decode by what Thetis sends, not the spec doc" lesson as the
+-- 1025/1027 port swap).  ps_active is a single bit -- cross it to the consumer
+-- clock with a plain 2-FF synchroniser (inherently metastability-safe; no gray
+-- coding needed unlike the multi-bit rate selector).
 -- =============================================================================
 
 library ieee;
@@ -89,7 +111,13 @@ entity hpsdr_ddc_spec_handler is
         --        "110" -> 768  kHz (decim  16)
         --        "111" -> 1536 kHz (decim   8)
         --        "100"/"101"   -> invalid (consumer falls back to 48 kHz)
-        rate_id_gray  : out std_logic_vector(2 downto 0)
+        rate_id_gray  : out std_logic_vector(2 downto 0);
+
+        -- PureSignal feedback-interleave request, decoded from the same
+        -- command (Mux[0] AND RxADC[1]=0x01).  Held stable between commands,
+        -- updated at most once per command (at rx_eop).  Single bit: sync to
+        -- the consumer clock with a 2-FF synchroniser.  Defaults '0'.
+        ps_active     : out std_logic
     );
 end entity;
 
@@ -100,6 +128,11 @@ architecture arch of hpsdr_ddc_spec_handler is
     constant BYTE_DDC0_RATE_LO : natural := 19;
     constant BYTE_DDC2_RATE_HI : natural := 30;
     constant BYTE_DDC2_RATE_LO : natural := 31;
+
+    -- PureSignal fields: RxADC[1] (entry 1 = byte 17 + 6*1) and the Mux byte.
+    -- See header for the BYTE_MUX (1363 RTL vs 1443 doc) caveat.
+    constant BYTE_RXADC1       : natural := 23;
+    constant BYTE_MUX          : natural := 1363;
 
     -- 11 bits cover the full 1444-byte payload index range (0..1443).
     signal byte_idx       : unsigned(10 downto 0) := (others => '0');
@@ -115,8 +148,16 @@ architecture arch of hpsdr_ddc_spec_handler is
     signal ddc2_hi_r      : std_logic_vector(7 downto 0) := (others => '0');
     signal ddc2_lo_r      : std_logic_vector(7 downto 0) := (others => '0');
 
+    -- PureSignal per-command captures (RxADC[1] @23, Mux @1363), reset at SOP
+    -- with the others; resolved into ps_active at rx_eop.
+    signal rxadc1_r       : std_logic_vector(7 downto 0) := (others => '0');
+    signal mux_r          : std_logic_vector(7 downto 0) := (others => '0');
+
     -- Slow-changing output; default to 48 kHz at reset.
     signal rate_id_gray_r : std_logic_vector(2 downto 0) := "000";
+
+    -- Slow-changing PS flag; default off at reset.
+    signal ps_active_r    : std_logic := '0';
 
     -- Map a 16-bit BE rate in kHz to its gray code + a validity flag.
     -- Six recognised values; everything else returns valid='0' and the
@@ -152,6 +193,7 @@ architecture arch of hpsdr_ddc_spec_handler is
 begin
 
     rate_id_gray <= rate_id_gray_r;
+    ps_active    <= ps_active_r;
 
     fsm : process(clock, reset)
         variable n_byte_idx : unsigned(10 downto 0);
@@ -165,7 +207,10 @@ begin
             ddc0_lo_r      <= (others => '0');
             ddc2_hi_r      <= (others => '0');
             ddc2_lo_r      <= (others => '0');
+            rxadc1_r       <= (others => '0');
+            mux_r          <= (others => '0');
             rate_id_gray_r <= "000";
+            ps_active_r    <= '0';
         elsif rising_edge(clock) then
             if rx_valid = '1' then
                 n_byte_idx := byte_idx;
@@ -178,6 +223,8 @@ begin
                     ddc0_lo_r  <= (others => '0');
                     ddc2_hi_r  <= (others => '0');
                     ddc2_lo_r  <= (others => '0');
+                    rxadc1_r   <= (others => '0');
+                    mux_r      <= (others => '0');
                 end if;
 
                 case to_integer(n_byte_idx) is
@@ -194,6 +241,11 @@ begin
                         ddc2_hi_r <= rx_data;
                     when BYTE_DDC2_RATE_LO =>
                         ddc2_lo_r <= rx_data;
+
+                    when BYTE_RXADC1 =>
+                        rxadc1_r <= rx_data;
+                    when BYTE_MUX =>
+                        mux_r <= rx_data;
 
                     when others =>
                         null;
@@ -217,6 +269,18 @@ begin
                             rate_id_gray_r <= "000";  -- unrecognised -> 48 kHz
                         end if;
                     end if;
+
+                    -- PureSignal: Rx0 muxed (Mux[0]) AND Rx1 sourced from the
+                    -- TX DAC (RxADC[1]=0x01).  Unconditional each command (no
+                    -- "hold previous" like rate): a command that clears Mux or
+                    -- re-points RxADC[1] turns PS off, matching Hermes where
+                    -- the interleave follows Mux live.
+                    if mux_r(0) = '1' and rxadc1_r = x"01" then
+                        ps_active_r <= '1';
+                    else
+                        ps_active_r <= '0';
+                    end if;
+
                     n_byte_idx := (others => '0');
                 else
                     n_byte_idx := n_byte_idx + 1;
